@@ -14,8 +14,8 @@ Wants=network-online.target
 [Service]
 User=pi123
 Group=pi123
-WorkingDirectory=/home/pi123/Desktop/geodetic
-ExecStart=/home/pi123/Desktop/geodetic/venv/bin/python /home/pi123/Desktop/geodetic/agent_universal.py
+WorkingDirectory=/home/pi123/pi/geodetic
+ExecStart=/home/pi123/pi/geodetic/venv/bin/python /home/pi123/pi/geodetic/agent_universal.py
 Restart=always
 RestartSec=10
 
