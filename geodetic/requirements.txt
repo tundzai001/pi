@@ -1,0 +1,7 @@
+asyncio==4.0.0
+paho-mqtt==2.1.0
+psutil==5.9.8
+pyserial==3.5
+setuptools==80.9.0
+websockets==12.0
+wheel==0.45.1
