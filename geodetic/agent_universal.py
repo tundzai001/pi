@@ -1293,27 +1293,50 @@ async def main():
 # === ENTRY POINT                                                           ===
 # ==============================================================================
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    # ------------------------------------------------------------
+
     stop_event = asyncio.Event()
 
     def shutdown_handler(signum, frame):
         logging.warning(f"Received shutdown signal {signum}. Cleaning up...")
-        stop_event.set()
+        # Sử dụng call_soon_threadsafe để tương tác với asyncio loop từ signal thread
+        loop.call_soon_threadsafe(stop_event.set)
 
+    # Chỉ đăng ký signal handler trên Linux/Raspberry Pi
     if IS_RASPBERRY_PI:
         for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
-            loop.add_signal_handler(sig, shutdown_handler, sig, None)
+            try:
+                loop.add_signal_handler(sig, lambda: stop_event.set())
+            except NotImplementedError:
+                # Fallback nếu loop không hỗ trợ signal handler
+                signal.signal(sig, shutdown_handler)
+    elif IS_WINDOWS:
+        # Trên Windows xử lý Ctrl+C cơ bản
+        signal.signal(signal.SIGINT, shutdown_handler)
+        signal.signal(signal.SIGTERM, shutdown_handler)
     
     main_task = loop.create_task(main())
     stop_task = loop.create_task(stop_event.wait())
     
     try:
-        # Run the wait coroutine on the event loop instead of using 'await' at module scope
+        # Chạy loop cho đến khi main_task hoặc stop_task hoàn thành
         done, pending = loop.run_until_complete(
             asyncio.wait([main_task, stop_task], return_when=asyncio.FIRST_COMPLETED)
         )
+        
+        # Cancel các task còn lại (ví dụ main chưa xong mà stop_event kích hoạt)
         for task in pending:
             task.cancel()
+            try:
+                loop.run_until_complete(task)
+            except asyncio.CancelledError:
+                pass
+                
     except KeyboardInterrupt:
         logging.info("\nAgent stopped by user (Ctrl+C).")
     except Exception as e:
@@ -1321,5 +1344,11 @@ if __name__ == "__main__":
         if IS_WINDOWS:
             input("A critical error occurred, press Enter to exit.")
     finally:
-        remove_lock_file()
-        logging.info("Final cleanup complete.")
+        # Đóng loop sạch sẽ
+        try:
+            remove_lock_file()
+            # Hủy các async generator nếu có
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        finally:
+            loop.close()
+            logging.info("Final cleanup complete.")
