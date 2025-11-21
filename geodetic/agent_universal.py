@@ -127,97 +127,200 @@ def generate_pi_license_base(serial_number: str) -> str:
 # === EMBEDDED CHIP DETECTOR                                                ===
 # ==============================================================================
 def get_chip_info(port: str, baudrate: int) -> dict | None:
+    """Improved detection - test command TRƯỚC khi listen passive"""
     try:
-        with serial.Serial(port, baudrate, timeout=1) as ser:
+        with serial.Serial(port, baudrate, timeout=2) as ser:
+            # Test U-blox first
+            ser.reset_input_buffer()
             ser.write(b'\xB5\x62\x0A\x04\x00\x00\x0E\x34')
+            ser.flush()
+            time.sleep(0.5)
             response = ser.read(100)
             if b'\xB5\x62\x0A\x04' in response:
                 return {"type": "Ublox"}
     except Exception:
         pass
-    try:
-        with serial.Serial(port, baudrate, timeout=1) as ser:
-            ser.write(b'config version\r\n')
-            response = ser.read(100)
-            if b'Unicore' in response or b'UM' in response:
-                return {"type": "Unicorecomm"}
-    except Exception:
-        pass
+    
+    # Test Unicorecomm với nhiều lệnh
+    unicore_test_commands = [
+        b'version\r\n',
+        b'config version\r\n',
+        b'config\r\n',
+    ]
+    
+    for test_cmd in unicore_test_commands:
+        try:
+            with serial.Serial(port, baudrate, timeout=2) as ser:
+                ser.reset_input_buffer()
+                ser.write(test_cmd)
+                ser.flush()
+                time.sleep(1.5)
+                response = ser.read(1024)
+                
+                # Kiểm tra các keyword Unicorecomm
+                unicore_keywords = [b'Unicore', b'UM982', b'UM9', b'UB4', b'FIRMWARE', b'COMPTYPE']
+                if any(keyword in response for keyword in unicore_keywords):
+                    return {"type": "Unicorecomm"}
+        except Exception:
+            continue
+    
     return None
 
 def find_chip_robustly():
-    common_baud_rates = [460800, 115200, 921600, 38400, 9600]
+    """
+    Enhanced detection - ƯU TIÊN ACTIVE PROBE trước khi passive listen
+    Tránh nhầm UM982 thành Generic_NMEA
+    """
+    common_baud_rates = [115200, 460800, 921600, 230400, 38400, 9600]
     ports = serial.tools.list_ports.comports()
     
     if not ports:
         logging.warning("[ChipDetector] No ports found.")
         return {"port": None, "type": "UNKNOWN", "baud": None}
     
-    logging.info("[ChipDetector] Starting ACTIVE scan...")
+    logging.info("[ChipDetector] Starting ACTIVE COMMAND-BASED scan...")
+    
+    # ========== PHASE 1: ACTIVE COMMAND PROBING ==========
+    # Test tất cả ports với commands TRƯỚC
     for port in ports:
         if 'bluetooth' in port.device.lower() or 'rfcomm' in port.device.lower():
             continue
             
         for baud in common_baud_rates:
-            logging.info(f"  -> Actively probing {port.device} @ {baud}...")
+            logging.info(f"  -> [ACTIVE] Probing {port.device} @ {baud}...")
+            
+            # === TEST UNICORECOMM FIRST ===
+            unicore_commands = [
+                b'version\r\n',
+                b'config version\r\n',
+                b'config\r\n'
+            ]
+            
+            for cmd in unicore_commands:
+                try:
+                    with serial.Serial(port.device, baud, timeout=2.5, write_timeout=2.0) as ser:
+                        # Clear buffer trước
+                        ser.reset_input_buffer()
+                        ser.reset_output_buffer()
+                        
+                        # Gửi lệnh
+                        ser.write(cmd)
+                        ser.flush()
+                        time.sleep(2.0)  # Chờ response đủ lâu
+                        
+                        if ser.in_waiting > 0:
+                            response = ser.read(ser.in_waiting)
+                            response_str = response.decode('ascii', errors='ignore')
+                            
+                            # Check keywords
+                            unicore_keywords = ['Unicore', 'UM982', 'UM9', 'UB4', 'FIRMWARE', 'COMPTYPE', 'MODEL']
+                            if any(kw in response_str for kw in unicore_keywords):
+                                logging.info(f"!!! [ACTIVE] Detected UM982/Unicorecomm on {port.device} @ {baud}")
+                                logging.info(f"    Response snippet: {response_str[:100]}")
+                                return {"port": port.device, "type": "Unicorecomm", "baud": baud}
+                except Exception as e:
+                    logging.debug(f"Unicore command test failed: {e}")
+                    continue
+            
+            # === TEST U-BLOX ===
             try:
                 with serial.Serial(port.device, baud, timeout=2.0, write_timeout=2.0) as ser:
-                    # Test U-blox
                     ser.reset_input_buffer()
                     ser.write(b'\xB5\x62\x0A\x04\x00\x00\x0E\x34')
                     ser.flush()
                     time.sleep(1.0)
-                    if ser.in_waiting > 0 and b'\xB5\x62\x0A\x04' in ser.read(512):
-                        logging.info(f"!!! ACTIVE: Detected U-blox on {port.device} @ {baud}")
-                        return {"port": port.device, "type": "Ublox", "baud": baud}
-
-                    # Test Unicorecomm
-                    ser.reset_input_buffer()
-                    ser.write(b'config version\r\n')
-                    ser.flush()
-                    time.sleep(1.0)
-                    response = ser.read(512)
-                    if ser.in_waiting > 0 and (b'Unicore' in response or b'UM' in response or b'UB4' in response):
-                        logging.info(f"!!! ACTIVE: Detected Unicorecomm on {port.device} @ {baud}")
-                        return {"port": port.device, "type": "Unicorecomm", "baud": baud}
-            except Exception:
-                continue 
+                    
+                    if ser.in_waiting > 0:
+                        response = ser.read(512)
+                        if b'\xB5\x62\x0A\x04' in response:
+                            logging.info(f"!!! [ACTIVE] Detected U-blox on {port.device} @ {baud}")
+                            return {"port": port.device, "type": "Ublox", "baud": baud}
+            except Exception as e:
+                logging.debug(f"Ublox test failed: {e}")
     
+    # ========== PHASE 2: PASSIVE LISTENING (fallback only) ==========
     logging.warning("[ChipDetector] Active scan failed. Starting PASSIVE scan...")
+    logging.warning("              (May misidentify UM982 as Generic_NMEA)")
+    
     for port in ports:
         if 'bluetooth' in port.device.lower() or 'rfcomm' in port.device.lower():
             continue
+            
         for baud in common_baud_rates:
-            logging.info(f"  -> Passively listening on {port.device} @ {baud}...")
+            logging.info(f"  -> [PASSIVE] Listening on {port.device} @ {baud}...")
             try:
-                with serial.Serial(port.device, baud, timeout=3.0) as ser:
-                    time.sleep(2.5)
+                with serial.Serial(port.device, baud, timeout=4.0) as ser:
+                    time.sleep(3.0)
+                    
                     if ser.in_waiting > 0:
                         raw_data = ser.read(ser.in_waiting)
-   
-                        if b'$GP' in raw_data or b'$GN' in raw_data:
-                            chip_type = "Ublox" if b'$PUBX' in raw_data else "Generic_NMEA"
-                            logging.info(f"!!! PASSIVE: Detected NMEA ({chip_type}) on {port.device} @ {baud}")
-                            return {"port": port.device, "type": chip_type, "baud": baud}
-
-                        elif b'\xD3' in raw_data:
-                            logging.info(f"!!! PASSIVE: Detected RTCM3 output on {port.device} @ {baud}")
+                        
+                        # Check for RTCM3 first (priority)
+                        if b'\xD3' in raw_data:
+                            logging.info(f"!!! [PASSIVE] Detected RTCM3 output on {port.device} @ {baud}")
                             return {"port": port.device, "type": "RTCM3_Source", "baud": baud}
-            except Exception:
+                        
+                        # Check for NMEA (last resort)
+                        elif b'$GP' in raw_data or b'$GN' in raw_data:
+                            # Thử xác định chip type qua NMEA messages
+                            if b'$PUBX' in raw_data:
+                                chip_type = "Ublox"
+                            else:
+                                # Có thể là UM982 nhưng không test được command
+                                logging.warning(f"    Detected NMEA on {port.device} - might be UM982")
+                                chip_type = "Generic_NMEA"
+                            
+                            logging.info(f"!!! [PASSIVE] Detected {chip_type} on {port.device} @ {baud}")
+                            return {"port": port.device, "type": chip_type, "baud": baud}
+                        
+            except Exception as e:
+                logging.debug(f"Passive scan error: {e}")
                 continue
 
     logging.error("[ChipDetector] All scans failed. No supported chip found.")
     return {"port": None, "type": "UNKNOWN", "baud": None}
 
+
 def find_chip_fallback():
-    logging.info("[ChipDetector] Running fallback detection...")
+    """
+    Fallback detection - cố gắng tắt NMEA output trước khi test
+    """
+    logging.info("[ChipDetector] Running FALLBACK detection with NMEA disable...")
     ports = serial.tools.list_ports.comports()
+    
     for port in ports:
-        if 'bluetooth' in port.device.lower(): continue
+        if 'bluetooth' in port.device.lower():
+            continue
+            
         logging.info(f"[Fallback] Testing {port.device}...")
-        for baud in [115200, 460800, 921600, 38400, 9600]:
+        
+        for baud in [115200, 460800, 921600, 38400]:
             try:
                 with serial.Serial(port.device, baud, timeout=3) as ser:
+                    # Thử tắt NMEA output cho Unicorecomm
+                    ser.reset_input_buffer()
+                    ser.write(b'unlog\r\n')
+                    ser.flush()
+                    time.sleep(1.0)
+                    
+                    # Clear buffer
+                    if ser.in_waiting > 0:
+                        ser.read(ser.in_waiting)
+                    
+                    # Test version command
+                    ser.write(b'version\r\n')
+                    ser.flush()
+                    time.sleep(2.0)
+                    
+                    if ser.in_waiting > 0:
+                        response = ser.read(ser.in_waiting)
+                        response_str = response.decode('ascii', errors='ignore')
+                        
+                        if any(kw in response_str for kw in ['UM982', 'Unicore', 'FIRMWARE']):
+                            logging.info(f"[Fallback] Found UM982 on {port.device} @ {baud}")
+                            return {"port": port.device, "type": "Unicorecomm", "baud": baud}
+                    
+                    # Test for any GNSS data
                     ser.reset_input_buffer()
                     time.sleep(2)
                     if ser.in_waiting > 0:
@@ -225,8 +328,11 @@ def find_chip_fallback():
                         if b'$G' in data or b'\xB5\x62' in data or b'\xD3' in data:
                             logging.info(f"[Fallback] Found GNSS-like data on {port.device} @ {baud}")
                             return {"port": port.device, "type": "Generic", "baud": baud}
-            except Exception:
+                            
+            except Exception as e:
+                logging.debug(f"Fallback test error: {e}")
                 continue
+    
     return {"port": None, "type": "UNKNOWN", "baud": None}
 
 async def detect_chip_with_retry(max_retries=3, retry_delay=10):
@@ -750,6 +856,8 @@ class AgentManager:
             "status": final_status, 
             "timestamp": int(time.time()),
             "detected_chip_type": self.detected_chip.get("type", "UNKNOWN"),
+            "detected_chip_port": self.detected_chip.get("port"),
+            "detected_chip_baud": self.detected_chip.get("baud"),
             "is_provisioned": self.config.get('is_provisioned', False),
             "base_config": self.get_base_config(),
             "service_config": self.get_service_config(),
@@ -761,6 +869,12 @@ class AgentManager:
                 status["ntrip_stats"] = self.service_stats.copy()
             status["ntrip_connected"] = any(self.ntrip_connection_status.values())
             status["ntrip_status"] = self.ntrip_connection_status.copy()
+            
+            # Thêm warning nếu BPS thấp
+            for key, bps in self.service_stats.items():
+                if 'bps' in key and bps > 0 and bps < 100:
+                    status["warning"] = f"Low data rate detected on {key}: {bps} bps"
+        
         return status
     
     def restart_services(self):
@@ -818,6 +932,9 @@ async def send_status(agent: AgentManager, mqtt_client: mqtt.Client):
         except Exception as e:
             logging.warning(f"MQTT publish failed: {e}")
 
+# ==============================================================================
+# === ASYNC FUNCTIONS - PROCESS COMMAND (UPDATED)                           ===
+# ==============================================================================
 async def process_command(source: str, data: dict, agent: AgentManager, gnss_reader: GNSSReader, mqtt_client: mqtt.Client):
     global current_state
     command = data.get("command")
@@ -886,13 +1003,37 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
                 try:
                     with serial_port_lock, serial.Serial(port, DEFAULT_BAUDRATE, timeout=1) as ser:
                         for cmd_b64 in commands_b64:
-                            ser.write(base64.b64decode(cmd_b64))
-                            await asyncio.sleep(0.5)
+                            decoded_cmd = base64.b64decode(cmd_b64)
+                            
+                            # === XỬ LÝ DELAY MARKERS ===
+                            if decoded_cmd == b'$DELAY_500$':
+                                logging.info("  -> Waiting 500ms between commands...")
+                                await asyncio.sleep(0.5)
+                                continue
+                            elif decoded_cmd == b'$DELAY_200$':
+                                logging.info("  -> Waiting 200ms between commands...")
+                                await asyncio.sleep(0.2)
+                                continue
+                            
+                            # Gửi lệnh thực tế
+                            logging.info(f"  -> Sending: {decoded_cmd.decode('ascii', errors='ignore').strip()}")
+                            ser.write(decoded_cmd)
+                            ser.flush()
+                            
+                            # Đọc response nếu có
+                            await asyncio.sleep(0.3)
+                            if ser.in_waiting > 0:
+                                response = ser.read(ser.in_waiting)
+                                logging.debug(f"     Response: {response.decode('ascii', errors='ignore')[:100]}")
+                    
                     current_state = "ONLINE"
+                    logging.info("✓ All base station commands executed successfully")
+                    
                 except Exception as e:
                     logging.error(f"Raw command execution error: {e}")
                 finally:
                     if gnss_reader:
+                        await asyncio.sleep(1.0)  # Chờ config ổn định
                         gnss_reader.resume()
         
         elif command == "DEPLOY_SERVICE_CONFIG":
@@ -918,6 +1059,34 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
             await asyncio.sleep(3)
             remove_lock_file()
             os.execv(sys.executable, [sys.executable] + sys.argv)
+        
+        elif command == "CHECK_BASE_STATUS":
+            port = agent.detected_chip.get("port")
+            if port and agent.detected_chip.get("type") == "Unicorecomm":
+                try:
+                    with serial_port_lock, serial.Serial(port, DEFAULT_BAUDRATE, timeout=2) as ser:
+                        # Get base station status
+                        logging.info("Checking UM982 base mode status...")
+                        ser.write(b'mode\r\n')
+                        ser.flush()
+                        await asyncio.sleep(1)
+                        
+                        mode_response = ser.read(ser.in_waiting).decode('ascii', errors='ignore')
+                        logging.info(f"Base Mode Status:\n{mode_response}")
+                        
+                        # Get RTCM output status
+                        logging.info("Checking RTCM log status...")
+                        ser.write(b'log\r\n')
+                        ser.flush()
+                        await asyncio.sleep(1)
+                        
+                        log_response = ser.read(ser.in_waiting).decode('ascii', errors='ignore')
+                        logging.info(f"RTCM Log Status:\n{log_response}")
+                        
+                except Exception as e:
+                    logging.error(f"Status check failed: {e}")
+            else:
+                logging.warning(f"CHECK_BASE_STATUS only works for Unicorecomm chips")
     
     finally:
         if current_state == "CONFIGURING":
