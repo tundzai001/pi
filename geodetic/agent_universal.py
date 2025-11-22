@@ -893,7 +893,7 @@ class GNSSReader(threading.Thread):
             self.log("ERROR", "GNSSReader: No serial port configured. Thread exiting.")
             return
         
-        self.log("SUCCESS", f"🚀 GNSSReader thread started for {self.port}")
+        self.log("SUCCESS", f"GNSSReader thread started for {self.port}")
         
         # Connection management
         error_count = 0
@@ -1193,7 +1193,7 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
     
     if command == "LOCK_DEVICE":
         if create_remote_lock():
-            logging.warning("🔒 DEVICE LOCKED REMOTELY")
+            logging.warning("DEVICE LOCKED REMOTELY")
         else:
             logging.error("!!! Failed to create remote lock file.")
         await send_status(agent, mqtt_client)
@@ -1201,7 +1201,7 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
     
     if command == "UNLOCK_DEVICE":
         if remove_remote_lock():
-            logging.info("🔓 DEVICE UNLOCKED")
+            logging.info(" DEVICE UNLOCKED")
         else:
             logging.error("!!! Failed to remove remote lock file.")
         await send_status(agent, mqtt_client)
@@ -1437,7 +1437,7 @@ async def main():
     # ========== Remote Lock Check ==========
     if is_remote_locked():
         current_state = "LOCKED"
-        logging.warning("🔒 Device is remotely locked. Running in restricted mode.")
+        logging.warning("Device is remotely locked. Running in restricted mode.")
         
         agent = AgentManager(get_machine_serial())
         mqtt_client = setup_mqtt_client(loop, agent, None)
@@ -1573,19 +1573,15 @@ if __name__ == "__main__":
 
     def shutdown_handler(signum, frame):
         logging.warning(f"Received shutdown signal {signum}. Cleaning up...")
-        # Sử dụng call_soon_threadsafe để tương tác với asyncio loop từ signal thread
         loop.call_soon_threadsafe(stop_event.set)
 
-    # Chỉ đăng ký signal handler trên Linux/Raspberry Pi
     if IS_RASPBERRY_PI:
         for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
             try:
                 loop.add_signal_handler(sig, lambda: stop_event.set())
             except NotImplementedError:
-                # Fallback nếu loop không hỗ trợ signal handler
                 signal.signal(sig, shutdown_handler)
     elif IS_WINDOWS:
-        # Trên Windows xử lý Ctrl+C cơ bản
         signal.signal(signal.SIGINT, shutdown_handler)
         signal.signal(signal.SIGTERM, shutdown_handler)
     
@@ -1593,12 +1589,10 @@ if __name__ == "__main__":
     stop_task = loop.create_task(stop_event.wait())
     
     try:
-        # Chạy loop cho đến khi main_task hoặc stop_task hoàn thành
         done, pending = loop.run_until_complete(
             asyncio.wait([main_task, stop_task], return_when=asyncio.FIRST_COMPLETED)
         )
-        
-        # Cancel các task còn lại (ví dụ main chưa xong mà stop_event kích hoạt)
+
         for task in pending:
             task.cancel()
             try:
@@ -1613,10 +1607,8 @@ if __name__ == "__main__":
         if IS_WINDOWS:
             input("A critical error occurred, press Enter to exit.")
     finally:
-        # Đóng loop sạch sẽ
         try:
             remove_lock_file()
-            # Hủy các async generator nếu có
             loop.run_until_complete(loop.shutdown_asyncgens())
         finally:
             loop.close()
