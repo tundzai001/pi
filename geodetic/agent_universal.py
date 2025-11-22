@@ -704,132 +704,8 @@ class NTRIPClientWorker(threading.Thread):
                 if client_socket: client_socket.close()
             self._stop_event.wait(reconnect_interval)
 
-
-# ==============================================================================
-# === PORT MANAGEMENT UTILITIES                                             ===
-# ==============================================================================
-
-def get_port_type(port_path: str) -> str:
-    """
-    Xác định loại port
-    Returns: 'ACM', 'USB', 'COM', 'UNKNOWN'
-    """
-    if not port_path:
-        return 'UNKNOWN'
-    
-    if 'ttyACM' in port_path:
-        return 'ACM'
-    elif 'ttyUSB' in port_path:
-        return 'USB'
-    elif 'COM' in port_path.upper():
-        return 'COM'
-    else:
-        return 'UNKNOWN'
-
-def extract_port_pattern(port_path: str) -> dict:
-    """
-    Trích xuất pattern từ port path để tìm lại sau này
-    """
-    import re
-    
-    port_type = get_port_type(port_path)
-    
-    if port_type == 'ACM':
-        match = re.search(r'(/dev/ttyACM)(\d+)', port_path)
-        if match:
-            return {
-                'prefix': match.group(1),
-                'type': 'ACM',
-                'number': int(match.group(2)),
-                'platform': 'linux'
-            }
-    
-    elif port_type == 'USB':
-        match = re.search(r'(/dev/ttyUSB)(\d+)', port_path)
-        if match:
-            return {
-                'prefix': match.group(1),
-                'type': 'USB',
-                'number': int(match.group(2)),
-                'platform': 'linux'
-            }
-    
-    elif port_type == 'COM':
-        match = re.search(r'(COM)(\d+)', port_path, re.IGNORECASE)
-        if match:
-            return {
-                'prefix': 'COM',
-                'type': 'COM',
-                'number': int(match.group(2)),
-                'platform': 'windows'
-            }
-    
-    return {'prefix': None, 'type': 'UNKNOWN', 'number': None, 'platform': 'unknown'}
-
-def find_available_ports(port_pattern: dict = None, max_search: int = 20) -> list:
-    """
-    Tìm tất cả ports khả dụng dựa trên pattern
-    """
-    available = []
-    
-    # Nếu không có pattern, dùng serial.tools.list_ports
-    if not port_pattern or not port_pattern.get('prefix'):
-        import serial.tools.list_ports
-        for port_info in serial.tools.list_ports.comports():
-            available.append(port_info.device)
-        return available
-    
-    # Search theo pattern cụ thể
-    prefix = port_pattern['prefix']
-    port_type = port_pattern['type']
-    
-    for i in range(max_search):
-        if port_type in ['ACM', 'USB']:
-            test_port = f"{prefix}{i}"
-            if os.path.exists(test_port):
-                # Kiểm tra xem có access được không
-                try:
-                    # Test open với timeout rất ngắn
-                    with serial.Serial(test_port, 9600, timeout=0.1) as test_ser:
-                        available.append(test_port)
-                except (serial.SerialException, PermissionError, OSError):
-                    # Port tồn tại nhưng không truy cập được (có thể đang được dùng)
-                    pass
-        
-        elif port_type == 'COM':
-            test_port = f"{prefix}{i}"
-            try:
-                # Windows: thử mở COM port
-                with serial.Serial(test_port, 9600, timeout=0.1) as test_ser:
-                    available.append(test_port)
-            except (serial.SerialException, FileNotFoundError):
-                # COM port không tồn tại
-                pass
-    
-    return available
-
-def port_exists(port_path: str) -> bool:
-    """
-    Kiểm tra port có tồn tại không (cross-platform)
-    """
-    if not port_path:
-        return False
-    
-    port_type = get_port_type(port_path)
-    
-    if port_type in ['ACM', 'USB']:
-        # Linux: kiểm tra file device
-        return os.path.exists(port_path)
-    
-    elif port_type == 'COM':
-        # Windows: thử list tất cả COM ports
-        import serial.tools.list_ports
-        available_ports = [p.device for p in serial.tools.list_ports.comports()]
-        return port_path.upper() in [p.upper() for p in available_ports]
-    
-    return False
-
 class GNSSReader(threading.Thread):
+    
     def __init__(self, log_callback, port, baudrate):
         super().__init__()
         self.log = log_callback
@@ -840,224 +716,258 @@ class GNSSReader(threading.Thread):
         self.daemon = True
         self.name = "GNSSReaderThread"
         
-        # Lưu pattern để tìm lại port
-        self.port_pattern = extract_port_pattern(port) if port else None
-        self.original_port = port
+        # Statistics
+        self.rtcm_packets_sent = 0
+        self.nmea_packets_sent = 0
+        self.bytes_read = 0
+        self.last_data_time = time.time()
         
-        self.log("INFO", f"GNSSReader initialized for {port} (type: {self.port_pattern.get('type', 'UNKNOWN')})")
+        self.log("INFO", f"GNSSReader initialized for {port} @ {baudrate} baud")
     
     def stop(self):
+        """Stop the reader thread gracefully"""
         self._stop_event.set()
+        self.log("INFO", "GNSSReader stop requested")
     
     def pause(self):
+        """Pause reading (used during chip configuration)"""
         self._pause_event.set()
-        self.log("DEBUG", "GNSSReader paused.")
+        self.log("INFO", "GNSSReader paused")
     
     def resume(self):
+        """Resume reading after pause"""
         self._pause_event.clear()
-        self.log("DEBUG", "GNSSReader resumed.")
+        self.log("INFO", "GNSSReader resumed")
     
-    def _try_find_alternative_port(self) -> str | None:
+    def get_statistics(self):
+        """Return current statistics"""
+        return {
+            "rtcm_packets": self.rtcm_packets_sent,
+            "nmea_packets": self.nmea_packets_sent,
+            "bytes_read": self.bytes_read,
+            "last_data_time": self.last_data_time,
+            "seconds_since_data": int(time.time() - self.last_data_time)
+        }
+    
+    def _parse_buffer(self, buffer: bytearray) -> bytearray:
         """
-        Tìm port thay thế khi port hiện tại mất
-        Ưu tiên:
-        1. Port cùng loại (ACM tìm ACM, USB tìm USB, COM tìm COM)
-        2. Bất kỳ GNSS port nào
+        Parse buffer for RTCM3 and NMEA packets
+        Returns remaining unparsed buffer
         """
-        if not self.port_pattern:
-            return None
-        
-        self.log("INFO", f"Searching for alternative {self.port_pattern['type']} ports...")
-        
-        # Tìm ports cùng loại
-        available = find_available_ports(self.port_pattern, max_search=20)
-        
-        if available:
-            # Ưu tiên port có số gần với port gốc
-            original_num = self.port_pattern.get('number', 0)
-            available.sort(key=lambda x: abs(extract_port_pattern(x).get('number', 99) - original_num))
+        while len(buffer) > 0:
+            processed = False
             
-            new_port = available[0]
-            self.log("SUCCESS", f"✓ Found alternative port: {new_port}")
-            return new_port
+            # ==================== RTCM3 DETECTION ====================
+            if buffer[0] == 0xD3:
+                # Need at least 3 bytes to read length
+                if len(buffer) < 3:
+                    break
+                
+                # RTCM3 length calculation
+                length = ((buffer[1] & 0x03) << 8) | buffer[2]
+                packet_len = length + 6  # header(3) + payload(length) + CRC(3)
+                
+                # Wait for complete packet
+                if len(buffer) < packet_len:
+                    break
+                
+                # Extract and dispatch RTCM packet
+                packet = bytes(buffer[:packet_len])
+                dispatch_rtcm_data(packet)
+                
+                # Update statistics
+                self.rtcm_packets_sent += 1
+                self.bytes_read += len(packet)
+                self.last_data_time = time.time()
+                
+                # Remove processed packet from buffer
+                buffer = buffer[packet_len:]
+                processed = True
+                continue
+            
+            # ==================== NMEA DETECTION ====================
+            elif buffer[0] == ord('$'):
+                # Look for CRLF terminator
+                end_idx = buffer.find(b'\r\n')
+                
+                if end_idx == -1:
+                    # Incomplete NMEA sentence
+                    # Prevent buffer overflow for malformed data
+                    if len(buffer) > 200:
+                        self.log("WARNING", "Malformed NMEA data detected, clearing buffer")
+                        buffer.clear()
+                    break
+                
+                # Extract and dispatch NMEA sentence
+                packet = bytes(buffer[:end_idx + 2])
+                dispatch_nmea_data(packet)
+                
+                # Update statistics
+                self.nmea_packets_sent += 1
+                self.bytes_read += len(packet)
+                self.last_data_time = time.time()
+                
+                # Remove processed sentence from buffer
+                buffer = buffer[end_idx + 2:]
+                processed = True
+                continue
+            
+            # ==================== UNKNOWN DATA ====================
+            if not processed:
+                # Discard unknown byte
+                buffer.pop(0)
         
-        # Nếu không tìm thấy cùng loại, thử tìm bất kỳ GNSS port nào
-        self.log("WARNING", "No ports of same type found. Searching all GNSS ports...")
-        all_ports = find_available_ports(None)
-        
-        if all_ports:
-            self.log("INFO", f"Found generic GNSS port: {all_ports[0]}")
-            return all_ports[0]
-        
-        return None
+        return buffer
     
     def run(self):
         """
-        Universal GNSS Reader - Works on Windows (COM), Linux (USB/ACM)
+        Main reader loop
+        - Connects to serial port
+        - Reads data continuously
+        - Parses RTCM3 and NMEA
+        - Auto-reconnects on failure
         """
         if not self.port:
-            self.log("ERROR", "GNSSReader: No serial port configured. Thread will not run.")
+            self.log("ERROR", "GNSSReader: No serial port configured. Thread exiting.")
             return
         
-        error_count = 0
-        buffer = bytearray()
-        last_error_log_time = 0
-        current_port = self.port
+        self.log("SUCCESS", f"🚀 GNSSReader thread started for {self.port}")
         
-        self.log("INFO", f"🚀 Starting GNSSReader for {current_port}")
+        # Connection management
+        error_count = 0
+        last_error_log_time = 0
+        consecutive_read_failures = 0
+        buffer = bytearray()
         
         while not self._stop_event.is_set():
             try:
-                # === KIỂM TRA PAUSE/LOCK ===
-                if self._pause_event.is_set() or is_remote_locked():
+                # ==================== CHECK PAUSE/LOCK ====================
+                if self._pause_event.is_set():
                     time.sleep(0.5)
                     continue
                 
-                # === KIỂM TRA PORT CÒN TỒN TẠI KHÔNG ===
-                if not port_exists(current_port):
-                    self.log("WARNING", f"⚠️ Port {current_port} disappeared!")
-                    
-                    # Thử tìm port thay thế
-                    alternative = self._try_find_alternative_port()
-                    if alternative:
-                        current_port = alternative
-                        self.port = current_port
-                        # Update pattern cho lần sau
-                        self.port_pattern = extract_port_pattern(current_port)
-                    else:
-                        raise FileNotFoundError(f"Port {current_port} not found and no alternatives available")
+                if is_remote_locked():
+                    if error_count == 0:
+                        self.log("WARNING", "Device is remotely locked, pausing GNSS reader")
+                    time.sleep(1)
+                    continue
                 
-                # === MỞ KẾT NỐI SERIAL ===
-                with serial_port_lock, serial.Serial(
-                    current_port, 
-                    self.baudrate, 
-                    timeout=1,
-                    write_timeout=1
-                ) as ser:
-                    # Reset state
-                    buffer.clear()
-                    
-                    # Log reconnection
-                    if error_count > 0:
-                        self.log("SUCCESS", f"Reconnected to {current_port} after {error_count} failed attempts.")
-                    else:
-                        self.log("SUCCESS", f"Connected to GNSS on {current_port} @ {self.baudrate} baud.")
-                    
-                    error_count = 0
-                    last_error_log_time = 0
-                    consecutive_read_errors = 0
-                    
-                    # === MAIN READ LOOP ===
-                    while not self._stop_event.is_set() and not self._pause_event.is_set() and not is_remote_locked():
-                        try:
-                            # Kiểm tra port còn tồn tại (chỉ cho Linux)
-                            if self.port_pattern.get('platform') == 'linux' and not port_exists(current_port):
-                                self.log("WARNING", f"Port {current_port} disappeared during operation")
+                # ==================== OPEN SERIAL PORT ====================
+                with serial_port_lock:
+                    with serial.Serial(
+                        self.port,
+                        self.baudrate,
+                        timeout=1,
+                        write_timeout=1
+                    ) as ser:
+                        
+                        # Reset state on successful connection
+                        buffer.clear()
+                        consecutive_read_failures = 0
+                        
+                        # Log connection status
+                        if error_count > 0:
+                            self.log("SUCCESS", f"Reconnected to {self.port} after {error_count} failed attempts")
+                        else:
+                            self.log("SUCCESS", f"Connected to GNSS receiver on {self.port}")
+                        
+                        error_count = 0
+                        
+                        # ==================== MAIN READ LOOP ====================
+                        while not self._stop_event.is_set():
+                            # Check pause/lock status
+                            if self._pause_event.is_set():
                                 break
                             
-                            # Đọc dữ liệu
-                            if ser.in_waiting > 0:
-                                new_data = ser.read(ser.in_waiting)
-                                buffer.extend(new_data)
-                                consecutive_read_errors = 0
+                            if is_remote_locked():
+                                break
                             
-                            # === PARSE BUFFER ===
-                            while len(buffer) > 0:
-                                processed_byte = False
+                            try:
+                                # Read available data
+                                if ser.in_waiting > 0:
+                                    new_data = ser.read(ser.in_waiting)
+                                    buffer.extend(new_data)
+                                    consecutive_read_failures = 0
                                 
-                                # --- RTCM3 (0xD3) ---
-                                if buffer[0] == 0xD3:
-                                    if len(buffer) > 2:
-                                        length = ((buffer[1] & 0x03) << 8) | buffer[2]
-                                        packet_len = length + 6
-                                        
-                                        if len(buffer) >= packet_len:
-                                            packet = buffer[:packet_len]
-                                            dispatch_rtcm_data(bytes(packet))
-                                            buffer = buffer[packet_len:]
-                                            processed_byte = True
-                                            continue
+                                # Parse accumulated data
+                                buffer = self._parse_buffer(buffer)
+                                
+                                # Prevent buffer overflow
+                                if len(buffer) > 4096:
+                                    self.log("WARNING", f"Buffer overflow detected ({len(buffer)} bytes), clearing...")
+                                    buffer.clear()
+                                
+                                # Small delay to prevent CPU spinning
+                                time.sleep(0.01)
+                            
+                            except (serial.SerialException, OSError) as read_error:
+                                consecutive_read_failures += 1
+                                
+                                # Only log after multiple failures
+                                if consecutive_read_failures >= 5:
+                                    current_time = time.time()
+                                    if current_time - last_error_log_time > 5:
+                                        self.log("WARNING", f"Read instability on {self.port}: {read_error}")
+                                        last_error_log_time = current_time
+                                    
+                                    # Break out of read loop to reconnect
+                                    buffer.clear()
                                     break
                                 
-                                # --- NMEA ($) ---
-                                elif buffer[0] == ord('$'):
-                                    end_nmea_idx = buffer.find(b'\r\n')
-                                    if end_nmea_idx != -1:
-                                        packet = buffer[:end_nmea_idx + 2]
-                                        dispatch_nmea_data(bytes(packet))
-                                        buffer = buffer[end_nmea_idx + 2:]
-                                        processed_byte = True
-                                        continue
-                                    break
-                                
-                                # --- Byte lạ ---
-                                if not processed_byte:
-                                    buffer.pop(0)
+                                time.sleep(0.1)
                             
-                            time.sleep(0.01)
-                        
-                        except (serial.SerialException, OSError) as inner_e:
-                            consecutive_read_errors += 1
-                            
-                            # Chỉ log sau khi lỗi nhiều lần
-                            if consecutive_read_errors > 5:
+                            except Exception as parse_error:
+                                # Log parsing errors occasionally
                                 current_time = time.time()
-                                if current_time - last_error_log_time > 5:
-                                    self.log("WARNING", f"Connection unstable on {current_port}: {inner_e}")
+                                if current_time - last_error_log_time > 10:
+                                    self.log("ERROR", f"Data parsing error: {str(parse_error)[:100]}")
                                     last_error_log_time = current_time
                                 
+                                # Clear buffer on parse error
                                 buffer.clear()
-                                break
-                            
-                            time.sleep(0.1)
-                        
-                        except Exception as inner_e:
-                            # Lỗi parsing
-                            current_time = time.time()
-                            if current_time - last_error_log_time > 10:
-                                self.log("ERROR", f"🐛 Data parsing error: {str(inner_e)[:100]}")
-                                last_error_log_time = current_time
-                            
-                            buffer.clear()
-                            time.sleep(0.1)
+                                time.sleep(0.1)
             
-            # === XỬ LÝ LỖI KẾT NỐI ===
-            except (serial.SerialException, OSError, FileNotFoundError) as e:
+            # ==================== CONNECTION ERROR HANDLING ====================
+            except (serial.SerialException, OSError, FileNotFoundError) as conn_error:
                 error_count += 1
                 
-                # Exponential backoff
-                wait_time = min(5 * error_count, 60)
+                # Exponential backoff (capped at 30 seconds)
+                wait_time = min(5 * error_count, 30)
                 
-                # Throttle logging
+                # Throttled logging
                 current_time = time.time()
                 should_log = (
-                    error_count == 1 or
-                    error_count <= 3 or
-                    error_count % 10 == 0 or
-                    (current_time - last_error_log_time) > 30
+                    error_count == 1 or  # First error
+                    error_count <= 3 or  # First few retries
+                    error_count % 10 == 0 or  # Every 10th retry
+                    (current_time - last_error_log_time) > 30  # Every 30 seconds
                 )
                 
                 if should_log:
                     if error_count == 1:
-                        error_desc = "disappeared" if "FileNotFoundError" in str(type(e).__name__) else "connection lost"
-                        self.log("WARNING", f"Port {current_port} {error_desc}: {str(e)[:100]}")
+                        if "FileNotFoundError" in str(type(conn_error).__name__):
+                            self.log("ERROR", f"Port {self.port} disappeared (device unplugged?)")
+                        else:
+                            self.log("WARNING", f"Connection lost on {self.port}: {str(conn_error)[:100]}")
                     elif error_count <= 3:
-                        self.log("WARNING", f"Reconnection attempt #{error_count} in {wait_time}s...")
+                        self.log("INFO", f"Reconnection attempt #{error_count} in {wait_time}s...")
                     else:
-                        self.log("ERROR", f"Persistent failure (attempt {error_count}). Next retry in {wait_time}s")
+                        self.log("WARNING", f"Persistent failure (attempt {error_count}). Next retry in {wait_time}s")
                     
                     last_error_log_time = current_time
                 
+                # Clear buffer and wait before retry
                 buffer.clear()
                 time.sleep(wait_time)
             
-            except Exception as e:
+            except Exception as critical_error:
                 error_count += 1
-                self.log("ERROR", f"Critical error in GNSSReader: {e}", exc_info=True)
+                self.log("ERROR", f"Critical error in GNSSReader: {critical_error}", exc_info=True)
                 buffer.clear()
                 time.sleep(min(5 * error_count, 30))
         
-        self.log("INFO", "GNSSReader thread stopped.")
+        # ==================== CLEANUP ====================
+        self.log("INFO", f"GNSSReader thread stopped. Statistics: {self.get_statistics()}")
 
 class AgentManager:
     def __init__(self, serial_number):
@@ -1138,6 +1048,9 @@ class AgentManager:
             "service_config": self.get_service_config(),
             "is_locked": is_remote_locked()
         }
+
+        if hasattr(self, 'gnss_reader') and self.gnss_reader:
+            status["gnss_stats"] = self.gnss_reader.get_statistics()
 
         with self.stats_lock:
             if self.service_stats:
@@ -1273,42 +1186,40 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
             if commands_b64 and port:
                 if gnss_reader:
                     gnss_reader.pause()
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(1.0)
                 
                 try:
-                    with serial_port_lock, serial.Serial(port, DEFAULT_BAUDRATE, timeout=1) as ser:
+                    with serial_port_lock, serial.Serial(port, DEFAULT_BAUDRATE, timeout=2) as ser:
                         for cmd_b64 in commands_b64:
                             decoded_cmd = base64.b64decode(cmd_b64)
                             
-                            # === XỬ LÝ DELAY MARKERS ===
+                            # Handle delay markers
                             if decoded_cmd == b'$DELAY_500$':
-                                logging.info("  -> Waiting 500ms between commands...")
                                 await asyncio.sleep(0.5)
                                 continue
                             elif decoded_cmd == b'$DELAY_200$':
-                                logging.info("  -> Waiting 200ms between commands...")
                                 await asyncio.sleep(0.2)
                                 continue
                             
-                            # Gửi lệnh thực tế
+                            # Send command
                             logging.info(f"  -> Sending: {decoded_cmd.decode('ascii', errors='ignore').strip()}")
                             ser.write(decoded_cmd)
                             ser.flush()
+                            await asyncio.sleep(0.5)
                             
-                            # Đọc response nếu có
-                            await asyncio.sleep(0.3)
+                            # Read response
                             if ser.in_waiting > 0:
                                 response = ser.read(ser.in_waiting)
                                 logging.debug(f"     Response: {response.decode('ascii', errors='ignore')[:100]}")
                     
                     current_state = "ONLINE"
-                    logging.info("✓ All base station commands executed successfully")
+                    logging.info("All base station commands executed successfully")
                     
                 except Exception as e:
                     logging.error(f"Raw command execution error: {e}")
                 finally:
                     if gnss_reader:
-                        await asyncio.sleep(1.0)  # Chờ config ổn định
+                        await asyncio.sleep(2.0)  # Wait for chip to stabilize
                         gnss_reader.resume()
         
         elif command == "DEPLOY_SERVICE_CONFIG":
@@ -1440,9 +1351,7 @@ async def websocket_task(agent: AgentManager, gnss_reader: GNSSReader, mqtt_clie
 
 async def status_publisher_task(agent: AgentManager, mqtt_client: mqtt.Client):
     while True:
-        # Random từ 0.5s đến 1.5s để phân tán tải lên server
-        # Thay vì tất cả cùng gửi đúng giây thứ 1
-        await asyncio.sleep(random.uniform(0.8, 1.2)) 
+        await asyncio.sleep(1) 
         await send_status(agent, mqtt_client)
 
 # ==============================================================================
@@ -1530,7 +1439,8 @@ async def main():
         )
         gnss_reader.start()
         logging.info(f"GNSS Reader thread started.")
-    
+    else:
+        logging.error("No valid GNSS port detected - reader not started")
     mqtt_client = setup_mqtt_client(loop, agent, gnss_reader)
     
     agent.nmea_publisher = NMEAPublisher(mqtt_client, MACHINE_SERIAL, loop)
@@ -1558,11 +1468,31 @@ async def main():
     finally:
         logging.info("="*60)
         logging.info("Main loop interrupted. Starting cleanup...")
-        if agent.nmea_publisher and agent.nmea_publisher.is_alive(): agent.nmea_publisher.stop(); agent.nmea_publisher.join(timeout=2)
+        
+        # Stop NMEA publisher
+        if agent.nmea_publisher and agent.nmea_publisher.is_alive():
+            agent.nmea_publisher.stop()
+            agent.nmea_publisher.join(timeout=2)
+        
+        # Stop services
         agent.restart_services()
-        if hasattr(agent, 'ntrip_client_worker') and agent.ntrip_client_worker and agent.ntrip_client_worker.is_alive(): agent.ntrip_client_worker.stop(); agent.ntrip_client_worker.join(timeout=2)
-        if gnss_reader and gnss_reader.is_alive(): gnss_reader.stop(); gnss_reader.join(timeout=2)
-        if mqtt_client: mqtt_client.loop_stop(); mqtt_client.disconnect()
+        
+        # Stop NTRIP client if exists
+        if hasattr(agent, 'ntrip_client_worker') and agent.ntrip_client_worker:
+            if agent.ntrip_client_worker.is_alive():
+                agent.ntrip_client_worker.stop()
+                agent.ntrip_client_worker.join(timeout=2)
+        
+        if gnss_reader and gnss_reader.is_alive():
+            gnss_reader.stop()
+            gnss_reader.join(timeout=3)
+            logging.info("GNSS Reader stopped")
+        
+        # Stop MQTT
+        if mqtt_client:
+            mqtt_client.loop_stop()
+            mqtt_client.disconnect()
+        
         remove_lock_file()
         logging.info("Cleanup complete. Agent stopped.")
 
