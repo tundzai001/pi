@@ -50,7 +50,6 @@ CONFIG_PATH = os.path.join(BASE_DIR, "agent_config.json")
 LICENSE_PATH = os.path.join(BASE_DIR, "license.key")
 LOCK_FILE_PATH = os.path.join(BASE_DIR, "agent.lock")
 REMOTE_LOCK_PATH = os.path.join(BASE_DIR, "remote.lock") 
-SERIAL_FILE_PATH = os.path.join(BASE_DIR, "device_id.txt") 
 
 # --- LOGGING CONFIGURATION ---
 if IS_WINDOWS:
@@ -361,50 +360,48 @@ async def detect_chip_with_retry(max_retries=3, retry_delay=10):
 # === UTILITY FUNCTIONS                                                     ===
 # ==============================================================================
 def get_machine_serial():
+    SERIAL_FILE_PATH = os.path.join(BASE_DIR, "device_id.txt") 
+
     if os.path.exists(SERIAL_FILE_PATH):
         try:
             with open(SERIAL_FILE_PATH, 'r') as f:
                 saved_serial = f.read().strip()
-                if saved_serial and len(saved_serial) > 5:
+                if saved_serial.startswith("LP_") and len(saved_serial) > 10:
                     return saved_serial
-        except Exception as e:
-            logging.warning(f"Could not read existing device_id file: {e}")
-
+        except Exception:
+            pass
     final_serial = ""
 
-    if IS_RASPBERRY_PI:
+    if IS_WINDOWS:
+        try:
+            mac = uuid.getnode()
+
+            mac_str = f"{mac:012X}"
+  
+            final_serial = f"LP_{mac_str}"
+            
+            logging.info(f"Generated new serial from MAC: {final_serial}")
+        except Exception:
+            final_serial = f"LP_RND_{uuid.uuid4().hex[:12]}"
+    
+    elif IS_RASPBERRY_PI:
         try:
             with open('/proc/cpuinfo', 'r') as f:
                 for line in f:
                     if line.startswith('Serial'):
                         final_serial = line.strip().split(':')[-1].strip()
-        except Exception:
-            pass
-        if not final_serial or final_serial == "0000000000000000":
-            final_serial = f"PI_{uuid.uuid4().hex[:12]}"
-    
-    elif IS_WINDOWS:
-        try:
-            mac = uuid.getnode()
-            if (mac >> 40) % 2 == 0: 
-                final_serial = f"LP_{mac:012X}" # LP = LattePanda
-            else:
-                final_serial = f"WIN_{uuid.uuid4().hex[:12]}"
-        except Exception:
-            final_serial = f"WIN_ERR_{uuid.uuid4().hex[:12]}"
-        if final_serial == "LP_000000000000":
-             final_serial = f"WIN_GEN_{uuid.uuid4().hex[:12]}"
+        except: pass
+        if not final_serial: final_serial = f"PI_{uuid.uuid4().hex[:12]}"
     
     else:
-
         final_serial = f"UNK_{uuid.uuid4().hex[:12]}"
 
     try:
         with open(SERIAL_FILE_PATH, 'w') as f:
             f.write(final_serial)
-        logging.info(f"Generated and saved new Machine Serial: {final_serial}")
+            logging.info(f"Saved new serial to {SERIAL_FILE_PATH}")
     except Exception as e:
-        logging.error(f"CRITICAL: Cannot save device ID to file: {e}")
+        logging.error(f"Cannot save device ID: {e}")
 
     return final_serial
 
