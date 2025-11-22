@@ -751,36 +751,71 @@ class GNSSReader(threading.Thread):
     
     def _parse_buffer(self, buffer: bytearray) -> bytearray:
         """
-        Parse buffer for RTCM3 and NMEA packets
-        Returns remaining unparsed buffer
+        Parse buffer for RTCM3, NMEA, and UBX packets
+        Priority: RTCM3 > UBX > NMEA
         """
         while len(buffer) > 0:
             processed = False
             
             # ==================== RTCM3 DETECTION ====================
             if buffer[0] == 0xD3:
-                # Need at least 3 bytes to read length
                 if len(buffer) < 3:
                     break
                 
-                # RTCM3 length calculation
                 length = ((buffer[1] & 0x03) << 8) | buffer[2]
-                packet_len = length + 6  # header(3) + payload(length) + CRC(3)
+                packet_len = length + 6
                 
-                # Wait for complete packet
+                if packet_len > 2048:
+                    self.log("WARNING", f"Invalid RTCM3 length: {packet_len}, discarding byte")
+                    buffer.pop(0)
+                    continue
+                
                 if len(buffer) < packet_len:
                     break
                 
-                # Extract and dispatch RTCM packet
                 packet = bytes(buffer[:packet_len])
                 dispatch_rtcm_data(packet)
                 
-                # Update statistics
                 self.rtcm_packets_sent += 1
                 self.bytes_read += len(packet)
                 self.last_data_time = time.time()
                 
-                # Remove processed packet from buffer
+                buffer = buffer[packet_len:]
+                processed = True
+                continue
+            
+            # ==================== UBX PROTOCOL DETECTION (U-BLOX) ====================
+            elif buffer[0] == 0xB5 and len(buffer) > 1 and buffer[1] == 0x62:
+                # UBX header: 0xB5 0x62 <class> <id> <length_low> <length_high> <payload> <CK_A> <CK_B>
+                if len(buffer) < 8:  # Minimum UBX packet size
+                    break
+                
+                # Extract payload length (little-endian)
+                if len(buffer) < 6:
+                    break
+                
+                payload_length = buffer[4] | (buffer[5] << 8)
+                packet_len = 6 + payload_length + 2  # header(6) + payload + checksum(2)
+                
+                # Sanity check
+                if packet_len > 4096:
+                    self.log("WARNING", f"Invalid UBX length: {packet_len}, discarding byte")
+                    buffer.pop(0)
+                    continue
+                
+                if len(buffer) < packet_len:
+                    break
+                
+                # Extract UBX packet (we don't process it, just discard or log)
+                packet = bytes(buffer[:packet_len])
+                
+                ubx_class = buffer[2]
+                ubx_id = buffer[3]
+                self.log("DEBUG", f"UBX packet received: class=0x{ubx_class:02X}, id=0x{ubx_id:02X}, len={payload_length}")
+                
+                self.bytes_read += len(packet)
+                self.last_data_time = time.time()
+                
                 buffer = buffer[packet_len:]
                 processed = True
                 continue
@@ -791,30 +826,57 @@ class GNSSReader(threading.Thread):
                 end_idx = buffer.find(b'\r\n')
                 
                 if end_idx == -1:
-                    # Incomplete NMEA sentence
-                    # Prevent buffer overflow for malformed data
-                    if len(buffer) > 200:
-                        self.log("WARNING", "Malformed NMEA data detected, clearing buffer")
-                        buffer.clear()
-                    break
+                    # Check if it looks like valid NMEA start
+                    if len(buffer) >= 6:
+                        sentence_start = buffer[:6].decode('ascii', errors='ignore')
+                        if sentence_start.startswith('$G') or sentence_start.startswith('$P'):
+                            # Looks like NMEA, wait for more data
+                            if len(buffer) > 200:
+                                # Too long without CRLF → corrupted
+                                self.log("WARNING", "NMEA sentence too long, discarding")
+                                buffer.pop(0)
+                                continue
+                            else:
+                                break  # Wait for more data
+                        else:
+                            # Not NMEA, discard
+                            buffer.pop(0)
+                            continue
+                    else:
+                        # Not enough data
+                        if len(buffer) > 200:
+                            buffer.pop(0)
+                            continue
+                        break
                 
-                # Extract and dispatch NMEA sentence
-                packet = bytes(buffer[:end_idx + 2])
-                dispatch_nmea_data(packet)
+                # Extract NMEA sentence
+                sentence = buffer[:end_idx + 2]
                 
-                # Update statistics
-                self.nmea_packets_sent += 1
-                self.bytes_read += len(packet)
-                self.last_data_time = time.time()
-                
-                # Remove processed sentence from buffer
-                buffer = buffer[end_idx + 2:]
-                processed = True
-                continue
+                # Validate: Must have checksum
+                if b'*' in sentence:
+                    try:
+                        packet = bytes(sentence)
+                        dispatch_nmea_data(packet)
+                        
+                        self.nmea_packets_sent += 1
+                        self.bytes_read += len(packet)
+                        self.last_data_time = time.time()
+                        
+                        buffer = buffer[end_idx + 2:]
+                        processed = True
+                        continue
+                    except Exception as e:
+                        self.log("DEBUG", f"Invalid NMEA: {e}")
+                        buffer.pop(0)
+                        continue
+                else:
+                    # No checksum → invalid NMEA
+                    buffer.pop(0)
+                    continue
             
             # ==================== UNKNOWN DATA ====================
             if not processed:
-                # Discard unknown byte
+                # Discard unknown byte silently
                 buffer.pop(0)
         
         return buffer
