@@ -1,6 +1,4 @@
-# ==============================================================================
-# == Geodetic Agent - Universal ==
-# ==============================================================================
+#agent_universal.py
 
 import asyncio
 import base64
@@ -953,11 +951,10 @@ class GNSSReader(threading.Thread):
                 try:
                     sentence_str = sentence.decode('ascii', errors='ignore')
                     
-                    # === FILTER: CHỈ GIỮ GSV (SATELLITE INFO) ===
-                    is_gsv = 'GSV' in sentence_str[:10]
+                    important_types = ['GGA', 'GSA', 'GSV']
+                    is_important = any(nmea_type in sentence_str[:10] for nmea_type in important_types)
                     
-                    if is_gsv:
-                        # Dispatch GSV messages
+                    if is_important:
                         has_checksum = b'*' in sentence
                         if has_checksum and 10 <= len(sentence) <= 200:
                             packet = bytes(sentence)
@@ -975,7 +972,6 @@ class GNSSReader(threading.Thread):
                             self.parse_errors += 1
                             continue
                     else:
-                        # Bỏ tất cả NMEA khác (GGA, RMC, GSA, VTG, etc.)
                         buffer = buffer[end_idx + 2:]
                         processed = True
                         continue
@@ -988,7 +984,6 @@ class GNSSReader(threading.Thread):
             
             # ==================== UNKNOWN DATA ====================
             if not processed:
-                # Discard unknown byte silently (could be noise or unsupported protocol)
                 buffer.pop(0)
         
         return buffer
