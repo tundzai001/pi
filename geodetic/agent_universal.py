@@ -66,7 +66,7 @@ else:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- CONNECTION CONFIGURATION ---
-BACKEND_HOST = "45.117.179.134"
+BACKEND_HOST = "aitogy.click"
 MQTT_BROKER = "45.117.179.134"
 MQTT_PORT = 1883
 DEFAULT_BAUDRATE = 115200 if IS_RASPBERRY_PI else 460800
@@ -490,15 +490,28 @@ def dispatch_rtcm_data(data):
             try:
                 queue.put_nowait(data)
             except Full:
-                pass
+                # Drop 2 oldest packets and force insert
+                try:
+                    queue.get_nowait()
+                    queue.get_nowait()
+                    queue.put_nowait(data)
+                except (Empty, Full):
+                    pass
 
 def dispatch_nmea_data(data):
+    """
+    Enhanced NMEA dispatcher with overflow protection
+    """
     with subscriber_lock:
         for queue in list(nmea_subscribers):
             try:
                 queue.put_nowait(data)
             except Full:
-                pass
+                try:
+                    queue.get_nowait()
+                    queue.put_nowait(data)
+                except (Empty, Full):
+                    pass  # Silently skip NMEA on overflow
 
 # ==============================================================================
 # === WORKER CLASSES                                                        ===
@@ -570,11 +583,14 @@ class NTRIPServerWorker(threading.Thread):
         self.daemon = True
         self._stop_event = threading.Event()
         self.name = f"NTRIPServerWorker-{server_id}"
-        self.queue = Queue(maxsize=500)
+        self.queue = Queue(maxsize=3000)
         
         self.bytes_sent = 0
         self.last_stat_update = time.time()
         
+        self.dropped_packets = 0
+        self.last_drop_log = time.time()
+
         with subscriber_lock:
             rtcm_subscribers.append(self.queue)
     
@@ -589,6 +605,11 @@ class NTRIPServerWorker(threading.Thread):
         p_str = self.config.get(f'port{self.server_id}')
         mp = self.config.get(f'mountpoint{self.server_id}')
         pw = self.config.get(f'password{self.server_id}')
+        user = self.config.get(f'username{self.server_id}')
+        if not user or user.strip() == "":
+            user = "source"
+        version = int(self.config.get(f'ntrip_version{self.server_id}', 1))
+
         
         if not all([host, p_str, mp]):
             return
@@ -609,18 +630,42 @@ class NTRIPServerWorker(threading.Thread):
             
             client_socket = None
             try:
-                self.log("INFO", f"S{self.server_id}: Connecting to ntrip://{host}:{port}/{mp}...")
+                self.log("INFO", f"S{self.server_id}: Connecting to ntrip://{host}:{port}/{mp} (v{version}.0)...")
                 client_socket = socket.create_connection((host, port), timeout=10)
                 
-                auth = base64.b64encode(f"source:{pw or ''}".encode('ascii')).decode('ascii')
-                headers = (f"SOURCE {pw or ''} /{mp} HTTP/1.1\r\n"
-                          f"Host: {host}:{port}\r\n"
-                          f"Ntrip-Version: Ntrip/2.0\r\n"
-                          f"User-Agent: NTRIP GeodeticAgent/4.0\r\n"
-                          f"Authorization: Basic {auth}\r\n"
-                          f"Connection: Keep-Alive\r\n\r\n")
+                auth_str = f"{user}:{pw or ''}"
+                auth = base64.b64encode(auth_str.encode('ascii')).decode('ascii')
+
+                # ========== CHỌN HEADER THEO VERSION ==========
+                if version == 2:
+                    # ===== NTRIP v2.0 - HTTP POST =====
+                    self.log("INFO", f"S{self.server_id}: Using NTRIP v2.0 (HTTP POST) with User: {user}")
+                    
+                    headers = (
+                        f"POST /{mp} HTTP/1.1\r\n"
+                        f"Host: {host}:{port}\r\n"
+                        f"Ntrip-Version: Ntrip/2.0\r\n"
+                        f"User-Agent: NTRIP GeodeticAgent/4.1\r\n"
+                        f"Authorization: Basic {auth}\r\n"  # Dùng biến auth mới
+                        f"Transfer-Encoding: chunked\r\n"
+                        f"Connection: Keep-Alive\r\n\r\n"
+                    )
+                else:
+                    # ===== NTRIP v1.0 - SOURCE =====
+                    self.log("INFO", f"S{self.server_id}: Using NTRIP v1.0 (SOURCE)")
+                    
+                    headers = (
+                        f"SOURCE {pw or ''} /{mp} HTTP/1.1\r\n"
+                        f"Host: {host}:{port}\r\n"
+                        f"Ntrip-Version: Ntrip/2.0\r\n"
+                        f"User-Agent: NTRIP GeodeticAgent/4.1\r\n"
+                        f"Authorization: Basic {auth}\r\n" # Thêm Authorization cho chắc chắn
+                        f"Connection: Keep-Alive\r\n\r\n"
+                    )
+                
                 client_socket.sendall(headers.encode('ascii'))
                 response = client_socket.recv(4096)
+                
                 if not (b"ICY 200 OK" in response or b"HTTP/1.1 200 OK" in response):
                     raise ConnectionError(f"Caster rejected: {response.decode(errors='ignore')}")
                 
@@ -631,16 +676,30 @@ class NTRIPServerWorker(threading.Thread):
                 self.last_stat_update = time.time()
                 self.bytes_sent = 0
 
+                # ========== DATA STREAMING LOOP ==========
                 while not self._stop_event.is_set() and not is_remote_locked():
                     try:
                         data_chunk = self.queue.get(timeout=1.0)
-                        client_socket.sendall(data_chunk)
+                        
+                        # ← NẾU v2.0, GỬI THEO CHUNK FORMAT
+                        if version == 2:
+                            chunk_size = hex(len(data_chunk))[2:].encode('ascii')
+                            client_socket.sendall(chunk_size + b'\r\n' + data_chunk + b'\r\n')
+                        else:
+                            # v1.0 - gửi raw
+                            client_socket.sendall(data_chunk)
 
                         self.bytes_sent += len(data_chunk)
 
                     except Empty:
-                        try: client_socket.sendall(b'\r\n')
-                        except Exception: break
+                        try: 
+                            if version == 2:
+                                # Keepalive chunk
+                                client_socket.sendall(b'0\r\n\r\n')
+                            else:
+                                client_socket.sendall(b'\r\n')
+                        except Exception: 
+                            break
 
                     now = time.time()
                     if now - self.last_stat_update >= 1.0:
@@ -715,6 +774,13 @@ class NTRIPClientWorker(threading.Thread):
             self._stop_event.wait(reconnect_interval)
 
 class GNSSReader(threading.Thread):
+    """
+    Enhanced GNSS Reader with:
+    - Buffer overflow protection
+    - Smart packet parsing (RTCM3, UBX, NMEA)
+    - Auto port recovery
+    - Performance monitoring
+    """
     
     def __init__(self, log_callback, port, baudrate):
         super().__init__()
@@ -731,6 +797,8 @@ class GNSSReader(threading.Thread):
         self.nmea_packets_sent = 0
         self.bytes_read = 0
         self.last_data_time = time.time()
+        self.buffer_overflows = 0
+        self.parse_errors = 0
         
         self.log("INFO", f"GNSSReader initialized for {port} @ {baudrate} baud")
     
@@ -756,13 +824,20 @@ class GNSSReader(threading.Thread):
             "nmea_packets": self.nmea_packets_sent,
             "bytes_read": self.bytes_read,
             "last_data_time": self.last_data_time,
-            "seconds_since_data": int(time.time() - self.last_data_time)
+            "seconds_since_data": int(time.time() - self.last_data_time),
+            "buffer_overflows": self.buffer_overflows,
+            "parse_errors": self.parse_errors
         }
     
     def _parse_buffer(self, buffer: bytearray) -> bytearray:
         """
-        Parse buffer for RTCM3, NMEA, and UBX packets
+        Enhanced parser for U-blox and other GNSS chips
         Priority: RTCM3 > UBX > NMEA
+        
+        Improvements:
+        - Better NMEA boundary detection
+        - Overflow protection
+        - Smart error recovery
         """
         while len(buffer) > 0:
             processed = False
@@ -772,17 +847,21 @@ class GNSSReader(threading.Thread):
                 if len(buffer) < 3:
                     break
                 
+                # RTCM3 format: 0xD3 | 6-bit reserved + 10-bit length | payload | CRC24
                 length = ((buffer[1] & 0x03) << 8) | buffer[2]
-                packet_len = length + 6
+                packet_len = length + 6  # header(3) + payload + CRC(3)
                 
+                # Sanity check
                 if packet_len > 2048:
                     self.log("WARNING", f"Invalid RTCM3 length: {packet_len}, discarding byte")
                     buffer.pop(0)
+                    self.parse_errors += 1
                     continue
                 
                 if len(buffer) < packet_len:
-                    break
+                    break  # Wait for more data
                 
+                # Extract and dispatch RTCM3 packet
                 packet = bytes(buffer[:packet_len])
                 dispatch_rtcm_data(packet)
                 
@@ -794,16 +873,16 @@ class GNSSReader(threading.Thread):
                 processed = True
                 continue
             
-            # ==================== UBX PROTOCOL DETECTION (U-BLOX) ====================
+            # ==================== UBX PROTOCOL (U-BLOX) ====================
             elif buffer[0] == 0xB5 and len(buffer) > 1 and buffer[1] == 0x62:
-                # UBX header: 0xB5 0x62 <class> <id> <length_low> <length_high> <payload> <CK_A> <CK_B>
+                # UBX format: 0xB5 0x62 <class> <id> <length_low> <length_high> <payload> <CK_A> <CK_B>
                 if len(buffer) < 8:  # Minimum UBX packet size
                     break
                 
-                # Extract payload length (little-endian)
                 if len(buffer) < 6:
                     break
                 
+                # Extract payload length (little-endian)
                 payload_length = buffer[4] | (buffer[5] << 8)
                 packet_len = 6 + payload_length + 2  # header(6) + payload + checksum(2)
                 
@@ -811,17 +890,21 @@ class GNSSReader(threading.Thread):
                 if packet_len > 4096:
                     self.log("WARNING", f"Invalid UBX length: {packet_len}, discarding byte")
                     buffer.pop(0)
+                    self.parse_errors += 1
                     continue
                 
                 if len(buffer) < packet_len:
-                    break
+                    break  # Wait for more data
                 
-                # Extract UBX packet (we don't process it, just discard or log)
+                # Extract UBX packet (we don't dispatch it, just discard or log)
                 packet = bytes(buffer[:packet_len])
                 
                 ubx_class = buffer[2]
                 ubx_id = buffer[3]
-                self.log("DEBUG", f"UBX packet received: class=0x{ubx_class:02X}, id=0x{ubx_id:02X}, len={payload_length}")
+                
+                # Only log important UBX messages
+                if ubx_class == 0x05:  # ACK/NAK
+                    self.log("DEBUG", f"UBX ACK/NAK: id=0x{ubx_id:02X}")
                 
                 self.bytes_read += len(packet)
                 self.last_data_time = time.time()
@@ -830,74 +913,92 @@ class GNSSReader(threading.Thread):
                 processed = True
                 continue
             
-            # ==================== NMEA DETECTION ====================
+            # ==================== NMEA DETECTION (IMPROVED) ====================
             elif buffer[0] == ord('$'):
-                # Look for CRLF terminator
                 end_idx = buffer.find(b'\r\n')
                 
                 if end_idx == -1:
-                    # Check if it looks like valid NMEA start
                     if len(buffer) >= 6:
-                        sentence_start = buffer[:6].decode('ascii', errors='ignore')
-                        if sentence_start.startswith('$G') or sentence_start.startswith('$P'):
-                            # Looks like NMEA, wait for more data
-                            if len(buffer) > 200:
-                                # Too long without CRLF → corrupted
-                                self.log("WARNING", "NMEA sentence too long, discarding")
+                        try:
+                            sentence_start = buffer[:6].decode('ascii', errors='ignore')
+                            valid_prefixes = ['$GP', '$GN', '$GL', '$GA', '$GB', '$GQ', '$PU', '$BD', '$P']
+                            is_valid_nmea = any(sentence_start.startswith(prefix) for prefix in valid_prefixes)
+                            
+                            if is_valid_nmea:
+                                if len(buffer) > 512:
+                                    next_dollar = buffer.find(b'$', 1)
+                                    if next_dollar > 0:
+                                        buffer = buffer[next_dollar:]
+                                    else:
+                                        buffer = buffer[1:]
+                                    self.parse_errors += 1
+                                    continue
+                                else:
+                                    break
+                            else:
                                 buffer.pop(0)
                                 continue
-                            else:
-                                break  # Wait for more data
-                        else:
-                            # Not NMEA, discard
+                        except Exception:
                             buffer.pop(0)
+                            self.parse_errors += 1
                             continue
                     else:
-                        # Not enough data
-                        if len(buffer) > 200:
+                        if len(buffer) > 512:
                             buffer.pop(0)
                             continue
                         break
                 
-                # Extract NMEA sentence
                 sentence = buffer[:end_idx + 2]
                 
-                # Validate: Must have checksum
-                if b'*' in sentence:
-                    try:
-                        packet = bytes(sentence)
-                        dispatch_nmea_data(packet)
-                        
-                        self.nmea_packets_sent += 1
-                        self.bytes_read += len(packet)
-                        self.last_data_time = time.time()
-                        
+                try:
+                    sentence_str = sentence.decode('ascii', errors='ignore')
+                    
+                    # === FILTER: CHỈ GIỮ GSV (SATELLITE INFO) ===
+                    is_gsv = 'GSV' in sentence_str[:10]
+                    
+                    if is_gsv:
+                        # Dispatch GSV messages
+                        has_checksum = b'*' in sentence
+                        if has_checksum and 10 <= len(sentence) <= 200:
+                            packet = bytes(sentence)
+                            dispatch_nmea_data(packet)
+                            
+                            self.nmea_packets_sent += 1
+                            self.bytes_read += len(packet)
+                            self.last_data_time = time.time()
+                            
+                            buffer = buffer[end_idx + 2:]
+                            processed = True
+                            continue
+                        else:
+                            buffer.pop(0)
+                            self.parse_errors += 1
+                            continue
+                    else:
+                        # Bỏ tất cả NMEA khác (GGA, RMC, GSA, VTG, etc.)
                         buffer = buffer[end_idx + 2:]
                         processed = True
                         continue
-                    except Exception as e:
-                        self.log("DEBUG", f"Invalid NMEA: {e}")
-                        buffer.pop(0)
-                        continue
-                else:
-                    # No checksum → invalid NMEA
+                        
+                except Exception as e:
+                    self.log("DEBUG", f"NMEA filter error: {e}")
                     buffer.pop(0)
+                    self.parse_errors += 1
                     continue
             
             # ==================== UNKNOWN DATA ====================
             if not processed:
-                # Discard unknown byte silently
+                # Discard unknown byte silently (could be noise or unsupported protocol)
                 buffer.pop(0)
         
         return buffer
     
     def run(self):
         """
-        Main reader loop
-        - Connects to serial port
-        - Reads data continuously
-        - Parses RTCM3 and NMEA
-        - Auto-reconnects on failure
+        Main reader loop with AUTO PORT DETECTION
+        - If current port is lost → auto-detect new port
+        - Batch reading for better performance
+        - Multi-pass parsing to prevent buffer overflow
         """
         if not self.port:
             self.log("ERROR", "GNSSReader: No serial port configured. Thread exiting.")
@@ -910,6 +1011,8 @@ class GNSSReader(threading.Thread):
         last_error_log_time = 0
         consecutive_read_failures = 0
         buffer = bytearray()
+        current_port = self.port
+        last_stats_log = time.time()
         
         while not self._stop_event.is_set():
             try:
@@ -924,10 +1027,45 @@ class GNSSReader(threading.Thread):
                     time.sleep(1)
                     continue
                 
+                # ==================== CHECK PORT EXISTENCE ====================
+                available_ports = [p.device for p in serial.tools.list_ports.comports()]
+                
+                if current_port not in available_ports:
+                    self.log("WARNING", f"Port {current_port} disappeared! Attempting auto-redetection...")
+                    
+                    # Auto-detect new port
+                    new_chip_info = find_chip_robustly()
+                    
+                    if new_chip_info and new_chip_info.get("port"):
+                        current_port = new_chip_info["port"]
+                        self.port = current_port
+                        self.baudrate = new_chip_info.get("baud", self.baudrate)
+                        
+                        self.log("SUCCESS", f"Re-detected GNSS chip on NEW PORT: {current_port} @ {self.baudrate}")
+                        error_count = 0
+                        buffer.clear()
+                    else:
+                        self.log("ERROR", "Failed to find GNSS chip. Retrying in 5s...")
+                        time.sleep(5)
+                        continue
+                
+                # ==================== INCREASE KERNEL BUFFER (RASPBERRY PI) ====================
+                try:
+                    if IS_RASPBERRY_PI and error_count == 0:
+                        temp_ser = serial.Serial(current_port, self.baudrate, timeout=0.1)
+                        try:
+                            temp_ser.set_buffer_size(rx_size=16384, tx_size=4096)
+                            self.log("DEBUG", f"Increased serial buffer size for {current_port}")
+                        except AttributeError:
+                            pass  # Method not available in this pyserial version
+                        temp_ser.close()
+                except Exception as e:
+                    self.log("DEBUG", f"Could not set buffer size: {e}")
+                
                 # ==================== OPEN SERIAL PORT ====================
                 with serial_port_lock:
                     with serial.Serial(
-                        self.port,
+                        current_port,
                         self.baudrate,
                         timeout=1,
                         write_timeout=1
@@ -939,9 +1077,9 @@ class GNSSReader(threading.Thread):
                         
                         # Log connection status
                         if error_count > 0:
-                            self.log("SUCCESS", f"Reconnected to {self.port} after {error_count} failed attempts")
+                            self.log("SUCCESS", f"Reconnected to {current_port} after {error_count} failed attempts")
                         else:
-                            self.log("SUCCESS", f"Connected to GNSS receiver on {self.port}")
+                            self.log("SUCCESS", f"Connected to GNSS receiver on {current_port}")
                         
                         error_count = 0
                         
@@ -955,22 +1093,42 @@ class GNSSReader(threading.Thread):
                                 break
                             
                             try:
-                                # Read available data
+                                # === READ IN BATCHES (NOT BYTE-BY-BYTE) ===
                                 if ser.in_waiting > 0:
-                                    new_data = ser.read(ser.in_waiting)
+                                    # Read up to 4KB at once for better performance
+                                    bytes_to_read = min(ser.in_waiting, 4096)
+                                    new_data = ser.read(bytes_to_read)
+                                    
                                     buffer.extend(new_data)
                                     consecutive_read_failures = 0
-                                
-                                # Parse accumulated data
-                                buffer = self._parse_buffer(buffer)
+                                    
+                                    # === MULTI-PASS PARSING ===
+                                    # Parse multiple times in one cycle to prevent buffer overflow
+                                    parse_attempts = 0
+                                    while len(buffer) > 0 and parse_attempts < 10:
+                                        old_len = len(buffer)
+                                        buffer = self._parse_buffer(buffer)
+                                        
+                                        # If buffer didn't shrink → stop parsing
+                                        if len(buffer) >= old_len:
+                                            break
+                                        parse_attempts += 1
                                 
                                 # Prevent buffer overflow
-                                if len(buffer) > 4096:
-                                    self.log("WARNING", f"Buffer overflow detected ({len(buffer)} bytes), clearing...")
+                                if len(buffer) > 8192:  # Increased from 4096
+                                    self.log("WARNING", f"Buffer overflow ({len(buffer)} bytes) - clearing")
                                     buffer.clear()
+                                    self.buffer_overflows += 1
                                 
-                                # Small delay to prevent CPU spinning
-                                time.sleep(0.01)
+                                # === LOG STATISTICS PERIODICALLY ===
+                                current_time = time.time()
+                                if current_time - last_stats_log > 30:  # Every 30 seconds
+                                    stats = self.get_statistics()
+                                    #self.log("INFO", f"GNSS Stats: RTCM={stats['rtcm_packets']}, NMEA={stats['nmea_packets']}, Errors={stats['parse_errors']}, Overflows={stats['buffer_overflows']}")
+                                    last_stats_log = current_time
+                                
+                                # Reduce CPU usage (3ms sleep = ~200 cycles/sec)
+                                time.sleep(0.003)
                             
                             except (serial.SerialException, OSError) as read_error:
                                 consecutive_read_failures += 1
@@ -979,7 +1137,7 @@ class GNSSReader(threading.Thread):
                                 if consecutive_read_failures >= 5:
                                     current_time = time.time()
                                     if current_time - last_error_log_time > 5:
-                                        self.log("WARNING", f"Read instability on {self.port}: {read_error}")
+                                        self.log("WARNING", f"Read instability on {current_port}: {read_error}")
                                         last_error_log_time = current_time
                                     
                                     # Break out of read loop to reconnect
@@ -997,6 +1155,7 @@ class GNSSReader(threading.Thread):
                                 
                                 # Clear buffer on parse error
                                 buffer.clear()
+                                self.parse_errors += 1
                                 time.sleep(0.1)
             
             # ==================== CONNECTION ERROR HANDLING ====================
@@ -1018,9 +1177,9 @@ class GNSSReader(threading.Thread):
                 if should_log:
                     if error_count == 1:
                         if "FileNotFoundError" in str(type(conn_error).__name__):
-                            self.log("ERROR", f"Port {self.port} disappeared (device unplugged?)")
+                            self.log("ERROR", f"Port {current_port} disappeared (device unplugged?)")
                         else:
-                            self.log("WARNING", f"Connection lost on {self.port}: {str(conn_error)[:100]}")
+                            self.log("WARNING", f"Connection lost on {current_port}: {str(conn_error)[:100]}")
                     elif error_count <= 3:
                         self.log("INFO", f"Reconnection attempt #{error_count} in {wait_time}s...")
                     else:
@@ -1039,7 +1198,7 @@ class GNSSReader(threading.Thread):
                 time.sleep(min(5 * error_count, 30))
         
         # ==================== CLEANUP ====================
-        self.log("INFO", f"GNSSReader thread stopped. Statistics: {self.get_statistics()}")
+        self.log("INFO", f"GNSSReader thread stopped. Final statistics: {self.get_statistics()}")
 
 class AgentManager:
     def __init__(self, serial_number):
@@ -1118,7 +1277,9 @@ class AgentManager:
             "is_provisioned": self.config.get('is_provisioned', False),
             "base_config": self.get_base_config(),
             "service_config": self.get_service_config(),
-            "is_locked": is_remote_locked()
+            "is_locked": is_remote_locked(),
+            "is_synced": True
+
         }
 
         if hasattr(self, 'gnss_reader') and self.gnss_reader:
@@ -1293,12 +1454,17 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
                     if gnss_reader:
                         await asyncio.sleep(2.0)  # Wait for chip to stabilize
                         gnss_reader.resume()
+                    current_state = "ONLINE"
+                    logging.info("✓ Base config applied successfully")
+
+                    await send_status(agent, mqtt_client)
         
         elif command == "DEPLOY_SERVICE_CONFIG":
             agent.update_service_config(payload)
             agent.restart_services()
             current_state = "ONLINE"
-        
+            await send_status(agent, mqtt_client)
+            
         elif command == "DELETE_DEVICE":
             if agent.nmea_publisher:
                 agent.nmea_publisher.stop()
@@ -1400,7 +1566,13 @@ async def websocket_task(agent: AgentManager, gnss_reader: GNSSReader, mqtt_clie
     
     while True:
         try:
-            async with websockets.connect(ws_uri) as websocket:
+            async with websockets.connect(
+                ws_uri,
+                ping_interval=20,
+                ping_timeout=10,
+                close_timeout=10,
+                open_timeout=30  # Tăng timeout handshake
+            ) as websocket:
                 logging.info(f"Secondary channel (WebSocket) connected: {ws_uri}")
                 active_websocket_connection = websocket
                 
@@ -1410,13 +1582,18 @@ async def websocket_task(agent: AgentManager, gnss_reader: GNSSReader, mqtt_clie
                     data = json.loads(message)
                     await process_command('websocket', data, agent, gnss_reader, mqtt_client)
 
+        except asyncio.TimeoutError:
+            logging.warning("WebSocket connection timeout. Retrying in 10s...")
+            await asyncio.sleep(10)
+        except websockets.exceptions.WebSocketException as e:
+            logging.warning(f"WebSocket error: {e}. Retrying in 10s...")
+            await asyncio.sleep(10)
         except Exception as e:
-            
             if mqtt_client and mqtt_client.is_connected():
-                logging.info(f"Secondary channel (WebSocket) failed to connect (Main MQTT channel is still running). Will retry in 10 seconds. Error: {e}")
+                logging.info(f"Secondary channel (WebSocket) failed. Main MQTT OK. Retry in 10s. Error: {e}")
             else:
-                logging.warning(f"WARNING: Both the main channel (MQTT) and the secondary channel (WebSocket) failed to connect. Will retry in 10 seconds. Error: {e}")
-
+                logging.warning(f"WARNING: Both MQTT and WebSocket failed. Retry in 10s. Error: {e}")
+            await asyncio.sleep(10)
         finally:
             active_websocket_connection = None
             await asyncio.sleep(10)
