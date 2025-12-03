@@ -126,7 +126,6 @@ def generate_pi_license_base(serial_number: str) -> str:
 # === EMBEDDED CHIP DETECTOR                                                ===
 # ==============================================================================
 def get_chip_info(port: str, baudrate: int) -> dict | None:
-    """Improved detection - test command TRƯỚC khi listen passive"""
     try:
         with serial.Serial(port, baudrate, timeout=2) as ser:
             # Test U-blox first
@@ -140,7 +139,6 @@ def get_chip_info(port: str, baudrate: int) -> dict | None:
     except Exception:
         pass
     
-    # Test Unicorecomm với nhiều lệnh
     unicore_test_commands = [
         b'version\r\n',
         b'config version\r\n',
@@ -155,8 +153,7 @@ def get_chip_info(port: str, baudrate: int) -> dict | None:
                 ser.flush()
                 time.sleep(1.5)
                 response = ser.read(1024)
-                
-                # Kiểm tra các keyword Unicorecomm
+            
                 unicore_keywords = [b'Unicore', b'UM982', b'UM9', b'UB4', b'FIRMWARE', b'COMPTYPE']
                 if any(keyword in response for keyword in unicore_keywords):
                     return {"type": "Unicorecomm"}
@@ -166,10 +163,6 @@ def get_chip_info(port: str, baudrate: int) -> dict | None:
     return None
 
 def find_chip_robustly():
-    """
-    Enhanced detection - ƯU TIÊN ACTIVE PROBE trước khi passive listen
-    Tránh nhầm UM982 thành Generic_NMEA
-    """
     common_baud_rates = [115200, 460800, 921600, 230400, 38400, 9600]
     ports = serial.tools.list_ports.comports()
     
@@ -180,7 +173,6 @@ def find_chip_robustly():
     logging.info("[ChipDetector] Starting ACTIVE COMMAND-BASED scan...")
     
     # ========== PHASE 1: ACTIVE COMMAND PROBING ==========
-    # Test tất cả ports với commands TRƯỚC
     for port in ports:
         if 'bluetooth' in port.device.lower() or 'rfcomm' in port.device.lower():
             continue
@@ -198,14 +190,12 @@ def find_chip_robustly():
             for cmd in unicore_commands:
                 try:
                     with serial.Serial(port.device, baud, timeout=2.5, write_timeout=2.0) as ser:
-                        # Clear buffer trước
                         ser.reset_input_buffer()
                         ser.reset_output_buffer()
                         
-                        # Gửi lệnh
                         ser.write(cmd)
                         ser.flush()
-                        time.sleep(2.0)  # Chờ response đủ lâu
+                        time.sleep(2.0)  
                         
                         if ser.in_waiting > 0:
                             response = ser.read(ser.in_waiting)
@@ -261,11 +251,9 @@ def find_chip_robustly():
                         
                         # Check for NMEA (last resort)
                         elif b'$GP' in raw_data or b'$GN' in raw_data:
-                            # Thử xác định chip type qua NMEA messages
                             if b'$PUBX' in raw_data:
                                 chip_type = "Ublox"
                             else:
-                                # Có thể là UM982 nhưng không test được command
                                 logging.warning(f"    Detected NMEA on {port.device} - might be UM982")
                                 chip_type = "Generic_NMEA"
                             
@@ -281,9 +269,6 @@ def find_chip_robustly():
 
 
 def find_chip_fallback():
-    """
-    Fallback detection - cố gắng tắt NMEA output trước khi test
-    """
     logging.info("[ChipDetector] Running FALLBACK detection with NMEA disable...")
     ports = serial.tools.list_ports.comports()
     
@@ -296,7 +281,6 @@ def find_chip_fallback():
         for baud in [115200, 460800, 921600, 38400]:
             try:
                 with serial.Serial(port.device, baud, timeout=3) as ser:
-                    # Thử tắt NMEA output cho Unicorecomm
                     ser.reset_input_buffer()
                     ser.write(b'unlog\r\n')
                     ser.flush()
@@ -357,6 +341,7 @@ async def detect_chip_with_retry(max_retries=3, retry_delay=10):
 # ==============================================================================
 # === UTILITY FUNCTIONS                                                     ===
 # ==============================================================================
+
 def get_machine_serial():
     SERIAL_FILE_PATH = os.path.join(BASE_DIR, "device_id.txt") 
 
@@ -634,7 +619,6 @@ class NTRIPServerWorker(threading.Thread):
                 auth_str = f"{user}:{pw or ''}"
                 auth = base64.b64encode(auth_str.encode('ascii')).decode('ascii')
 
-                # ========== CHỌN HEADER THEO VERSION ==========
                 if version == 2:
                     # ===== NTRIP v2.0 - HTTP POST =====
                     self.log("INFO", f"S{self.server_id}: Using NTRIP v2.0 (HTTP POST) with User: {user}")
@@ -644,7 +628,7 @@ class NTRIPServerWorker(threading.Thread):
                         f"Host: {host}:{port}\r\n"
                         f"Ntrip-Version: Ntrip/2.0\r\n"
                         f"User-Agent: NTRIP GeodeticAgent/4.1\r\n"
-                        f"Authorization: Basic {auth}\r\n"  # Dùng biến auth mới
+                        f"Authorization: Basic {auth}\r\n" 
                         f"Transfer-Encoding: chunked\r\n"
                         f"Connection: Keep-Alive\r\n\r\n"
                     )
@@ -657,7 +641,7 @@ class NTRIPServerWorker(threading.Thread):
                         f"Host: {host}:{port}\r\n"
                         f"Ntrip-Version: Ntrip/2.0\r\n"
                         f"User-Agent: NTRIP GeodeticAgent/4.1\r\n"
-                        f"Authorization: Basic {auth}\r\n" # Thêm Authorization cho chắc chắn
+                        f"Authorization: Basic {auth}\r\n" 
                         f"Connection: Keep-Alive\r\n\r\n"
                     )
                 
@@ -679,12 +663,10 @@ class NTRIPServerWorker(threading.Thread):
                     try:
                         data_chunk = self.queue.get(timeout=1.0)
                         
-                        # ← NẾU v2.0, GỬI THEO CHUNK FORMAT
                         if version == 2:
                             chunk_size = hex(len(data_chunk))[2:].encode('ascii')
                             client_socket.sendall(chunk_size + b'\r\n' + data_chunk + b'\r\n')
                         else:
-                            # v1.0 - gửi raw
                             client_socket.sendall(data_chunk)
 
                         self.bytes_sent += len(data_chunk)
@@ -762,7 +744,7 @@ class NTRIPClientWorker(threading.Thread):
                 
                 while not self._stop_event.is_set() and not is_remote_locked():
                     rtcm_data = client_socket.recv(1024)
-                    if not rtcm_data: break # Ket noi dong
+                    if not rtcm_data: break
                     dispatch_rtcm_data(rtcm_data)
 
             except Exception as e:
@@ -772,14 +754,6 @@ class NTRIPClientWorker(threading.Thread):
             self._stop_event.wait(reconnect_interval)
 
 class GNSSReader(threading.Thread):
-    """
-    Enhanced GNSS Reader with:
-    - Buffer overflow protection
-    - Smart packet parsing (RTCM3, UBX, NMEA)
-    - Auto port recovery
-    - Performance monitoring
-    """
-    
     def __init__(self, log_callback, port, baudrate):
         super().__init__()
         self.log = log_callback
@@ -801,22 +775,18 @@ class GNSSReader(threading.Thread):
         self.log("INFO", f"GNSSReader initialized for {port} @ {baudrate} baud")
     
     def stop(self):
-        """Stop the reader thread gracefully"""
         self._stop_event.set()
         self.log("INFO", "GNSSReader stop requested")
     
     def pause(self):
-        """Pause reading (used during chip configuration)"""
         self._pause_event.set()
         self.log("INFO", "GNSSReader paused")
     
     def resume(self):
-        """Resume reading after pause"""
         self._pause_event.clear()
         self.log("INFO", "GNSSReader resumed")
     
     def get_statistics(self):
-        """Return current statistics"""
         return {
             "rtcm_packets": self.rtcm_packets_sent,
             "nmea_packets": self.nmea_packets_sent,
@@ -828,15 +798,6 @@ class GNSSReader(threading.Thread):
         }
     
     def _parse_buffer(self, buffer: bytearray) -> bytearray:
-        """
-        Enhanced parser for U-blox and other GNSS chips
-        Priority: RTCM3 > UBX > NMEA
-        
-        Improvements:
-        - Better NMEA boundary detection
-        - Overflow protection
-        - Smart error recovery
-        """
         while len(buffer) > 0:
             processed = False
             
@@ -989,12 +950,6 @@ class GNSSReader(threading.Thread):
         return buffer
     
     def run(self):
-        """
-        Main reader loop with AUTO PORT DETECTION
-        - If current port is lost → auto-detect new port
-        - Batch reading for better performance
-        - Multi-pass parsing to prevent buffer overflow
-        """
         if not self.port:
             self.log("ERROR", "GNSSReader: No serial port configured. Thread exiting.")
             return
@@ -1286,7 +1241,6 @@ class AgentManager:
             status["ntrip_connected"] = any(self.ntrip_connection_status.values())
             status["ntrip_status"] = self.ntrip_connection_status.copy()
             
-            # Thêm warning nếu BPS thấp
             for key, bps in self.service_stats.items():
                 if 'bps' in key and bps > 0 and bps < 100:
                     status["warning"] = f"Low data rate detected on {key}: {bps} bps"
@@ -1566,7 +1520,7 @@ async def websocket_task(agent: AgentManager, gnss_reader: GNSSReader, mqtt_clie
                 ping_interval=20,
                 ping_timeout=10,
                 close_timeout=10,
-                open_timeout=30  # Tăng timeout handshake
+                open_timeout=30  
             ) as websocket:
                 logging.info(f"Secondary channel (WebSocket) connected: {ws_uri}")
                 active_websocket_connection = websocket
