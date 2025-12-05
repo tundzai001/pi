@@ -464,6 +464,57 @@ def remove_remote_lock():
             return False
     return False
 
+def get_system_info() -> dict:
+    try:
+        # CPU
+        cpu_percent = psutil.cpu_percent(interval=1)
+        cpu_freq = psutil.cpu_freq()
+        
+        # Temperature (Raspberry Pi)
+        temp = None
+        if IS_RASPBERRY_PI:
+            try:
+                with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
+                    temp = float(f.read().strip()) / 1000.0  # Celsius
+            except:
+                pass
+        
+        # Memory
+        mem = psutil.virtual_memory()
+        
+        # Disk
+        disk = psutil.disk_usage('/')
+        
+        # Uptime
+        boot_time = psutil.boot_time()
+        uptime_seconds = int(time.time() - boot_time)
+        
+        return {
+            "cpu": {
+                "usage_percent": round(cpu_percent, 1),
+                "frequency_mhz": round(cpu_freq.current, 0) if cpu_freq else None,
+                "count": psutil.cpu_count()
+            },
+            "temperature": {
+                "celsius": round(temp, 1) if temp else None
+            },
+            "memory": {
+                "total_mb": round(mem.total / (1024**2), 0),
+                "used_mb": round(mem.used / (1024**2), 0),
+                "percent": round(mem.percent, 1)
+            },
+            "disk": {
+                "total_gb": round(disk.total / (1024**3), 1),
+                "used_gb": round(disk.used / (1024**3), 1),
+                "percent": round(disk.percent, 1)
+            },
+            "uptime_seconds": uptime_seconds,
+            "timestamp": int(time.time())
+        }
+    except Exception as e:
+        logging.error(f"Error collecting system info: {e}")
+        return {}
+    
 # ==============================================================================
 # === DISPATCHER FUNCTIONS                                                  ===
 # ==============================================================================
@@ -1287,7 +1338,16 @@ async def send_status(agent: AgentManager, mqtt_client: mqtt.Client):
     await initialization_complete.wait()
     
     status_payload = agent.get_full_status()
+    
+    try:
+        system_info = get_system_info()
+        if system_info:
+            status_payload['system_info'] = system_info
+            logging.debug(f"System info collected: CPU={system_info.get('cpu', {}).get('usage_percent')}%, Temp={system_info.get('temperature', {}).get('celsius')}°C")
+    except Exception as e:
+        logging.error(f"Failed to collect system info: {e}")
 
+    # Gửi qua WebSocket
     if active_websocket_connection:
         try:
             ws_message = {"type": "status_update", "payload": status_payload}
@@ -1295,6 +1355,7 @@ async def send_status(agent: AgentManager, mqtt_client: mqtt.Client):
         except Exception as e:
             logging.error(f"Failed to send status via WebSocket: {e}")
 
+    # Gửi qua MQTT
     if mqtt_client and mqtt_client.is_connected():
         try:
             topic = f"pi/devices/{MACHINE_SERIAL}/status"
