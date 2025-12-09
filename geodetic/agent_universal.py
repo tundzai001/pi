@@ -67,6 +67,9 @@ else:
 BACKEND_HOST = "aitogy.click"
 MQTT_BROKER = "45.117.179.134"
 MQTT_PORT = 1883
+# === THÊM 2 DÒNG NÀY ===
+MQTT_USERNAME = os.getenv("MQTT_USERNAME", "mqttUser")
+MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "MqttPassword123$%^")
 DEFAULT_BAUDRATE = 115200 if IS_RASPBERRY_PI else 460800
 
 # --- GLOBAL VARIABLES ---
@@ -79,6 +82,8 @@ current_state = "INITIALIZING"
 active_websocket_connection = None
 is_remotely_locked = False 
 initialization_complete = asyncio.Event()
+# Last parsed GGA fix status (updated by NMEA dispatcher)
+LAST_GGA_FIX_STATUS = "NO_FIX"
 
 # ==============================================================================
 # === EMBEDDED LICENSE MANAGER                                              ===
@@ -485,7 +490,7 @@ def get_system_info() -> dict:
         # Disk
         disk = psutil.disk_usage('/')
         
-        # Uptime
+        # Uptime (seconds)
         boot_time = psutil.boot_time()
         uptime_seconds = int(time.time() - boot_time)
         
@@ -515,6 +520,53 @@ def get_system_info() -> dict:
         logging.error(f"Error collecting system info: {e}")
         return {}
     
+def parse_gga_fix_status(gga_sentence: str) -> str:
+    """
+    Parse NMEA GGA sentence để lấy Fix Quality
+
+    GGA Fix Quality:
+    0 = Invalid
+    1 = GPS Fix (SPS)
+    2 = DGPS Fix
+    4 = RTK Fixed
+    5 = RTK Float
+    """
+    try:
+        # Ensure we only operate on the GGA line
+        s = gga_sentence.strip()
+        # If sentence contains multiple lines, pick the first line with GGA
+        lines = s.split('\n')
+        line = None
+        for l in lines:
+            if 'GGA' in l:
+                line = l.strip()
+                break
+        if line is None:
+            line = s
+
+        parts = line.split(',')
+        if len(parts) < 7:
+            return "NO_FIX"
+
+        # The fix quality is the 7th field (index 6)
+        try:
+            fix_quality = int(parts[6])
+        except Exception:
+            return "NO_FIX"
+
+        if fix_quality == 4:
+            return "RTK_FIXED"
+        elif fix_quality == 5:
+            return "RTK_FLOAT"
+        elif fix_quality == 2:
+            return "DGPS"
+        elif fix_quality == 1:
+            return "GPS_FIX"
+        else:
+            return "NO_FIX"
+    except Exception:
+        return "NO_FIX"
+    
 # ==============================================================================
 # === DISPATCHER FUNCTIONS                                                  ===
 # ==============================================================================
@@ -537,6 +589,30 @@ def dispatch_nmea_data(data):
     Enhanced NMEA dispatcher with overflow protection
     """
     with subscriber_lock:
+        # Try to detect GGA sentences and update last-known fix status
+        try:
+            s = None
+            if isinstance(data, (bytes, bytearray)):
+                s = data.decode('ascii', errors='ignore')
+            elif isinstance(data, str):
+                s = data
+
+            if s and '$G' in s and 'GGA' in s[:10]:
+                # If this is a GGA sentence, parse fix quality
+                try:
+                    # import local parser
+                    new_status = parse_gga_fix_status(s)
+                    globals()['LAST_GGA_FIX_STATUS'] = new_status
+                    # If an AgentManager instance exists in globals, update it too
+                    ag = globals().get('agent')
+                    if ag and hasattr(ag, 'last_gga_fix_status'):
+                        ag.last_gga_fix_status = new_status
+                except Exception:
+                    pass
+
+        except Exception:
+            pass
+
         for queue in list(nmea_subscribers):
             try:
                 queue.put_nowait(data)
@@ -1212,6 +1288,8 @@ class AgentManager:
         self.ntrip_connection_status = {} 
         self.stats_lock = threading.Lock()
         self.log = lambda lvl, msg: logging.log(getattr(logging, lvl.upper(), logging.INFO), msg)
+        # Last-known RTK/GGA fix status (updated asynchronously by NMEA dispatcher)
+        self.last_gga_fix_status = globals().get('LAST_GGA_FIX_STATUS', 'NO_FIX')
         self.load_config()
     
     def load_config(self):
@@ -1272,6 +1350,8 @@ class AgentManager:
             "name": self.config.get('device_name'),
             "status": final_status, 
             "timestamp": int(time.time()),
+            "rtk_fix_status": getattr(self, 'last_gga_fix_status', globals().get('LAST_GGA_FIX_STATUS', 'NO_FIX')),
+            "base_mode_active": bool(self.get_base_config()),
             "detected_chip_type": self.detected_chip.get("type", "UNKNOWN"),
             "detected_chip_port": self.detected_chip.get("port"),
             "detected_chip_baud": self.detected_chip.get("baud"),
@@ -1558,6 +1638,10 @@ def setup_mqtt_client(loop: asyncio.AbstractEventLoop, agent: AgentManager, gnss
     client.on_connect = on_connect
     client.on_message = on_message
     client.reconnect_delay_set(min_delay=5, max_delay=120)
+
+    if MQTT_USERNAME and MQTT_PASSWORD:
+        client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+    # ==================================
     
     last_will = json.dumps({
         "serial": MACHINE_SERIAL,
