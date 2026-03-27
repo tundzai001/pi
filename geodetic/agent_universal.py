@@ -71,6 +71,11 @@ MQTT_PORT = 1883
 MQTT_USERNAME = os.getenv("MQTT_USERNAME", "mqttUser")
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "MqttPassword123$%^")
 DEFAULT_BAUDRATE = 115200 if IS_RASPBERRY_PI else 460800
+STATUS_PUBLISH_INTERVAL_SECONDS = int(os.getenv("STATUS_PUBLISH_INTERVAL_SECONDS", "5"))
+NMEA_IDLE_PUBLISH_INTERVAL_SECONDS = float(os.getenv("NMEA_IDLE_PUBLISH_INTERVAL_SECONDS", "1.0"))
+# Force-enable parser debug in code (no environment variable required).
+PARSER_DEBUG_ENABLED = False
+PARSER_DEBUG_INTERVAL_SECONDS = 2.0
 
 # --- GLOBAL VARIABLES ---
 MACHINE_SERIAL = ""
@@ -84,6 +89,13 @@ is_remotely_locked = False
 initialization_complete = asyncio.Event()
 # Last parsed GGA fix status (updated by NMEA dispatcher)
 LAST_GGA_FIX_STATUS = "NO_FIX"
+# RTCM stream active flag (controlled by SET_RTCM_STREAM_ACTIVE command)
+rtcm_stream_active_flag = False
+# Internal RTCM ingress bitrate tracker (independent from NTRIP socket forwarding)
+rtcm_input_stats_lock = threading.Lock()
+rtcm_input_window_bytes = 0
+rtcm_input_window_start_ts = time.time()
+rtcm_input_bps = 0
 
 # ==============================================================================
 # === EMBEDDED LICENSE MANAGER                                              ===
@@ -566,11 +578,112 @@ def parse_gga_fix_status(gga_sentence: str) -> str:
             return "NO_FIX"
     except Exception:
         return "NO_FIX"
+
+def _crc24q(data: bytes) -> int:
+    crc = 0
+    poly = 0x1864CFB
+    for byte in data:
+        crc ^= byte << 16
+        for _ in range(8):
+            crc <<= 1
+            if crc & 0x1000000:
+                crc ^= poly
+            crc &= 0xFFFFFF
+    return crc
+
+def is_valid_rtcm3_packet(packet: bytes) -> bool:
+    if not packet or len(packet) < 6 or packet[0] != 0xD3:
+        return False
+
+    payload_len = ((packet[1] & 0x03) << 8) | packet[2]
+    if len(packet) != payload_len + 6:
+        return False
+
+    expected_crc = _crc24q(packet[:-3])
+    packet_crc = (packet[-3] << 16) | (packet[-2] << 8) | packet[-1]
+    return expected_crc == packet_crc
+
+
+def extract_valid_rtcm3_packets(stream_buffer: bytearray, max_packet_len: int = 2048) -> list[bytes]:
+    """Extract only complete, CRC-valid RTCM3 packets from a streaming buffer."""
+    packets: list[bytes] = []
+
+    while True:
+        if len(stream_buffer) < 3:
+            break
+
+        preamble_idx = stream_buffer.find(0xD3)
+        if preamble_idx < 0:
+            stream_buffer.clear()
+            break
+
+        if preamble_idx > 0:
+            del stream_buffer[:preamble_idx]
+
+        if len(stream_buffer) < 3:
+            break
+
+        payload_len = ((stream_buffer[1] & 0x03) << 8) | stream_buffer[2]
+        packet_len = payload_len + 6
+
+        if packet_len < 6 or packet_len > max_packet_len:
+            del stream_buffer[0]
+            continue
+
+        if len(stream_buffer) < packet_len:
+            break
+
+        candidate = bytes(stream_buffer[:packet_len])
+        if is_valid_rtcm3_packet(candidate):
+            packets.append(candidate)
+            del stream_buffer[:packet_len]
+        else:
+            del stream_buffer[0]
+
+    return packets
+
+def is_valid_nmea_checksum(sentence) -> bool:
+    try:
+        if isinstance(sentence, (bytes, bytearray)):
+            s = sentence.decode('ascii', errors='ignore').strip()
+        else:
+            s = str(sentence).strip()
+
+        if not s.startswith('$') or '*' not in s:
+            return False
+
+        body, checksum_part = s[1:].split('*', 1)
+        if len(checksum_part) < 2:
+            return False
+
+        given = checksum_part[:2].upper()
+        calc = 0
+        for ch in body:
+            calc ^= ord(ch)
+
+        return f"{calc:02X}" == given
+    except Exception:
+        return False
     
 # ==============================================================================
 # === DISPATCHER FUNCTIONS                                                  ===
 # ==============================================================================
 def dispatch_rtcm_data(data):
+    global rtcm_input_window_bytes, rtcm_input_window_start_ts, rtcm_input_bps
+    now = time.time()
+    with rtcm_input_stats_lock:
+        rtcm_input_window_bytes += len(data)
+        elapsed = now - rtcm_input_window_start_ts
+        if elapsed >= 1.0:
+            rtcm_input_bps = int(rtcm_input_window_bytes / elapsed)
+            rtcm_input_window_bytes = 0
+            rtcm_input_window_start_ts = now
+
+    # Check if RTCM streaming is active (can be disabled by SET_RTCM_STREAM_ACTIVE command)
+    global rtcm_stream_active_flag
+    if not rtcm_stream_active_flag:
+        return  # Drop RTCM data if stream is inactive
+    
     with subscriber_lock:
         for queue in list(rtcm_subscribers):
             try:
@@ -636,6 +749,7 @@ class NMEAPublisher(threading.Thread):
         self.serial_number = serial_number
         self.loop = loop
         self.queue = Queue(maxsize=200)
+        self.last_mqtt_publish_ts = 0.0
         with subscriber_lock:
             nmea_subscribers.append(self.queue)
     
@@ -646,7 +760,6 @@ class NMEAPublisher(threading.Thread):
                 nmea_subscribers.remove(self.queue)
 
     def run(self):
-        error_count = 0 
         logging.info("NMEA Publisher thread started.")
         topic = f"pi/devices/{self.serial_number}/raw_data"
         
@@ -672,7 +785,11 @@ class NMEAPublisher(threading.Thread):
 
                 if self.mqtt_client and self.mqtt_client.is_connected():
                     try:
-                        self.mqtt_client.publish(topic, data_chunk, qos=0)
+                        now = time.time()
+                        # When no live websocket consumer is attached, limit MQTT raw_data publish rate.
+                        if active_websocket_connection or (now - self.last_mqtt_publish_ts) >= NMEA_IDLE_PUBLISH_INTERVAL_SECONDS:
+                            self.mqtt_client.publish(topic, data_chunk, qos=0)
+                            self.last_mqtt_publish_ts = now
                     except Exception as e:
                         logging.warning(f"Failed to publish NMEA to MQTT: {e}")
 
@@ -784,11 +901,46 @@ class NTRIPServerWorker(threading.Thread):
                 self.log("SUCCESS", f"S{self.server_id}: Authenticated. Pushing RTCM data.")
                 self.last_stat_update = time.time()
                 self.bytes_sent = 0
+                standby_logged = False
+                non_rtcm_dropped = 0
+                non_rtcm_last_log_ts = 0.0
 
                 # ========== DATA STREAMING LOOP ==========
                 while not self._stop_event.is_set() and not is_remote_locked():
                     try:
+                        # Hard gate: never push RTCM while stream is inactive.
+                        if not rtcm_stream_active_flag:
+                            if not standby_logged:
+                                self.log("INFO", f"S{self.server_id}: RTCM stream inactive, holding push in standby.")
+                                standby_logged = True
+
+                            with self.stats_lock:
+                                self.stats[f'server{self.server_id}_bps'] = 0
+
+                            # Drop queued stale RTCM packets accumulated before deactivation.
+                            try:
+                                while True:
+                                    self.queue.get_nowait()
+                            except Empty:
+                                pass
+
+                            time.sleep(0.2)
+                            continue
+
+                        standby_logged = False
                         data_chunk = self.queue.get(timeout=1.0)
+
+                        # Hard filter: never forward non-RTCM payloads to caster.
+                        if not is_valid_rtcm3_packet(data_chunk):
+                            non_rtcm_dropped += 1
+                            now = time.time()
+                            if (now - non_rtcm_last_log_ts) >= 5.0:
+                                self.log(
+                                    "WARNING",
+                                    f"S{self.server_id}: Dropped non-RTCM payloads={non_rtcm_dropped}"
+                                )
+                                non_rtcm_last_log_ts = now
+                            continue
                         
                         if version == 2:
                             chunk_size = hex(len(data_chunk))[2:].encode('ascii')
@@ -850,6 +1002,7 @@ class NTRIPClientWorker(threading.Thread):
         while not self._stop_event.is_set():
             if is_remote_locked(): time.sleep(2); continue
             client_socket = None
+            rtcm_stream_buffer = bytearray()
             try:
                 self.log("INFO", f"[RTCM Client] Connecting to ntrip://{host}:{port}/{mp}...")
                 client_socket = socket.create_connection((host, port), timeout=10)
@@ -872,7 +1025,16 @@ class NTRIPClientWorker(threading.Thread):
                 while not self._stop_event.is_set() and not is_remote_locked():
                     rtcm_data = client_socket.recv(1024)
                     if not rtcm_data: break
-                    dispatch_rtcm_data(rtcm_data)
+                    rtcm_stream_buffer.extend(rtcm_data)
+
+                    # Safety cap for malformed stream bursts.
+                    if len(rtcm_stream_buffer) > 16384:
+                        self.log("WARNING", "[RTCM Client] Stream buffer overflow; dropping buffered data")
+                        rtcm_stream_buffer.clear()
+                        continue
+
+                    for pkt in extract_valid_rtcm3_packets(rtcm_stream_buffer):
+                        dispatch_rtcm_data(pkt)
 
             except Exception as e:
                 self.log("WARNING", f"[RTCM Client] Connection error: {e}.")
@@ -898,8 +1060,29 @@ class GNSSReader(threading.Thread):
         self.last_data_time = time.time()
         self.buffer_overflows = 0
         self.parse_errors = 0
+
+        # Parser diagnostics (helps verify RTCM/NMEA are not dropped incorrectly)
+        self.parser_debug_enabled = PARSER_DEBUG_ENABLED
+        self.parser_debug_interval = max(1.0, PARSER_DEBUG_INTERVAL_SECONDS)
+        self.rtcm_preamble_seen = 0
+        self.rtcm_valid_packets = 0
+        self.rtcm_invalid_crc = 0
+        self.rtcm_invalid_length = 0
+        self.rtcm_incomplete_waits = 0
+        self.nmea_sentence_seen = 0
+        self.nmea_valid_packets = 0
+        self.nmea_invalid_checksum = 0
+        self.nmea_unimportant_skipped = 0
+        self.nmea_incomplete_waits = 0
+        self.unknown_bytes_dropped = 0
+        self._parser_debug_prev = {}
+        self._parser_debug_last_log_ts = time.time()
         
         self.log("INFO", f"GNSSReader initialized for {port} @ {baudrate} baud")
+        self.log(
+            "INFO",
+            f"[PARSER_DEBUG] enabled={self.parser_debug_enabled} interval={self.parser_debug_interval:.1f}s"
+        )
     
     def stop(self):
         self._stop_event.set()
@@ -921,8 +1104,61 @@ class GNSSReader(threading.Thread):
             "last_data_time": self.last_data_time,
             "seconds_since_data": int(time.time() - self.last_data_time),
             "buffer_overflows": self.buffer_overflows,
-            "parse_errors": self.parse_errors
+            "parse_errors": self.parse_errors,
+            "parser_debug": self._build_parser_debug_snapshot()
         }
+
+    def _build_parser_debug_snapshot(self):
+        return {
+            "enabled": self.parser_debug_enabled,
+            "parse_errors": self.parse_errors,
+            "rtcm_preamble_seen": self.rtcm_preamble_seen,
+            "rtcm_valid_packets": self.rtcm_valid_packets,
+            "rtcm_invalid_crc": self.rtcm_invalid_crc,
+            "rtcm_invalid_length": self.rtcm_invalid_length,
+            "rtcm_incomplete_waits": self.rtcm_incomplete_waits,
+            "nmea_sentence_seen": self.nmea_sentence_seen,
+            "nmea_valid_packets": self.nmea_valid_packets,
+            "nmea_invalid_checksum": self.nmea_invalid_checksum,
+            "nmea_unimportant_skipped": self.nmea_unimportant_skipped,
+            "nmea_incomplete_waits": self.nmea_incomplete_waits,
+            "unknown_bytes_dropped": self.unknown_bytes_dropped
+        }
+
+    def _log_parser_debug_if_due(self, now: float, buffer_len: int):
+        if not self.parser_debug_enabled:
+            return
+        elapsed = now - self._parser_debug_last_log_ts
+        if elapsed < self.parser_debug_interval:
+            return
+
+        curr = self._build_parser_debug_snapshot()
+        prev = self._parser_debug_prev
+        self._parser_debug_prev = curr
+        self._parser_debug_last_log_ts = now
+
+        def delta(name: str) -> int:
+            return int(curr.get(name, 0)) - int(prev.get(name, 0))
+
+        rtcm_valid = delta("rtcm_valid_packets")
+        rtcm_bad_crc = delta("rtcm_invalid_crc")
+        rtcm_bad_len = delta("rtcm_invalid_length")
+        nmea_valid = delta("nmea_valid_packets")
+        nmea_bad_ck = delta("nmea_invalid_checksum")
+        unknown_drop = delta("unknown_bytes_dropped")
+        parse_err = self.parse_errors - int(prev.get("parse_errors", 0))
+
+        self.log(
+            "INFO",
+            (
+                "[PARSER_DEBUG] "
+                f"dt={elapsed:.1f}s "
+                f"rtcm_ok={rtcm_valid} rtcm_crc_fail={rtcm_bad_crc} rtcm_len_fail={rtcm_bad_len} "
+                f"nmea_ok={nmea_valid} nmea_ck_fail={nmea_bad_ck} "
+                f"unknown_drop={unknown_drop} parse_err={parse_err} "
+                f"buf={buffer_len}"
+            )
+        )
     
     def _parse_buffer(self, buffer: bytearray) -> bytearray:
         while len(buffer) > 0:
@@ -930,7 +1166,9 @@ class GNSSReader(threading.Thread):
             
             # ==================== RTCM3 DETECTION ====================
             if buffer[0] == 0xD3:
+                self.rtcm_preamble_seen += 1
                 if len(buffer) < 3:
+                    self.rtcm_incomplete_waits += 1
                     break
                 
                 # RTCM3 format: 0xD3 | 6-bit reserved + 10-bit length | payload | CRC24
@@ -942,22 +1180,31 @@ class GNSSReader(threading.Thread):
                     self.log("WARNING", f"Invalid RTCM3 length: {packet_len}, discarding byte")
                     buffer.pop(0)
                     self.parse_errors += 1
+                    self.rtcm_invalid_length += 1
                     continue
                 
                 if len(buffer) < packet_len:
+                    self.rtcm_incomplete_waits += 1
                     break  # Wait for more data
                 
-                # Extract and dispatch RTCM3 packet
+                # Extract and validate RTCM3 packet before dispatch
                 packet = bytes(buffer[:packet_len])
-                dispatch_rtcm_data(packet)
-                
-                self.rtcm_packets_sent += 1
-                self.bytes_read += len(packet)
-                self.last_data_time = time.time()
-                
-                buffer = buffer[packet_len:]
-                processed = True
-                continue
+                if is_valid_rtcm3_packet(packet):
+                    dispatch_rtcm_data(packet)
+                    self.rtcm_packets_sent += 1
+                    self.rtcm_valid_packets += 1
+                    self.bytes_read += len(packet)
+                    self.last_data_time = time.time()
+                    buffer = buffer[packet_len:]
+                    processed = True
+                    continue
+                else:
+                    # CRC failed: drop one byte to resync safely instead of skipping packet_len bytes.
+                    # This prevents discarding valid data when a false 0xD3 preamble is encountered.
+                    self.parse_errors += 1
+                    self.rtcm_invalid_crc += 1
+                    buffer.pop(0)
+                    continue
             
             # ==================== UBX PROTOCOL (U-BLOX) ====================
             elif buffer[0] == 0xB5 and len(buffer) > 1 and buffer[1] == 0x62:
@@ -1020,6 +1267,7 @@ class GNSSReader(threading.Thread):
                                     self.parse_errors += 1
                                     continue
                                 else:
+                                    self.nmea_incomplete_waits += 1
                                     break
                             else:
                                 buffer.pop(0)
@@ -1032,9 +1280,11 @@ class GNSSReader(threading.Thread):
                         if len(buffer) > 512:
                             buffer.pop(0)
                             continue
+                        self.nmea_incomplete_waits += 1
                         break
                 
                 sentence = buffer[:end_idx + 2]
+                self.nmea_sentence_seen += 1
                 
                 try:
                     sentence_str = sentence.decode('ascii', errors='ignore')
@@ -1043,12 +1293,12 @@ class GNSSReader(threading.Thread):
                     is_important = any(nmea_type in sentence_str[:10] for nmea_type in important_types)
                     
                     if is_important:
-                        has_checksum = b'*' in sentence
-                        if has_checksum and 10 <= len(sentence) <= 200:
+                        if 10 <= len(sentence) <= 200 and is_valid_nmea_checksum(sentence):
                             packet = bytes(sentence)
                             dispatch_nmea_data(packet)
                             
                             self.nmea_packets_sent += 1
+                            self.nmea_valid_packets += 1
                             self.bytes_read += len(packet)
                             self.last_data_time = time.time()
                             
@@ -1058,8 +1308,10 @@ class GNSSReader(threading.Thread):
                         else:
                             buffer.pop(0)
                             self.parse_errors += 1
+                            self.nmea_invalid_checksum += 1
                             continue
                     else:
+                        self.nmea_unimportant_skipped += 1
                         buffer = buffer[end_idx + 2:]
                         processed = True
                         continue
@@ -1072,6 +1324,7 @@ class GNSSReader(threading.Thread):
             
             # ==================== UNKNOWN DATA ====================
             if not processed:
+                self.unknown_bytes_dropped += 1
                 buffer.pop(0)
         
         return buffer
@@ -1182,7 +1435,7 @@ class GNSSReader(threading.Thread):
                                     # === MULTI-PASS PARSING ===
                                     # Parse multiple times in one cycle to prevent buffer overflow
                                     parse_attempts = 0
-                                    while len(buffer) > 0 and parse_attempts < 10:
+                                    while len(buffer) > 0 and parse_attempts < 20:
                                         old_len = len(buffer)
                                         buffer = self._parse_buffer(buffer)
                                         
@@ -1191,10 +1444,27 @@ class GNSSReader(threading.Thread):
                                             break
                                         parse_attempts += 1
                                 
-                                # Prevent buffer overflow
-                                if len(buffer) > 8192:  # Increased from 4096
-                                    self.log("WARNING", f"Buffer overflow ({len(buffer)} bytes) - clearing")
-                                    buffer.clear()
+                                # Prevent buffer overflow with best-effort resync (avoid dropping everything).
+                                if len(buffer) > 8192:
+                                    self.log("WARNING", f"Buffer overflow ({len(buffer)} bytes) - trimming and resync")
+                                    tail = bytearray(buffer[-4096:])
+
+                                    marker_positions = []
+                                    pos_nmea = tail.find(b'$')
+                                    if pos_nmea != -1:
+                                        marker_positions.append(pos_nmea)
+                                    pos_rtcm = tail.find(0xD3)
+                                    if pos_rtcm != -1:
+                                        marker_positions.append(pos_rtcm)
+                                    pos_ubx = tail.find(b'\xB5\x62')
+                                    if pos_ubx != -1:
+                                        marker_positions.append(pos_ubx)
+
+                                    if marker_positions:
+                                        buffer = tail[min(marker_positions):]
+                                    else:
+                                        buffer.clear()
+
                                     self.buffer_overflows += 1
                                 
                                 # === LOG STATISTICS PERIODICALLY ===
@@ -1203,6 +1473,7 @@ class GNSSReader(threading.Thread):
                                     stats = self.get_statistics()
                                     #self.log("INFO", f"GNSS Stats: RTCM={stats['rtcm_packets']}, NMEA={stats['nmea_packets']}, Errors={stats['parse_errors']}, Overflows={stats['buffer_overflows']}")
                                     last_stats_log = current_time
+                                self._log_parser_debug_if_due(current_time, len(buffer))
                                 
                                 # Reduce CPU usage (3ms sleep = ~200 cycles/sec)
                                 time.sleep(0.003)
@@ -1288,9 +1559,21 @@ class AgentManager:
         self.ntrip_connection_status = {} 
         self.stats_lock = threading.Lock()
         self.log = lambda lvl, msg: logging.log(getattr(logging, lvl.upper(), logging.INFO), msg)
+        self.rtcm_stream_active = False
         # Last-known RTK/GGA fix status (updated asynchronously by NMEA dispatcher)
         self.last_gga_fix_status = globals().get('LAST_GGA_FIX_STATUS', 'NO_FIX')
         self.load_config()
+        self._force_rtcm_standby_on_startup()
+
+    def _force_rtcm_standby_on_startup(self):
+        global rtcm_stream_active_flag
+        services = self.config.setdefault('services', {})
+        services['stream_on_demand'] = True
+        services['stream_active'] = False
+        services.pop('active_mountpoint', None)
+        self.rtcm_stream_active = False
+        rtcm_stream_active_flag = False
+        self.save_config()
     
     def load_config(self):
         try:
@@ -1318,8 +1601,45 @@ class AgentManager:
         return False
     
     def update_service_config(self, cfg: dict):
+        # Never auto-enable RTCM push from config deployment.
+        # Stream can only be enabled by SET_RTCM_STREAM_ACTIVE command.
+        cfg['stream_on_demand'] = True
+        cfg['stream_active'] = False
+        cfg.pop('active_mountpoint', None)
         self.config['services'] = cfg
+        self.rtcm_stream_active = False
         self.save_config()
+
+    @staticmethod
+    def _normalize_mountpoint(value):
+        if value is None:
+            return None
+        cleaned = str(value).strip()
+        return cleaned.lower() if cleaned else None
+
+    def set_rtcm_stream_active(self, active: bool, mountpoint: str = None):
+        global rtcm_stream_active_flag
+        services = self.config.setdefault('services', {})
+        prev_active = bool(services.get('stream_active', False))
+        prev_mountpoint = self._normalize_mountpoint(services.get('active_mountpoint'))
+
+        services['stream_on_demand'] = True
+        services['stream_active'] = bool(active)
+
+        # Optional mountpoint selector from backend control plane.
+        if mountpoint and bool(active):
+            services['active_mountpoint'] = str(mountpoint)
+        elif not bool(active):
+            services.pop('active_mountpoint', None)
+
+        new_mountpoint = self._normalize_mountpoint(services.get('active_mountpoint'))
+        should_restart = (prev_active != bool(active)) or (prev_mountpoint != new_mountpoint)
+
+        self.rtcm_stream_active = bool(active)
+        rtcm_stream_active_flag = bool(active)  # Update global flag for dispatch
+        self.save_config()
+        if should_restart:
+            self.restart_services()
     
     def get_base_config(self):
         return self.config.get('base_config', {})
@@ -1365,10 +1685,47 @@ class AgentManager:
 
         if hasattr(self, 'gnss_reader') and self.gnss_reader:
             status["gnss_stats"] = self.gnss_reader.get_statistics()
+            status["parser_debug"] = status["gnss_stats"].get("parser_debug", {})
 
         with self.stats_lock:
             if self.service_stats:
                 status["ntrip_stats"] = self.service_stats.copy()
+            else:
+                status["ntrip_stats"] = {}
+
+            # Always expose internal RTCM input bitrate for UI, even when forwarding sockets are closed.
+            with rtcm_input_stats_lock:
+                ingress_bps = rtcm_input_bps
+                status["ntrip_stats"]["rtcm_input_bps"] = ingress_bps
+
+            # Backward-compatible UI keys: keep server1_bps/server2_bps present even in standby mode.
+            cfg = self.get_service_config() or {}
+            server1_enabled = bool(cfg.get('server1_enabled'))
+            server2_enabled = bool(cfg.get('server2_enabled'))
+            selected_mountpoint = self._normalize_mountpoint(cfg.get('active_mountpoint'))
+            server1_mp = self._normalize_mountpoint(cfg.get('mountpoint1'))
+            server2_mp = self._normalize_mountpoint(cfg.get('mountpoint2'))
+
+            synth_server1_bps = 0
+            synth_server2_bps = 0
+
+            if selected_mountpoint:
+                if selected_mountpoint == server1_mp:
+                    synth_server1_bps = ingress_bps
+                elif selected_mountpoint == server2_mp:
+                    synth_server2_bps = ingress_bps
+            elif server1_enabled and not server2_enabled:
+                synth_server1_bps = ingress_bps
+            elif server2_enabled and not server1_enabled:
+                synth_server2_bps = ingress_bps
+            elif server1_enabled and server2_enabled:
+                # No mountpoint selected: duplicate ingress for compatibility dashboards.
+                synth_server1_bps = ingress_bps
+                synth_server2_bps = ingress_bps
+
+            status["ntrip_stats"]["server1_bps"] = int(status["ntrip_stats"].get("server1_bps", synth_server1_bps))
+            status["ntrip_stats"]["server2_bps"] = int(status["ntrip_stats"].get("server2_bps", synth_server2_bps))
+
             status["ntrip_connected"] = any(self.ntrip_connection_status.values())
             status["ntrip_status"] = self.ntrip_connection_status.copy()
             
@@ -1394,11 +1751,33 @@ class AgentManager:
             return
         
         cfg = self.config.get("services", {})
+        stream_on_demand = bool(cfg.get('stream_on_demand', False))
+        stream_active = bool(cfg.get('stream_active', True))
+        self.rtcm_stream_active = stream_active
+        can_push_rtcm = (not stream_on_demand) or stream_active
+        selected_mountpoint = self._normalize_mountpoint(cfg.get('active_mountpoint'))
+
+        def _server_can_publish(server_id: int) -> bool:
+            if not cfg.get(f'server{server_id}_enabled'):
+                return False
+            if not can_push_rtcm:
+                return False
+            if not selected_mountpoint:
+                return True
+
+            server_mp = self._normalize_mountpoint(cfg.get(f'mountpoint{server_id}'))
+            return server_mp == selected_mountpoint
         
-        if cfg.get('server1_enabled'):
+        if _server_can_publish(1):
             self.service_workers.append(NTRIPServerWorker(1, cfg, self.log, self.service_stats, self.stats_lock, self.ntrip_connection_status))
-        if cfg.get('server2_enabled'):
+        if _server_can_publish(2):
             self.service_workers.append(NTRIPServerWorker(2, cfg, self.log, self.service_stats, self.stats_lock, self.ntrip_connection_status))
+
+        if selected_mountpoint and can_push_rtcm and not self.service_workers:
+            self.log("WARNING", f"[RTCM] active_mountpoint='{cfg.get('active_mountpoint')}' does not match any enabled server mountpoint")
+
+        if stream_on_demand and not stream_active:
+            self.log("INFO", "[RTCM] Stream is in standby mode (on-demand enabled, active=false).")
         
         is_base_station = bool(self.get_base_config())
         
@@ -1554,6 +1933,22 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
             agent.restart_services()
             current_state = "ONLINE"
             await send_status(agent, mqtt_client)
+
+        elif command == "SET_RTCM_STREAM_ACTIVE":
+            global rtcm_stream_active_flag
+            active = bool(payload.get("active", False))
+            mountpoint = payload.get("mountpoint")
+            agent.set_rtcm_stream_active(active, mountpoint=mountpoint)
+            rtcm_stream_active_flag = bool(active)  # Update global flag immediately
+            if active:
+                if mountpoint:
+                    logging.info(f"[RTCM] Stream activated for mountpoint '{mountpoint}' by control plane")
+                else:
+                    logging.info("[RTCM] Stream activated by control plane - forwarding to NTRIP caster enabled")
+            else:
+                logging.info("[RTCM] Stream set to standby by control plane - forwarding to NTRIP caster disabled")
+            current_state = "ONLINE"
+            await send_status(agent, mqtt_client)
             
         elif command == "DELETE_DEVICE":
             if agent.nmea_publisher:
@@ -1617,25 +2012,44 @@ def setup_mqtt_client(loop: asyncio.AbstractEventLoop, agent: AgentManager, gnss
         client = mqtt.Client(client_id=f"agent-{MACHINE_SERIAL}-{os.getpid()}")
     client.user_data_set({"agent": agent, "gnss_reader": gnss_reader})
     
+    command_topics = [
+        f"pi/devices/{MACHINE_SERIAL}/command",
+        f"pi/devices/{MACHINE_SERIAL}/commands",
+        f"pi/device/{MACHINE_SERIAL}/command",
+    ]
+
     def on_connect(c, userdata, flags, rc, properties=None):
         if rc == 0:
             logging.info("Connected to MQTT Broker.")
-            c.subscribe(f"pi/devices/{MACHINE_SERIAL}/command", qos=1)
+            for topic in command_topics:
+                result, mid = c.subscribe(topic, qos=1)
+                logging.info(f"MQTT subscribe topic='{topic}' result={result} mid={mid}")
             asyncio.run_coroutine_threadsafe(send_status(userdata["agent"], c), loop)
         else:
             logging.error(f"!!! MQTT connection failed, code: {rc}")
+
+    def on_subscribe(c, userdata, mid, granted_qos, properties=None):
+        logging.info(f"MQTT subscribe acknowledged mid={mid} qos={granted_qos}")
     
     def on_message(c, userdata, msg):
         try:
+            logging.info(f"MQTT message received topic='{msg.topic}' bytes={len(msg.payload)}")
             data = json.loads(msg.payload.decode())
-            asyncio.run_coroutine_threadsafe(
+            future = asyncio.run_coroutine_threadsafe(
                 process_command('mqtt', data, userdata["agent"], userdata["gnss_reader"], c),
                 loop
             )
+            def on_done(f):
+                try: 
+                    f.result()
+                except Exception as e:
+                    logging.error(f"Process command failed: {e}", exc_info=True)
+            future.add_done_callback(on_done)
         except Exception as e:
             logging.error(f"Error processing MQTT message: {e}")
     
     client.on_connect = on_connect
+    client.on_subscribe = on_subscribe
     client.on_message = on_message
     client.reconnect_delay_set(min_delay=5, max_delay=120)
 
@@ -1694,7 +2108,7 @@ async def websocket_task(agent: AgentManager, gnss_reader: GNSSReader, mqtt_clie
 
 async def status_publisher_task(agent: AgentManager, mqtt_client: mqtt.Client):
     while True:
-        await asyncio.sleep(1) 
+        await asyncio.sleep(max(1, STATUS_PUBLISH_INTERVAL_SECONDS))
         await send_status(agent, mqtt_client)
 
 # ==============================================================================
@@ -1702,6 +2116,8 @@ async def status_publisher_task(agent: AgentManager, mqtt_client: mqtt.Client):
 # ==============================================================================
 async def main():
     global current_state
+    logging.info(f"Agent script path: {os.path.abspath(__file__)}")
+    logging.info(f"Parser debug default: enabled={PARSER_DEBUG_ENABLED} interval={PARSER_DEBUG_INTERVAL_SECONDS}s")
     
     # ========== Lock File Check ==========
     if not cleanup_lock_file():
