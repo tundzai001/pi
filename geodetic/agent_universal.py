@@ -12,6 +12,9 @@ import time
 import uuid
 import platform
 import signal
+import statistics
+import struct
+from dataclasses import dataclass, field
 from queue import Queue, Empty, Full
 from pathlib import Path
 
@@ -21,6 +24,9 @@ import serial.tools.list_ports
 import websockets
 import psutil
 import random 
+import unicodedata
+import urllib.parse
+import urllib.request
 
 # --- PLATFORM DETECTION ---
 IS_WINDOWS = platform.system() == "Windows"
@@ -89,6 +95,67 @@ is_remotely_locked = False
 initialization_complete = asyncio.Event()
 # Last parsed GGA fix status (updated by NMEA dispatcher)
 LAST_GGA_FIX_STATUS = "NO_FIX"
+LAST_GGA_COORD = None
+LAST_RAW_GGA = None
+LAST_RAW_GGA_TS = 0.0
+AUTO_BASE_PROGRESS = {}
+LAST_HPPOSLLH_COORD = None
+LAST_HPPOSLLH_TS = 0.0
+LAST_UBX_NUMSV = None
+LAST_UBX_NUMSV_TS = 0.0
+
+@dataclass
+class EllipPara:
+    a: float = 6378137.0
+    b: float = 6356752.31424518
+    f: float = 1.0 / 298.2572236
+    we: float = 7.292115147e-5
+    e2: float = 1.0 - (6356752.3142 / 6378137.0) ** 2
+    gm: float = 3986004.418e8
+    j2: float = 1.082626683e-3
+    j3: float = -2.5327e-6
+
+@dataclass
+class RTCMDatum:
+    rtcm1025_update: bool = False
+    k0: float = 0.9999
+    to_zone: int = 3
+    l0: float = 105.0 * 0.017453292519943295
+    central_meridian_deg: int = 105
+    central_meridian_min: int = 0
+    elip: EllipPara = field(default_factory=EllipPara)
+    to_proj: int = 0
+    to_ellip: int = 0
+    rtcm1021_update: bool = False
+    kT: float = 0.999999747093722
+    dX: float = 191.90441429
+    dY: float = 39.30318279
+    dZ: float = 111.45032835
+    rX: float = 0.00928836
+    rY: float = -0.01975479
+    rZ: float = 0.00427372
+    para_model: int = 0
+    false_easting: float = 500000.0
+    false_northing: float = 0.0
+    false_h: float = 0.0
+    rtcm1023_update: bool = False
+    resB: float = 0.0
+    resL: float = 0.0
+    resH: float = 0.0
+    resN: float = 0.0
+    resE: float = 0.0
+    resHS: float = 0.0
+    tra_update: int = 0
+    res_update: bool = False
+    pro_update: bool = False
+    shift_cors: bool = True
+    name: str = "WGS-84"
+    datum_type: int = 0
+
+DATUM_LOCK = threading.Lock()
+AUTO_BASE_DATUM = RTCMDatum()
+active_auto_base_task = None
+active_auto_base_client = None
 # RTCM stream active flag (controlled by SET_RTCM_STREAM_ACTIVE command)
 rtcm_stream_active_flag = False
 # Internal RTCM ingress bitrate tracker (independent from NTRIP socket forwarding)
@@ -484,7 +551,7 @@ def remove_remote_lock():
 def get_system_info() -> dict:
     try:
         # CPU
-        cpu_percent = psutil.cpu_percent(interval=1)
+        cpu_percent = psutil.cpu_percent(interval=None)
         cpu_freq = psutil.cpu_freq()
         
         # Temperature (Raspberry Pi)
@@ -532,52 +599,139 @@ def get_system_info() -> dict:
         logging.error(f"Error collecting system info: {e}")
         return {}
     
-def parse_gga_fix_status(gga_sentence: str) -> str:
+def parse_gga_data(gga_sentence: str) -> tuple:
     """
-    Parse NMEA GGA sentence để lấy Fix Quality
-
-    GGA Fix Quality:
-    0 = Invalid
-    1 = GPS Fix (SPS)
-    2 = DGPS Fix
-    4 = RTK Fixed
-    5 = RTK Float
+    Parse NMEA GGA sentence để lấy Fix Quality và Tọa độ (Lat, Lon, Alt)
+    Trường hợp lỗi trả về ("NO_FIX", None, None, None)
     """
     try:
-        # Ensure we only operate on the GGA line
         s = gga_sentence.strip()
-        # If sentence contains multiple lines, pick the first line with GGA
         lines = s.split('\n')
-        line = None
-        for l in lines:
-            if 'GGA' in l:
-                line = l.strip()
-                break
-        if line is None:
-            line = s
-
+        line = next((l.strip() for l in lines if 'GGA' in l), s)
         parts = line.split(',')
-        if len(parts) < 7:
-            return "NO_FIX"
+        if len(parts) < 10:
+            return ("NO_FIX", None, None, None)
 
-        # The fix quality is the 7th field (index 6)
         try:
             fix_quality = int(parts[6])
-        except Exception:
-            return "NO_FIX"
+        except ValueError:
+            return ("NO_FIX", None, None, None)
 
-        if fix_quality == 4:
-            return "RTK_FIXED"
-        elif fix_quality == 5:
-            return "RTK_FLOAT"
-        elif fix_quality == 2:
-            return "DGPS"
-        elif fix_quality == 1:
-            return "GPS_FIX"
-        else:
-            return "NO_FIX"
+        status_map = {1: "GPS_FIX", 2: "DGPS", 4: "RTK_FIXED", 5: "RTK_FLOAT"}
+        status = status_map.get(fix_quality, "NO_FIX")
+
+        lat, lon, alt_ellipsoid = None, None, None
+        try:
+            if parts[2] and parts[4] and parts[9]:
+                # Convert NMEA DDMM.MMMMM to Decimal Degrees DD.DDDDDD
+                raw_lat = float(parts[2])
+                lat = int(raw_lat / 100) + (raw_lat % 100) / 60.0
+                if parts[3] == 'S': lat = -lat
+
+                raw_lon = float(parts[4])
+                lon = int(raw_lon / 100) + (raw_lon % 100) / 60.0
+                if parts[5] == 'W': lon = -lon
+
+                # Prefer true ellipsoidal height from UBX-NAV-HPPOSLLH when available.
+                hpp = globals().get('LAST_HPPOSLLH_COORD')
+                hpp_ts = float(globals().get('LAST_HPPOSLLH_TS') or 0.0)
+                if hpp and isinstance(hpp, tuple) and len(hpp) >= 3 and (time.time() - hpp_ts) <= 2.5:
+                    lat_hpp, lon_hpp, h_hpp = hpp[:3]
+                    # Use HPPOSLLH full LLH if close enough to current GGA position.
+                    if (
+                        lat_hpp is not None and lon_hpp is not None and h_hpp is not None
+                        and abs(float(lat_hpp) - float(lat)) <= 0.0002
+                        and abs(float(lon_hpp) - float(lon)) <= 0.0002
+                    ):
+                        lat = float(lat_hpp)
+                        lon = float(lon_hpp)
+                        alt_ellipsoid = float(h_hpp)
+                    else:
+                        alt_ellipsoid = float(h_hpp)
+                else:
+                    # Fallback from GGA fields:
+                    # - parts[9]: orthometric height H (MSL)
+                    # - parts[11]: geoid separation N
+                    # Ellipsoidal height h = H + N
+                    alt_msl = float(parts[9])
+                    geoid_sep = float(parts[11]) if len(parts) > 11 and parts[11] not in (None, "") else 0.0
+                    alt_ellipsoid = alt_msl + geoid_sep
+        except ValueError:
+            pass
+
+        return (status, lat, lon, alt_ellipsoid)
     except Exception:
-        return "NO_FIX"
+        return ("NO_FIX", None, None, None)
+
+def _nmea_checksum(body: str) -> str:
+    csum = 0
+    for ch in body:
+        csum ^= ord(ch)
+    return f"{csum:02X}"
+
+def _normalize_gga_for_ntrip(raw_gga: str) -> str | None:
+    """
+    Normalize outbound GGA for NTRIP:
+    - Keep original sentence as base.
+    - Override satellite count with UBX NAV-PVT numSV when available (fresh).
+    - Recalculate checksum.
+    """
+    if not raw_gga:
+        return None
+    try:
+        s = str(raw_gga).strip()
+        if not s:
+            return None
+        if "\n" in s:
+            s = next((l.strip() for l in s.splitlines() if "GGA" in l), s.strip())
+        if not s.startswith("$") or "GGA" not in s[:12]:
+            return s
+
+        body = s[1:].split("*", 1)[0]
+        parts = body.split(",")
+        if len(parts) < 15:
+            return s
+
+        numsv = globals().get("LAST_UBX_NUMSV")
+        numsv_ts = float(globals().get("LAST_UBX_NUMSV_TS") or 0.0)
+        if numsv is not None and (time.time() - numsv_ts) <= 2.5:
+            try:
+                n = int(numsv)
+                if n < 0:
+                    n = 0
+                if n > 99:
+                    n = 99
+                parts[7] = str(n)
+            except Exception:
+                pass
+
+        body2 = ",".join(parts)
+        return f"${body2}*{_nmea_checksum(body2)}"
+    except Exception:
+        return raw_gga
+
+def _is_rtk_usable_status(status: str) -> bool:
+    # Accept both RTK fixed and float to avoid long stalls when fix quality oscillates.
+    return status in ("RTK_FIXED", "RTK_FLOAT")
+
+def _get_fresh_outbound_gga(max_age_seconds: float = 3.0) -> str | None:
+    raw_gga = globals().get('LAST_RAW_GGA')
+    gga_ts = float(globals().get('LAST_RAW_GGA_TS') or 0.0)
+    if not raw_gga or gga_ts <= 0.0:
+        return None
+    if (time.time() - gga_ts) > max_age_seconds:
+        return None
+    return _normalize_gga_for_ntrip(raw_gga)
+
+def _mark_gnss_data_stale():
+    globals()['LAST_RAW_GGA'] = None
+    globals()['LAST_RAW_GGA_TS'] = 0.0
+    globals()['LAST_GGA_FIX_STATUS'] = "NO_FIX"
+    globals()['LAST_GGA_COORD'] = None
+    globals()['LAST_HPPOSLLH_COORD'] = None
+    globals()['LAST_HPPOSLLH_TS'] = 0.0
+    globals()['LAST_UBX_NUMSV'] = None
+    globals()['LAST_UBX_NUMSV_TS'] = 0.0
 
 def _crc24q(data: bytes) -> int:
     crc = 0
@@ -610,7 +764,7 @@ def extract_valid_rtcm3_packets(stream_buffer: bytearray, max_packet_len: int = 
 
     while True:
         if len(stream_buffer) < 3:
-            break
+            return packets
 
         preamble_idx = stream_buffer.find(0xD3)
         if preamble_idx < 0:
@@ -642,6 +796,464 @@ def extract_valid_rtcm3_packets(stream_buffer: bytearray, max_packet_len: int = 
 
     return packets
 
+def _rtcm_getbitu(buff: bytes, pos: int, length: int) -> int:
+    bits = 0
+    for i in range(pos, pos + length):
+        bits = (bits << 1) + ((buff[i // 8] >> (7 - i % 8)) & 1)
+    return bits
+
+def _rtcm_getbits(buff: bytes, pos: int, length: int) -> int:
+    bits = _rtcm_getbitu(buff, pos, length)
+    if length <= 0:
+        return 0
+    sign_bit = 1 << (length - 1)
+    if bits & sign_bit:
+        bits -= (1 << length)
+    return int(bits)
+
+def _rtcm_getbits_38(buff: bytes, pos: int) -> float:
+    return float(_rtcm_getbits(buff, pos, 38))
+
+def _decode_type1021(buff: bytes, datum: RTCMDatum):
+    i = 36
+    n = _rtcm_getbitu(buff, i, 5)
+    m = _rtcm_getbitu(buff, i + 5 + 8 * n, 5)
+    if i + 400 + 8 * n + 8 * m > len(buff) * 8 + 24:
+        return
+
+    i += 5 + 8 * n
+    i += 5 + 8 * m
+    i += 8 + 10 + 5 + 4 + 2 + 19 + 20 + 14 + 14
+
+    dx = _rtcm_getbits(buff, i, 23); i += 23
+    dy = _rtcm_getbits(buff, i, 23); i += 23
+    dz = _rtcm_getbits(buff, i, 23); i += 23
+    rx = _rtcm_getbits(buff, i, 32); i += 32
+    ry = _rtcm_getbits(buff, i, 32); i += 32
+    rz = _rtcm_getbits(buff, i, 32); i += 32
+    ds = _rtcm_getbits(buff, i, 25)
+
+    datum.dX = float(dx) * 0.001
+    datum.dY = float(dy) * 0.001
+    datum.dZ = float(dz) * 0.001
+    datum.rX = float(rx) * 0.00002
+    datum.rY = float(ry) * 0.00002
+    datum.rZ = float(rz) * 0.00002
+    datum.kT = float(ds) * 0.00000000001 + 1.0
+    datum.tra_update = 2
+    datum.rtcm1021_update = True
+
+def _decode_type1023(buff: bytes, datum: RTCMDatum):
+    i = 24 + 12
+    if i + 566 > len(buff) * 8 + 24:
+        return
+    i += 8 + 1 + 1 + 21 + 22 + 12 + 12
+    m_lat_o = _rtcm_getbits(buff, i, 8); i += 8
+    m_lon_o = _rtcm_getbits(buff, i, 8); i += 8
+    m_h_o = _rtcm_getbits(buff, i, 15); i += 15
+    dlat_res = []
+    dlon_res = []
+    dhei_res = []
+    for _ in range(16):
+        dlat_res.append(float(_rtcm_getbits(buff, i, 9))); i += 9
+        dlon_res.append(float(_rtcm_getbits(buff, i, 9))); i += 9
+        dhei_res.append(float(_rtcm_getbits(buff, i, 9))); i += 9
+
+    res_b_sec = float(m_lat_o) * 0.001 + (dlat_res[5] + dlat_res[6] + dlat_res[9] + dlat_res[10]) * 0.00003 / 4.0
+    res_l_sec = float(m_lon_o) * 0.001 + (dlon_res[5] + dlon_res[6] + dlon_res[9] + dlon_res[10]) * 0.00003 / 4.0
+    res_h_m = float(m_h_o) * 0.01 + (dhei_res[5] + dhei_res[6] + dhei_res[9] + dhei_res[10]) * 0.001 / 4.0
+
+    datum.resB = res_b_sec * (math.pi / (3600.0 * 180.0))
+    datum.resL = res_l_sec * (math.pi / (3600.0 * 180.0))
+    datum.resH = -res_h_m
+    datum.tra_update += 1
+    datum.res_update = True
+    datum.rtcm1023_update = True
+
+def _decode_type1025(buff: bytes, datum: RTCMDatum):
+    i = 24 + 12
+    if i + 184 > len(buff) * 8 + 24:
+        return
+    i += 8  # station id
+    i += 6  # projection type
+    _ = _rtcm_getbits(buff, i, 34); i += 34  # latitude of natural origin
+    lon_no = _rtcm_getbits(buff, i, 35); i += 35  # longitude of natural origin
+    sno = _rtcm_getbitu(buff, i, 30); i += 30
+    fe = _rtcm_getbitu(buff, i, 36); i += 36
+    fn = _rtcm_getbits(buff, i, 35)
+
+    k0 = (float(sno) * 0.00001 + 993000.0) * 0.000001
+    # RTCM 1025 LoNO unit: 1.1e-8 degree
+    l0_deg_raw = float(lon_no) * 0.000000011
+    l0_norm = math.radians(l0_deg_raw)
+
+    # Guard corrupted/invalid decode values.
+    if not math.isfinite(l0_norm) or not (math.radians(90.0) <= l0_norm <= math.radians(120.0)):
+        logging.warning(
+            f"RTCM1025 decode ignored invalid L0 raw_deg={l0_deg_raw}"
+        )
+        return
+    if not math.isfinite(k0) or not (0.9 <= k0 <= 1.1):
+        logging.warning(f"RTCM1025 decode ignored invalid k0={k0}")
+        return
+
+    datum.l0 = l0_norm
+    datum.k0 = round(k0, 6)
+    datum.false_easting = float(fe) * 0.001
+    datum.false_northing = float(fn) * 0.001
+    datum.rtcm1025_update = True
+    logging.info(
+        "RTCM1025 datum updated: "
+        f"L0_deg={math.degrees(datum.l0):.6f}, k0={datum.k0:.6f}, "
+        f"FE={datum.false_easting:.3f}, FN={datum.false_northing:.3f}"
+    )
+
+def _update_datum_from_rtcm_packet(packet: bytes):
+    if len(packet) < 6 or packet[0] != 0xD3:
+        return
+    try:
+        msg = _rtcm_getbitu(packet, 24, 12)
+    except Exception:
+        return
+
+    if msg not in (1021, 1023):
+        return
+
+    try:
+        with DATUM_LOCK:
+            if msg == 1021:
+                _decode_type1021(packet, AUTO_BASE_DATUM)
+            elif msg == 1023:
+                _decode_type1023(packet, AUTO_BASE_DATUM)
+    except Exception as e:
+        logging.debug(f"RTCM datum decode failed (msg={msg}): {e}")
+
+def _datum_snapshot() -> RTCMDatum:
+    with DATUM_LOCK:
+        d = AUTO_BASE_DATUM
+        snap = RTCMDatum()
+        snap.__dict__.update(d.__dict__)
+        snap.elip = EllipPara(**d.elip.__dict__)
+        return snap
+
+def _llh_rad_to_ecef(phi: float, lam: float, h: float, a: float, b: float):
+    e2 = 1.0 - (b * b) / (a * a)
+    sin_phi = math.sin(phi)
+    cos_phi = math.cos(phi)
+    n = a / math.sqrt(1.0 - e2 * sin_phi * sin_phi)
+    x = (n + h) * cos_phi * math.cos(lam)
+    y = (n + h) * cos_phi * math.sin(lam)
+    z = (n * (1.0 - e2) + h) * sin_phi
+    return x, y, z
+
+def _ecef_to_llh_rad(x: float, y: float, z: float, a: float, b: float):
+    e2 = 1.0 - (b * b) / (a * a)
+    ep2 = (a * a - b * b) / (b * b)
+    p = math.sqrt(x * x + y * y)
+    if p < 1e-12:
+        lat = math.copysign(math.pi / 2.0, z)
+        lon = 0.0
+        h = abs(z) - b
+        return lat, lon, h
+    theta = math.atan2(z * a, p * b)
+    st = math.sin(theta)
+    ct = math.cos(theta)
+    lat = math.atan2(z + ep2 * b * st * st * st, p - e2 * a * ct * ct * ct)
+    lon = math.atan2(y, x)
+    sin_lat = math.sin(lat)
+    n = a / math.sqrt(1.0 - e2 * sin_lat * sin_lat)
+    h = p / math.cos(lat) - n
+    return lat, lon, h
+
+def _blh_to_xyh(l0: float, k0: float, phi: float, lam: float, h: float, datum: RTCMDatum):
+    a = datum.elip.a
+    e2 = datum.elip.e2
+    ep2 = e2 / (1.0 - e2)
+    sin_phi = math.sin(phi)
+    cos_phi = math.cos(phi)
+    tan_phi = math.tan(phi)
+    n = a / math.sqrt(1.0 - e2 * sin_phi * sin_phi)
+    t = tan_phi * tan_phi
+    c = ep2 * cos_phi * cos_phi
+    A = (lam - l0) * cos_phi
+    e4 = e2 * e2
+    e6 = e4 * e2
+    m = a * (
+        (1.0 - e2 / 4.0 - 3.0 * e4 / 64.0 - 5.0 * e6 / 256.0) * phi
+        - (3.0 * e2 / 8.0 + 3.0 * e4 / 32.0 + 45.0 * e6 / 1024.0) * math.sin(2.0 * phi)
+        + (15.0 * e4 / 256.0 + 45.0 * e6 / 1024.0) * math.sin(4.0 * phi)
+        - (35.0 * e6 / 3072.0) * math.sin(6.0 * phi)
+    )
+    north = datum.false_northing + k0 * (
+        m + n * tan_phi * (
+            A * A / 2.0
+            + (5.0 - t + 9.0 * c + 4.0 * c * c) * A**4 / 24.0
+            + (61.0 - 58.0 * t + t * t + 600.0 * c - 330.0 * ep2) * A**6 / 720.0
+        )
+    )
+    east = datum.false_easting + k0 * n * (
+        A
+        + (1.0 - t + c) * A**3 / 6.0
+        + (5.0 - 18.0 * t + t * t + 72.0 * c - 58.0 * ep2) * A**5 / 120.0
+    )
+    return north, east, h
+
+def _xy_to_blh(l0: float, k0: float, north: float, east: float, h: float, datum: RTCMDatum):
+    a = datum.elip.a
+    e2 = datum.elip.e2
+    ep2 = e2 / (1.0 - e2)
+    x = (north - datum.false_northing) / k0
+    y = (east - datum.false_easting) / k0
+    e4 = e2 * e2
+    e6 = e4 * e2
+    mu = x / (a * (1.0 - e2 / 4.0 - 3.0 * e4 / 64.0 - 5.0 * e6 / 256.0))
+    e1 = (1.0 - math.sqrt(1.0 - e2)) / (1.0 + math.sqrt(1.0 - e2))
+    j1 = (3.0 * e1 / 2.0) - (27.0 * e1**3 / 32.0)
+    j2 = (21.0 * e1**2 / 16.0) - (55.0 * e1**4 / 32.0)
+    j3 = (151.0 * e1**3 / 96.0)
+    j4 = (1097.0 * e1**4 / 512.0)
+    fp = mu + j1 * math.sin(2.0 * mu) + j2 * math.sin(4.0 * mu) + j3 * math.sin(6.0 * mu) + j4 * math.sin(8.0 * mu)
+    sf = math.sin(fp)
+    cf = math.cos(fp)
+    tf = math.tan(fp)
+    c1 = ep2 * cf * cf
+    t1 = tf * tf
+    n1 = a / math.sqrt(1.0 - e2 * sf * sf)
+    r1 = n1 * (1.0 - e2) / (1.0 - e2 * sf * sf)
+    d = y / n1
+    lat = fp - (n1 * tf / r1) * (
+        d * d / 2.0
+        - (5.0 + 3.0 * t1 + 10.0 * c1 - 4.0 * c1 * c1 - 9.0 * ep2) * d**4 / 24.0
+        + (61.0 + 90.0 * t1 + 298.0 * c1 + 45.0 * t1 * t1 - 252.0 * ep2 - 3.0 * c1 * c1) * d**6 / 720.0
+    )
+    lon = l0 + (
+        d
+        - (1.0 + 2.0 * t1 + c1) * d**3 / 6.0
+        + (5.0 - 2.0 * c1 + 28.0 * t1 - 3.0 * c1 * c1 + 8.0 * ep2 + 24.0 * t1 * t1) * d**5 / 120.0
+    ) / cf
+    return lat, lon, h
+
+def _vn2000_blh_to_local_wgs84_llh(lat_blh: float, lon_blh: float, h_blh: float, datum: RTCMDatum):
+    """
+    Follow vn20002llh() flow from legacy implementation:
+    BLH(VN2000) -> XYZ -> inverse 7-parameter -> LLH(local/WGS84-like)
+    """
+    a = datum.elip.a
+    b = datum.elip.b
+    x, y, z = _llh_rad_to_ecef(lat_blh, lon_blh, h_blh, a, b)
+
+    ro = math.pi / (180.0 * 3600.0)
+    dX0 = -191.90441429
+    dY0 = -39.30318279
+    dZ0 = -111.45032835
+    omega0 = -0.00928836 * ro
+    phi0 = 0.01975479 * ro
+    epsilon0 = -0.00427372 * ro
+    k = 1.000000252906278
+
+    xv = dX0 + k * (x + epsilon0 * y - phi0 * z)
+    yv = dY0 + k * (-epsilon0 * x + y + omega0 * z)
+    zv = dZ0 + k * (phi0 * x - omega0 * y + z)
+
+    lat_local, lon_local, h_local = _ecef_to_llh_rad(xv, yv, zv, a, b)
+    return lat_local, lon_local, h_local
+
+def _transform_itrf_to_vn2000_llh(lat_deg: float, lon_deg: float, h: float, datum: RTCMDatum):
+    phi = math.radians(lat_deg)
+    lam = math.radians(lon_deg)
+    a = datum.elip.a
+    b = datum.elip.b
+    x, y, z = _llh_rad_to_ecef(phi, lam, h, a, b)
+
+    ro = math.pi / (180.0 * 3600.0)
+    omega = datum.rX * ro
+    phi0 = datum.rY * ro
+    eps = datum.rZ * ro
+    k = datum.kT
+
+    xv = datum.dX + k * (x + eps * y - phi0 * z)
+    yv = datum.dY + k * (-eps * x + y + omega * z)
+    zv = datum.dZ + k * (phi0 * x - omega * y + z)
+    lat_vn, lon_vn, h_vn = _ecef_to_llh_rad(xv, yv, zv, a, b)
+
+    if datum.res_update:
+        lat_vn += datum.resB
+        lon_vn += datum.resL
+        h_vn += datum.resH
+
+    north, east, h_ne = _blh_to_xyh(datum.l0, datum.k0, lat_vn, lon_vn, h_vn, datum)
+    if datum.shift_cors:
+        north += datum.resN
+        east += datum.resE
+        h_ne += datum.resHS
+
+    lat_blh, lon_blh, h_blh = _xy_to_blh(datum.l0, datum.k0, north, east, h_ne, datum)
+    lat_local, lon_local, h_local = _vn2000_blh_to_local_wgs84_llh(lat_blh, lon_blh, h_blh, datum)
+    return math.degrees(lat_local), math.degrees(lon_local), h_local
+
+def _transform_itrf_to_vn2000_neh_and_llh(lat_deg: float, lon_deg: float, h: float, datum: RTCMDatum):
+    phi = math.radians(lat_deg)
+    lam = math.radians(lon_deg)
+    a = datum.elip.a
+    b = datum.elip.b
+    x, y, z = _llh_rad_to_ecef(phi, lam, h, a, b)
+
+    ro = math.pi / (180.0 * 3600.0)
+    omega = datum.rX * ro
+    phi0 = datum.rY * ro
+    eps = datum.rZ * ro
+    k = datum.kT
+
+    xv = datum.dX + k * (x + eps * y - phi0 * z)
+    yv = datum.dY + k * (-eps * x + y + omega * z)
+    zv = datum.dZ + k * (phi0 * x - omega * y + z)
+    lat_vn, lon_vn, h_vn = _ecef_to_llh_rad(xv, yv, zv, a, b)
+
+    if datum.res_update:
+        lat_vn += datum.resB
+        lon_vn += datum.resL
+        h_vn += datum.resH
+
+    north, east, h_ne = _blh_to_xyh(datum.l0, datum.k0, lat_vn, lon_vn, h_vn, datum)
+    if datum.shift_cors:
+        north += datum.resN
+        east += datum.resE
+        h_ne += datum.resHS
+
+    lat_blh, lon_blh, h_blh = _xy_to_blh(datum.l0, datum.k0, north, east, h_ne, datum)
+    lat_local, lon_local, h_local = _vn2000_blh_to_local_wgs84_llh(lat_blh, lon_blh, h_blh, datum)
+    return north, east, h_ne, math.degrees(lat_local), math.degrees(lon_local), h_local
+
+def _is_valid_vn2000_projection_params(datum: RTCMDatum) -> bool:
+    l0_deg = math.degrees(datum.l0)
+    if not math.isfinite(l0_deg) or not math.isfinite(datum.k0):
+        return False
+    # Vietnam practical bounds for central meridian and projection scale.
+    if not (100.0 <= l0_deg <= 112.0):
+        return False
+    if not (0.9990 <= datum.k0 <= 1.0010):
+        return False
+    return True
+
+# Practical VN2000 central meridians in Vietnam (degrees), aligned with provincial table usage.
+VN2000_L0_CANDIDATES_DEG = (
+    103.0,
+    104.0, 104.5, 104.75,
+    105.0, 105.5, 105.75,
+    106.0, 106.5,
+    107.0, 107.25, 107.75,
+    108.0, 108.25, 108.5,
+)
+
+def _infer_vn2000_l0_from_lon(lon_deg: float):
+    if not math.isfinite(lon_deg):
+        return None
+    return min(VN2000_L0_CANDIDATES_DEG, key=lambda l0: abs(l0 - lon_deg))
+
+VN2000_PROVINCE_TABLE = [
+    {"code": "AG_KG", "name": "An Giang + Kiên Giang", "l0_deg": 104.75, "k0": 0.9999, "aliases": ["an giang", "kien giang"]},
+    {"code": "BN_BG", "name": "Bắc Ninh + Bắc Giang", "l0_deg": 107.0, "k0": 0.9999, "aliases": ["bac ninh", "bac giang"]},
+    {"code": "CM_BL", "name": "Cà Mau + Bạc Liêu", "l0_deg": 104.5, "k0": 0.9999, "aliases": ["ca mau", "bac lieu"]},
+    {"code": "CAO_BANG", "name": "Cao Bằng", "l0_deg": 105.75, "k0": 0.9999, "aliases": ["cao bang"]},
+    {"code": "DAKLAK_PY", "name": "Đắk Lắk + Phú Yên", "l0_deg": 108.5, "k0": 0.9999, "aliases": ["dak lak", "phu yen"]},
+    {"code": "DIEN_BIEN", "name": "Điện Biên", "l0_deg": 103.0, "k0": 0.9999, "aliases": ["dien bien"]},
+    {"code": "DNAI_BPHUOC", "name": "Đồng Nai + Bình Phước", "l0_deg": 107.75, "k0": 0.9999, "aliases": ["dong nai", "binh phuoc"]},
+    {"code": "DTHAP_TGIANG", "name": "Đồng Tháp + Tiền Giang", "l0_deg": 105.0, "k0": 0.9999, "aliases": ["dong thap", "tien giang"]},
+    {"code": "GLAI_BDINH", "name": "Gia Lai + Bình Định", "l0_deg": 108.25, "k0": 0.9999, "aliases": ["gia lai", "binh dinh"]},
+    {"code": "HA_TINH", "name": "Hà Tĩnh", "l0_deg": 105.5, "k0": 0.9999, "aliases": ["ha tinh"]},
+    {"code": "HYEN_TBINH", "name": "Hưng Yên + Thái Bình", "l0_deg": 105.5, "k0": 0.9999, "aliases": ["hung yen", "thai binh"]},
+    {"code": "KH_HOA_NTHUAN", "name": "Khánh Hòa + Ninh Thuận", "l0_deg": 108.25, "k0": 0.9999, "aliases": ["khanh hoa", "ninh thuan"]},
+    {"code": "LAI_CHAU", "name": "Lai Châu", "l0_deg": 104.75, "k0": 0.9999, "aliases": ["lai chau"]},
+    {"code": "LANG_SON", "name": "Lạng Sơn", "l0_deg": 107.25, "k0": 0.9999, "aliases": ["lang son"]},
+    {"code": "LCAI_YBAI", "name": "Lào Cai + Yên Bái", "l0_deg": 104.75, "k0": 0.9999, "aliases": ["lao cai", "yen bai"]},
+    {"code": "LDONG_DNONG_BTHUAN", "name": "Lâm Đồng + Đắk Nông + Bình Thuận", "l0_deg": 107.75, "k0": 0.9999, "aliases": ["lam dong", "dak nong", "binh thuan"]},
+    {"code": "NGHE_AN", "name": "Nghệ An", "l0_deg": 104.75, "k0": 0.9999, "aliases": ["nghe an"]},
+    {"code": "NBINH_HNAM_NDINH", "name": "Ninh Bình + Hà Nam + Nam Định", "l0_deg": 105.0, "k0": 0.9999, "aliases": ["ninh binh", "ha nam", "nam dinh"]},
+    {"code": "PHU_THO_VPHUC_HBINH", "name": "Phú Thọ + Vĩnh Phúc + Hòa Bình", "l0_deg": 104.75, "k0": 0.9999, "aliases": ["phu tho", "vinh phuc", "hoa binh"]},
+    {"code": "QNGAI_KTUM", "name": "Quảng Ngãi + Kon Tum", "l0_deg": 108.0, "k0": 0.9999, "aliases": ["quang ngai", "kon tum"]},
+    {"code": "QNINH", "name": "Quảng Ninh", "l0_deg": 107.75, "k0": 0.9999, "aliases": ["quang ninh"]},
+    {"code": "QTRI_QBINH", "name": "Quảng Trị + Quảng Bình", "l0_deg": 106.0, "k0": 0.9999, "aliases": ["quang tri", "quang binh"]},
+    {"code": "SON_LA", "name": "Sơn La", "l0_deg": 104.0, "k0": 0.9999, "aliases": ["son la"]},
+    {"code": "TNINH_LONGAN", "name": "Tây Ninh + Long An", "l0_deg": 105.75, "k0": 0.9999, "aliases": ["tay ninh", "long an"]},
+    {"code": "TNGUYEN_BKAN", "name": "Thái Nguyên + Bắc Kạn", "l0_deg": 106.5, "k0": 0.9999, "aliases": ["thai nguyen", "bac kan"]},
+    {"code": "THANH_HOA", "name": "Thanh Hóa", "l0_deg": 105.0, "k0": 0.9999, "aliases": ["thanh hoa"]},
+    {"code": "CTHO_STRANG_HGIANG", "name": "Thành phố Cần Thơ + Sóc Trăng + Hậu Giang", "l0_deg": 105.0, "k0": 0.9999, "aliases": ["can tho", "soc trang", "hau giang"]},
+    {"code": "DANANG_QNAM", "name": "Thành phố Đà Nẵng + Quảng Nam", "l0_deg": 107.75, "k0": 0.9999, "aliases": ["da nang", "quang nam"]},
+    {"code": "HA_NOI", "name": "Thành phố Hà Nội", "l0_deg": 105.0, "k0": 0.9999, "aliases": ["ha noi", "hanoi"]},
+    {"code": "HPHONG_HDUONG", "name": "Thành phố Hải Phòng + Hải Dương", "l0_deg": 105.75, "k0": 0.9999, "aliases": ["hai phong", "hai duong"]},
+    {"code": "HCM_BRVT_BDUONG", "name": "Thành phố Hồ Chí Minh + Bà Rịa - Vũng Tàu + Bình Dương", "l0_deg": 105.75, "k0": 0.9999, "aliases": ["ho chi minh", "hcm", "ba ria", "vung tau", "binh duong"]},
+    {"code": "HUE", "name": "Thành phố Huế", "l0_deg": 107.0, "k0": 0.9999, "aliases": ["hue", "thua thien hue"]},
+    {"code": "TQUANG_HGIANG", "name": "Tuyên Quang + Hà Giang", "l0_deg": 106.0, "k0": 0.9999, "aliases": ["tuyen quang", "ha giang"]},
+    {"code": "VLONG_BTRE_TVINH", "name": "Vĩnh Long + Bến Tre + Trà Vinh", "l0_deg": 105.5, "k0": 0.9999, "aliases": ["vinh long", "ben tre", "tra vinh"]},
+]
+
+def _vn_normalize_text(value: str) -> str:
+    text = str(value or "").strip().lower()
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    text = text.replace("đ", "d")
+    return " ".join(text.split())
+
+def _reverse_geocode_province_name(lat: float, lon: float):
+    try:
+        query = urllib.parse.urlencode({
+            "format": "jsonv2",
+            "lat": f"{lat:.8f}",
+            "lon": f"{lon:.8f}",
+            "zoom": 10,
+            "addressdetails": 1,
+            "accept-language": "vi",
+        })
+        url = f"https://nominatim.openstreetmap.org/reverse?{query}"
+        req = urllib.request.Request(url, headers={"User-Agent": "cors-geodetic-agent/1.0"})
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        address = payload.get("address") or {}
+        for key in ("state", "province", "city", "county", "region"):
+            value = address.get(key)
+            if value:
+                return str(value)
+    except Exception:
+        return None
+    return None
+
+def _infer_vn2000_projection(lat_deg: float, lon_deg: float):
+    province_hint = _reverse_geocode_province_name(lat_deg, lon_deg)
+    province_hint_norm = _vn_normalize_text(province_hint) if province_hint else ""
+
+    if province_hint_norm:
+        for row in VN2000_PROVINCE_TABLE:
+            for alias in row["aliases"]:
+                alias_norm = _vn_normalize_text(alias)
+                if alias_norm and alias_norm in province_hint_norm:
+                    return {
+                        "province_code": row["code"],
+                        "province_name": row["name"],
+                        "l0_deg": float(row["l0_deg"]),
+                        "k0": float(row["k0"]),
+                        "source": "reverse_geocode",
+                        "province_hint": province_hint,
+                    }
+
+    fallback_l0 = _infer_vn2000_l0_from_lon(lon_deg)
+    return {
+        "province_code": "UNKNOWN",
+        "province_name": "Không xác định (fallback theo kinh độ)",
+        "l0_deg": float(fallback_l0 if fallback_l0 is not None else 105.0),
+        "k0": 0.9999,
+        "source": "lon_fallback",
+        "province_hint": province_hint,
+    }
+
+def _get_vn2000_province_by_code(code: str):
+    code_norm = str(code or "").strip().upper()
+    if not code_norm:
+        return None
+    for row in VN2000_PROVINCE_TABLE:
+        if str(row.get("code", "")).upper() == code_norm:
+            return row
+    return None
+
 def is_valid_nmea_checksum(sentence) -> bool:
     try:
         if isinstance(sentence, (bytes, bytearray)):
@@ -670,6 +1282,8 @@ def is_valid_nmea_checksum(sentence) -> bool:
 # ==============================================================================
 def dispatch_rtcm_data(data):
     global rtcm_input_window_bytes, rtcm_input_window_start_ts, rtcm_input_bps
+    # Parse datum messages (1021/1023/1025) regardless of stream forwarding state.
+    _update_datum_from_rtcm_packet(data)
     now = time.time()
     with rtcm_input_stats_lock:
         rtcm_input_window_bytes += len(data)
@@ -713,10 +1327,16 @@ def dispatch_nmea_data(data):
             if s and '$G' in s and 'GGA' in s[:10]:
                 # If this is a GGA sentence, parse fix quality
                 try:
-                    # import local parser
-                    new_status = parse_gga_fix_status(s)
+                    new_status, lat, lon, alt = parse_gga_data(s)
                     globals()['LAST_GGA_FIX_STATUS'] = new_status
-                    # If an AgentManager instance exists in globals, update it too
+                    if lat is not None:
+                        globals()['LAST_GGA_COORD'] = (lat, lon, alt)
+                    # Store raw GGA for NTRIP VRS usage
+                    raw_line = s.strip()
+                    if '\n' in raw_line:
+                        raw_line = next((l.strip() for l in raw_line.split('\n') if 'GGA' in l), raw_line)
+                    globals()['LAST_RAW_GGA'] = raw_line
+                    globals()['LAST_RAW_GGA_TS'] = time.time()
                     ag = globals().get('agent')
                     if ag and hasattr(ag, 'last_gga_fix_status'):
                         ag.last_gga_fix_status = new_status
@@ -1008,8 +1628,14 @@ class NTRIPClientWorker(threading.Thread):
                 client_socket = socket.create_connection((host, port), timeout=10)
                 
                 auth_str = f"{user}:{pw or ''}"
-                auth_b64 = base64.b64encode(auth_str.encode('ascii')).decode('ascii')
-                headers = (f"GET /{mp} HTTP/1.1\r\nHost: {host}:{port}\r\nNtrip-Version: Ntrip/2.0\r\nUser-Agent: NTRIP GeodeticAgent/4.1\r\nAuthorization: Basic {auth_b64}\r\nConnection: close\r\n\r\n")
+                auth_b64 = base64.b64encode(auth_str.encode('ascii')).decode('ascii').strip()
+                headers = (
+                    f"GET /{mp} HTTP/1.0\r\n"
+                    f"User-Agent: NTRIP AitogyNTRIPClient/20131124\r\n"
+                    f"Authorization: Basic {auth_b64}\r\n"
+                    f"Accept: */*\r\n"
+                    f"Connection: close\r\n\r\n"
+                )
                 
                 client_socket.sendall(headers.encode('ascii'))
                 
@@ -1020,11 +1646,54 @@ class NTRIPClientWorker(threading.Thread):
                 if not (b"ICY 200 OK" in response_header or b"HTTP/1.1 200 OK" in response_header):
                     raise ConnectionError(f"Caster rejected: {response_header.decode(errors='ignore')}")
 
-                self.log("SUCCESS", "[RTCM Client] Authenticated. Receiving correction data.")
+                self.log("INFO", "[RTCM Client] Authenticated. Receiving correction data.")
+                
+                # Send GGA immediately after auth for VRS
+                out_gga = _get_fresh_outbound_gga(3.0)
+                if out_gga:
+                    try:
+                        gga_bytes = (out_gga + '\r\n').encode('ascii')
+                        client_socket.sendall(gga_bytes)
+                        self.log("INFO", f"[RTCM Client] >>> SENT INITIAL GGA to caster: {out_gga}")
+                    except Exception as e:
+                        self.log("WARNING", f"[RTCM Client] Failed to send initial GGA: {e}")
+                else:
+                    self.log("WARNING", "[RTCM Client] No fresh GGA available yet")
+                
+                last_gga_send_time = time.time()
+                gga_send_interval = 5  # Send GGA every 5 seconds for VRS
+                client_socket.settimeout(5.0)
+                total_rtcm_bytes = 0
+                total_rtcm_pkts = 0
                 
                 while not self._stop_event.is_set() and not is_remote_locked():
-                    rtcm_data = client_socket.recv(1024)
-                    if not rtcm_data: break
+                    # Send GGA to caster periodically (required for VRS)
+                    now = time.time()
+                    if now - last_gga_send_time >= gga_send_interval:
+                        out_gga = _get_fresh_outbound_gga(3.0)
+                        if out_gga:
+                            try:
+                                gga_bytes = (out_gga + '\r\n').encode('ascii')
+                                client_socket.sendall(gga_bytes)
+                                self.log("INFO", f"[RTCM Client] >>> GGA sent ({len(gga_bytes)}B): {out_gga}")
+                            except Exception as e:
+                                self.log("WARNING", f"[RTCM Client] Failed to send GGA: {e}")
+                                break
+                        else:
+                            self.log("WARNING", "[RTCM Client] No fresh GGA to send (waiting for GNSS data)")
+                        last_gga_send_time = now
+                    
+                    try:
+                        rtcm_data = client_socket.recv(4096)
+                    except socket.timeout:
+                        self.log("INFO", f"[RTCM Client] recv timeout (5s), total RTCM so far: {total_rtcm_bytes}B / {total_rtcm_pkts} pkts")
+                        continue  # No data yet, loop back to check GGA send
+                    
+                    if not rtcm_data:
+                        self.log("WARNING", f"[RTCM Client] Server closed connection (recv returned empty). Total received: {total_rtcm_bytes}B")
+                        break
+                    
+                    total_rtcm_bytes += len(rtcm_data)
                     rtcm_stream_buffer.extend(rtcm_data)
 
                     # Safety cap for malformed stream bursts.
@@ -1033,8 +1702,20 @@ class NTRIPClientWorker(threading.Thread):
                         rtcm_stream_buffer.clear()
                         continue
 
-                    for pkt in extract_valid_rtcm3_packets(rtcm_stream_buffer):
+                    pkts = extract_valid_rtcm3_packets(rtcm_stream_buffer)
+                    for pkt in pkts:
                         dispatch_rtcm_data(pkt)
+                        total_rtcm_pkts += 1
+                    
+                    if pkts:
+                        total_rtcm_bytes += len(rtcm_data)
+                        # Log summary every 30s instead of every packet
+                        now_log = time.time()
+                        if not hasattr(self, '_last_rtcm_log_time'):
+                            self._last_rtcm_log_time = 0
+                        if now_log - self._last_rtcm_log_time >= 30.0 or total_rtcm_pkts <= 5:
+                            self.log("INFO", f"[RTCM Client] Total received so far: {total_rtcm_bytes}B / {total_rtcm_pkts} pkts")
+                            self._last_rtcm_log_time = now_log
 
             except Exception as e:
                 self.log("WARNING", f"[RTCM Client] Connection error: {e}.")
@@ -1052,6 +1733,9 @@ class GNSSReader(threading.Thread):
         self._pause_event = threading.Event()
         self.daemon = True
         self.name = "GNSSReaderThread"
+        
+        # RTCM injection queue (for writing CORS corrections to serial)
+        self.rtcm_inject_queue = Queue(maxsize=200)
         
         # Statistics
         self.rtcm_packets_sent = 0
@@ -1095,6 +1779,17 @@ class GNSSReader(threading.Thread):
     def resume(self):
         self._pause_event.clear()
         self.log("INFO", "GNSSReader resumed")
+    
+    def inject_rtcm(self, data: bytes):
+        """Queue RTCM correction data to be written to serial port"""
+        try:
+            self.rtcm_inject_queue.put_nowait(data)
+        except Full:
+            try:
+                self.rtcm_inject_queue.get_nowait()
+                self.rtcm_inject_queue.put_nowait(data)
+            except (Empty, Full):
+                pass
     
     def get_statistics(self):
         return {
@@ -1234,6 +1929,36 @@ class GNSSReader(threading.Thread):
                 
                 ubx_class = buffer[2]
                 ubx_id = buffer[3]
+
+                # UBX-NAV-HPPOSLLH (class=0x01, id=0x14) payload length is typically 36 bytes.
+                if ubx_class == 0x01 and ubx_id == 0x14 and payload_length >= 36:
+                    try:
+                        payload = packet[6:6 + payload_length]
+                        lon = struct.unpack_from('<i', payload, 4)[0] * 1e-7
+                        lat = struct.unpack_from('<i', payload, 8)[0] * 1e-7
+                        h_mm = struct.unpack_from('<i', payload, 12)[0]
+                        lon_hp = struct.unpack_from('<b', payload, 20)[0] * 1e-9
+                        lat_hp = struct.unpack_from('<b', payload, 21)[0] * 1e-9
+                        h_hp_m = struct.unpack_from('<b', payload, 22)[0] * 1e-4  # 0.1 mm -> m
+                        lat_hpp = float(lat + lat_hp)
+                        lon_hpp = float(lon + lon_hp)
+                        h_ell = float(h_mm * 1e-3 + h_hp_m)
+                        if -90.0 <= lat_hpp <= 90.0 and -180.0 <= lon_hpp <= 180.0:
+                            globals()['LAST_HPPOSLLH_COORD'] = (lat_hpp, lon_hpp, h_ell)
+                            globals()['LAST_HPPOSLLH_TS'] = time.time()
+                    except Exception:
+                        pass
+
+                # UBX-NAV-PVT (class=0x01, id=0x07): numSV at payload offset 23.
+                if ubx_class == 0x01 and ubx_id == 0x07 and payload_length >= 24:
+                    try:
+                        payload = packet[6:6 + payload_length]
+                        num_sv = int(payload[23])
+                        if 0 <= num_sv <= 99:
+                            globals()['LAST_UBX_NUMSV'] = num_sv
+                            globals()['LAST_UBX_NUMSV_TS'] = time.time()
+                    except Exception:
+                        pass
                 
                 # Only log important UBX messages
                 if ubx_class == 0x05:  # ACK/NAK
@@ -1423,6 +2148,33 @@ class GNSSReader(threading.Thread):
                                 break
                             
                             try:
+                                # === INJECT RTCM CORRECTIONS TO CHIP ===
+                                inject_count = 0
+                                inject_bytes = 0
+                                while not self.rtcm_inject_queue.empty():
+                                    try:
+                                        rtcm_pkt = self.rtcm_inject_queue.get_nowait()
+                                        ser.write(rtcm_pkt)
+                                        inject_count += 1
+                                        inject_bytes += len(rtcm_pkt)
+                                    except Empty:
+                                        break
+                                    except Exception as inj_err:
+                                        self.log("WARNING", f"RTCM inject write error: {inj_err}")
+                                        break
+                                
+                                if inject_count > 0:
+                                    if not hasattr(self, '_inject_total'):
+                                        self._inject_total = 0
+                                        self._inject_bytes_total = 0
+                                        self._inject_last_log = 0
+                                    self._inject_total += inject_count
+                                    self._inject_bytes_total += inject_bytes
+                                    now_inj = time.time()
+                                    if now_inj - self._inject_last_log >= 30.0:
+                                        self.log("INFO", f"[RTCM INJECT] Written {self._inject_total} pkts / {self._inject_bytes_total}B to serial port")
+                                        self._inject_last_log = now_inj
+                                
                                 # === READ IN BATCHES (NOT BYTE-BY-BYTE) ===
                                 if ser.in_waiting > 0:
                                     # Read up to 4KB at once for better performance
@@ -1487,6 +2239,7 @@ class GNSSReader(threading.Thread):
                                     if current_time - last_error_log_time > 5:
                                         self.log("WARNING", f"Read instability on {current_port}: {read_error}")
                                         last_error_log_time = current_time
+                                    _mark_gnss_data_stale()
                                     
                                     # Break out of read loop to reconnect
                                     buffer.clear()
@@ -1537,12 +2290,14 @@ class GNSSReader(threading.Thread):
                 
                 # Clear buffer and wait before retry
                 buffer.clear()
+                _mark_gnss_data_stale()
                 time.sleep(wait_time)
             
             except Exception as critical_error:
                 error_count += 1
                 self.log("ERROR", f"Critical error in GNSSReader: {critical_error}", exc_info=True)
                 buffer.clear()
+                _mark_gnss_data_stale()
                 time.sleep(min(5 * error_count, 30))
         
         # ==================== CLEANUP ====================
@@ -1601,13 +2356,29 @@ class AgentManager:
         return False
     
     def update_service_config(self, cfg: dict):
-        # Never auto-enable RTCM push from config deployment.
-        # Stream can only be enabled by SET_RTCM_STREAM_ACTIVE command.
-        cfg['stream_on_demand'] = True
-        cfg['stream_active'] = False
-        cfg.pop('active_mountpoint', None)
+        # Respect user settings from dashboard deployment
+        
+        # Core logic: derive stream_active from stream_on_demand
+        stream_on_demand = bool(cfg.get('stream_on_demand', False))
+        
+        if not stream_on_demand:
+            # Always-On mode: force stream_active = True
+            cfg['stream_active'] = True
+        else:
+            # On-Demand mode: Force stream_active = False so it starts in Sleep mode
+            # if not explicitly set (None or missing)
+            if cfg.get('stream_active') is None:
+                cfg['stream_active'] = False
+        
         self.config['services'] = cfg
-        self.rtcm_stream_active = False
+        
+        # Sync current engine state
+        stream_active = bool(cfg.get('stream_active', False))
+        self.rtcm_stream_active = stream_active
+        
+        global rtcm_stream_active_flag
+        rtcm_stream_active_flag = stream_active
+        
         self.save_config()
 
     @staticmethod
@@ -1651,6 +2422,14 @@ class AgentManager:
         base_status = "online" 
         if not self.config.get('is_provisioned', False):
             base_status = "unprovisioned"
+        
+        # New: Three-state (Online/Sleep/Offline) logic
+        services = self.config.get('services', {})
+        stream_on_demand = services.get('stream_on_demand') == True
+        stream_active = services.get('stream_active') == True
+        
+        if base_status == "online" and stream_on_demand and not stream_active:
+            base_status = "sleep"
 
         final_status = current_state.lower()
 
@@ -1659,8 +2438,8 @@ class AgentManager:
             "rebooting", 
             "rebooting_for_reset", 
             "initializing", 
-            "awaiting_license" 
-        ]:
+            "awaiting_license"
+        ] and not final_status.startswith("auto_setup"):
             final_status = base_status
         if is_remote_locked():
             final_status = "locked"
@@ -1678,10 +2457,35 @@ class AgentManager:
             "is_provisioned": self.config.get('is_provisioned', False),
             "base_config": self.get_base_config(),
             "service_config": self.get_service_config(),
+            "auto_base_progress": globals().get("AUTO_BASE_PROGRESS", {}),
             "is_locked": is_remote_locked(),
             "is_synced": True
 
         }
+        with DATUM_LOCK:
+            datum_l0_deg = round(math.degrees(AUTO_BASE_DATUM.l0), 8)
+            datum_k0 = AUTO_BASE_DATUM.k0
+            datum_1021 = AUTO_BASE_DATUM.rtcm1021_update
+            datum_1023 = AUTO_BASE_DATUM.rtcm1023_update
+            datum_1025 = AUTO_BASE_DATUM.rtcm1025_update
+        status["auto_base_datum"] = {
+            "rtcm1021_update": datum_1021,
+            "rtcm1023_update": datum_1023,
+            "rtcm1025_update": datum_1025,
+            "l0_deg": datum_l0_deg,
+            "k0": datum_k0
+        }
+
+        base_cfg = status.get("base_config") or {}
+        coords = base_cfg.get("coords")
+        if not coords:
+            lat = base_cfg.get("lat")
+            lon = base_cfg.get("lon")
+            alt = base_cfg.get("alt")
+            if lat is not None and lon is not None:
+                coords = {"lat": lat, "lon": lon, "alt": alt if alt is not None else 0.0}
+        if coords:
+            status["base_coords"] = coords
 
         if hasattr(self, 'gnss_reader') and self.gnss_reader:
             status["gnss_stats"] = self.gnss_reader.get_statistics()
@@ -1702,6 +2506,9 @@ class AgentManager:
             cfg = self.get_service_config() or {}
             server1_enabled = bool(cfg.get('server1_enabled'))
             server2_enabled = bool(cfg.get('server2_enabled'))
+            stream_on_demand = bool(cfg.get('stream_on_demand', False))
+            stream_active = bool(cfg.get('stream_active', True))
+            can_push_rtcm = (not stream_on_demand) or stream_active
             selected_mountpoint = self._normalize_mountpoint(cfg.get('active_mountpoint'))
             server1_mp = self._normalize_mountpoint(cfg.get('mountpoint1'))
             server2_mp = self._normalize_mountpoint(cfg.get('mountpoint2'))
@@ -1709,24 +2516,25 @@ class AgentManager:
             synth_server1_bps = 0
             synth_server2_bps = 0
 
-            if selected_mountpoint:
-                if selected_mountpoint == server1_mp:
+            if can_push_rtcm:
+                if selected_mountpoint:
+                    if selected_mountpoint == server1_mp:
+                        synth_server1_bps = ingress_bps
+                    elif selected_mountpoint == server2_mp:
+                        synth_server2_bps = ingress_bps
+                elif server1_enabled and not server2_enabled:
                     synth_server1_bps = ingress_bps
-                elif selected_mountpoint == server2_mp:
+                elif server2_enabled and not server1_enabled:
                     synth_server2_bps = ingress_bps
-            elif server1_enabled and not server2_enabled:
-                synth_server1_bps = ingress_bps
-            elif server2_enabled and not server1_enabled:
-                synth_server2_bps = ingress_bps
-            elif server1_enabled and server2_enabled:
-                # No mountpoint selected: duplicate ingress for compatibility dashboards.
-                synth_server1_bps = ingress_bps
-                synth_server2_bps = ingress_bps
+                elif server1_enabled and server2_enabled:
+                    # No mountpoint selected: duplicate ingress for compatibility dashboards.
+                    synth_server1_bps = ingress_bps
+                    synth_server2_bps = ingress_bps
 
             status["ntrip_stats"]["server1_bps"] = int(status["ntrip_stats"].get("server1_bps", synth_server1_bps))
             status["ntrip_stats"]["server2_bps"] = int(status["ntrip_stats"].get("server2_bps", synth_server2_bps))
 
-            status["ntrip_connected"] = any(self.ntrip_connection_status.values())
+            status["ntrip_connected"] = can_push_rtcm and any(self.ntrip_connection_status.values())
             status["ntrip_status"] = self.ntrip_connection_status.copy()
             
             for key, bps in self.service_stats.items():
@@ -1826,7 +2634,7 @@ async def send_status(agent: AgentManager, mqtt_client: mqtt.Client):
 # === ASYNC FUNCTIONS - PROCESS COMMAND (UPDATED)                           ===
 # ==============================================================================
 async def process_command(source: str, data: dict, agent: AgentManager, gnss_reader: GNSSReader, mqtt_client: mqtt.Client):
-    global current_state
+    global current_state, rtcm_stream_active_flag, active_auto_base_task, active_auto_base_client
     command = data.get("command")
     payload = data.get("payload", {})
     logging.info(f"Received command '{command}' from {source.upper()}")
@@ -1852,7 +2660,14 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
         return
     
     previous_state = current_state
-    is_long_running = command in ["EXECUTE_RAW_COMMANDS", "DELETE_DEVICE", "PROVISION_DEVICE", "DEPLOY_LICENSE"]
+    is_long_running = command in [
+        "EXECUTE_RAW_COMMANDS",
+        "DELETE_DEVICE",
+        "PROVISION_DEVICE",
+        "DEPLOY_LICENSE",
+        "TRIGGER_AUTO_BASE",
+        "APPLY_VN2000_PROVINCE",
+    ]
     
     if is_long_running:
         if not create_lock_file():
@@ -1877,6 +2692,120 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
                 remove_lock_file()
                 os.execv(sys.executable, [sys.executable] + sys.argv)
         
+        elif command == "TRIGGER_AUTO_BASE":
+            logging.info("Received TRIGGER_AUTO_BASE command. Configuring and starting state machine...")
+            auto_setup_metadata = payload
+            raw_mp = auto_setup_metadata.get("mountpoint", "VRS.105M3")
+            if raw_mp == "VRS":
+                raw_mp = "VRS.105M3" # Force fallback if backend sent stale 'VRS'
+                
+            agent.config['auto_base_setup'] = {
+                "enabled": True,
+                "ip": auto_setup_metadata.get("ip", "14.238.1.125"),
+                "port": auto_setup_metadata.get("port", 2101),
+                "user": auto_setup_metadata.get("user", "aitogy"),
+                "password": auto_setup_metadata.get("password", "123"),
+                "mountpoint": raw_mp,
+                "timeout": auto_setup_metadata.get("timeout", 3600),
+                "samples": auto_setup_metadata.get("samples", 60),
+                "sensor_type": auto_setup_metadata.get("sensor_type"),
+                "enable_itrf_vn2000_transform": auto_setup_metadata.get("enable_itrf_vn2000_transform", True),
+                "l0_deg": auto_setup_metadata.get("l0_deg"),
+                "k0": auto_setup_metadata.get("k0")
+            }
+            agent.save_config()
+            _set_auto_base_progress("queued", step=0, total_steps=4)
+            await send_status(agent, mqtt_client)
+            
+            # Cancel existing task if running
+            global active_auto_base_task, active_auto_base_client
+            try:
+                if 'active_auto_base_client' in globals() and active_auto_base_client:
+                    active_auto_base_client.stop()
+            except Exception: pass
+            
+            try:
+                if 'active_auto_base_task' in globals() and active_auto_base_task:
+                    active_auto_base_task.cancel()
+            except Exception: pass
+            
+            # Start the state machine as a background task
+            active_auto_base_task = asyncio.create_task(auto_base_state_machine(agent, gnss_reader, mqtt_client))
+
+        elif command == "STOP_AUTO_BASE":
+            logging.info("Received STOP_AUTO_BASE command")
+            try:
+                if active_auto_base_client:
+                    active_auto_base_client.stop()
+            except Exception:
+                pass
+            try:
+                if active_auto_base_task:
+                    active_auto_base_task.cancel()
+            except Exception:
+                pass
+            active_auto_base_client = None
+            active_auto_base_task = None
+            rtcm_stream_active_flag = False
+            if gnss_reader:
+                try:
+                    gnss_reader.resume()
+                except Exception:
+                    pass
+            current_state = "ONLINE"
+            _set_auto_base_progress("stopped", step=0, total_steps=4, reason="Stopped by user")
+            await send_status(agent, mqtt_client)
+
+        elif command == "APPLY_VN2000_PROVINCE":
+            province_code = str(payload.get("province_code") or "").strip().upper()
+            province_row = _get_vn2000_province_by_code(province_code)
+            if not province_row:
+                raise ValueError(f"Invalid province_code: {province_code}")
+
+            base_cfg = agent.get_base_config() or {}
+            raw_llh = base_cfg.get("auto_base_raw_itrf_llh") or {}
+            raw_lat = float(raw_llh.get("lat"))
+            raw_lon = float(raw_llh.get("lon"))
+            raw_alt = float(raw_llh.get("alt"))
+
+            datum_snapshot = _datum_snapshot()
+
+            datum_snapshot.l0 = math.radians(float(province_row["l0_deg"]))
+            datum_snapshot.k0 = float(province_row.get("k0", 0.9999))
+
+            local_lat, local_lon, local_alt = _transform_itrf_to_vn2000_llh(raw_lat, raw_lon, raw_alt, datum_snapshot)
+            if not (
+                math.isfinite(local_lat) and math.isfinite(local_lon) and math.isfinite(local_alt)
+                and -90.0 <= local_lat <= 90.0 and -180.0 <= local_lon <= 180.0
+            ):
+                raise ValueError("Transformed coordinate out of valid range")
+
+            port = agent.detected_chip.get("port")
+            chip_type = agent.detected_chip.get("type", "UNKNOWN")
+            await _apply_base_mode_to_chip(chip_type, port, local_lat, local_lon, local_alt, gnss_reader)
+
+            base_cfg["coords"] = {"lat": local_lat, "lon": local_lon, "alt": local_alt}
+            base_cfg["itrf_vn2000_transform_applied"] = True
+            base_cfg["central_meridian_deg"] = float(province_row["l0_deg"])
+            base_cfg["k0"] = float(province_row.get("k0", 0.9999))
+            base_cfg["projection_source"] = "manual_province_override"
+            base_cfg["province_code"] = province_row["code"]
+            base_cfg["province_name"] = province_row["name"]
+            base_cfg["timestamp"] = int(time.time())
+            agent.config["base_config"] = base_cfg
+            agent.save_config()
+
+            current_state = "ONLINE"
+            _set_auto_base_progress(
+                "reprojected",
+                step=4,
+                total_steps=4,
+                province_code=province_row["code"],
+                province_name=province_row["name"],
+                coord={"lat": local_lat, "lon": local_lon, "alt": local_alt},
+            )
+            await send_status(agent, mqtt_client)
+            
         elif command == "EXECUTE_RAW_COMMANDS":
             if data.get("original_config", {}).get("mode") == "BASE":
                 agent.config['base_config'] = data["original_config"]["params"]
@@ -1935,7 +2864,6 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
             await send_status(agent, mqtt_client)
 
         elif command == "SET_RTCM_STREAM_ACTIVE":
-            global rtcm_stream_active_flag
             active = bool(payload.get("active", False))
             mountpoint = payload.get("mountpoint")
             agent.set_rtcm_stream_active(active, mountpoint=mountpoint)
@@ -2090,6 +3018,9 @@ async def websocket_task(agent: AgentManager, gnss_reader: GNSSReader, mqtt_clie
                     data = json.loads(message)
                     await process_command('websocket', data, agent, gnss_reader, mqtt_client)
 
+        except asyncio.CancelledError:
+            logging.info("websocket_task cancelled")
+            break
         except asyncio.TimeoutError:
             logging.warning("WebSocket connection timeout. Retrying in 10s...")
             await asyncio.sleep(10)
@@ -2104,12 +3035,523 @@ async def websocket_task(agent: AgentManager, gnss_reader: GNSSReader, mqtt_clie
             await asyncio.sleep(10)
         finally:
             active_websocket_connection = None
-            await asyncio.sleep(10)
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                raise
 
 async def status_publisher_task(agent: AgentManager, mqtt_client: mqtt.Client):
+    try:
+        while True:
+            await asyncio.sleep(max(1, STATUS_PUBLISH_INTERVAL_SECONDS))
+            await send_status(agent, mqtt_client)
+    except asyncio.CancelledError:
+        logging.info("status_publisher_task cancelled")
+        raise
+
+# ==============================================================================
+# === AUTO BASE SETUP STATE MACHINE                                         ===
+# ==============================================================================
+def _cleanup_inject_queue(gnss_reader):
+    """Remove GNSSReader's inject queue from RTCM subscribers after auto-base is done"""
+    if gnss_reader:
+        with subscriber_lock:
+            if gnss_reader.rtcm_inject_queue in rtcm_subscribers:
+                rtcm_subscribers.remove(gnss_reader.rtcm_inject_queue)
+        # Drain any remaining packets
+        while not gnss_reader.rtcm_inject_queue.empty():
+            try:
+                gnss_reader.rtcm_inject_queue.get_nowait()
+            except Empty:
+                break
+
+def _set_auto_base_progress(phase: str, **extra):
+    global AUTO_BASE_PROGRESS
+    progress = {"phase": phase, "updated_at": int(time.time())}
+    progress.update(extra)
+    AUTO_BASE_PROGRESS = progress
+
+def _robust_mean(values):
+    if not values:
+        return None
+    if len(values) < 5:
+        return sum(values) / len(values)
+
+    median_val = statistics.median(values)
+    deviations = [abs(v - median_val) for v in values]
+    mad = statistics.median(deviations)
+
+    if mad <= 1e-12:
+        sorted_vals = sorted(values)
+        trim = max(1, int(len(sorted_vals) * 0.1))
+        core = sorted_vals[trim:len(sorted_vals) - trim]
+        if not core:
+            core = sorted_vals
+        return sum(core) / len(core)
+
+    # 1.4826 scales MAD to approximate standard deviation on normal data.
+    robust_sigma = 1.4826 * mad
+    threshold = 3.5 * robust_sigma
+    core = [v for v in values if abs(v - median_val) <= threshold]
+    if not core:
+        core = values
+    return sum(core) / len(core)
+
+def _plain_mean(values):
+    vals = [float(v) for v in values if v is not None]
+    if not vals:
+        return None
+    return sum(vals) / len(vals)
+
+async def _apply_base_mode_to_chip(chip_type: str, port: str, lat: float, lon: float, alt: float, gnss_reader: GNSSReader):
+    if not port:
+        raise RuntimeError("No GNSS port")
+
+    if gnss_reader:
+        gnss_reader.pause()
+        await asyncio.sleep(1.0)
+
+    try:
+        with serial_port_lock, serial.Serial(port, DEFAULT_BAUDRATE, timeout=2) as ser:
+            if chip_type == "Ublox":
+                accuracy = 0.01
+                msg = bytearray(b'\xb5\x62\x06\x71\x28\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')
+                msg[8] = 2
+                msg[9] = 1
+
+                multiplier = 10000000
+                ecef_x_or_lat = int(lat * multiplier).to_bytes(4, byteorder='little', signed=True)
+                ecef_x_or_lat_hp = int((lat * multiplier - int(lat * multiplier)) * 100).to_bytes(1, byteorder='little', signed=True)
+                ecef_y_or_lon = int(lon * multiplier).to_bytes(4, byteorder='little', signed=True)
+                ecef_y_or_lon_hp = int((lon * multiplier - int(lon * multiplier)) * 100).to_bytes(1, byteorder='little', signed=True)
+                ecef_z_or_alt = int(alt * 100).to_bytes(4, byteorder='little', signed=True)
+                ecef_z_or_alt_hp = int((alt * 100 - int(alt * 100)) * 100).to_bytes(1, byteorder='little', signed=True)
+                fixed_pos_acc = int(accuracy * 10000).to_bytes(4, byteorder='little', signed=False)
+
+                for i in range(4):
+                    msg[10 + i] = ecef_x_or_lat[i]
+                    msg[14 + i] = ecef_y_or_lon[i]
+                    msg[18 + i] = ecef_z_or_alt[i]
+                    msg[26 + i] = fixed_pos_acc[i]
+
+                msg[22] = ecef_x_or_lat_hp[0]
+                msg[23] = ecef_y_or_lon_hp[0]
+                msg[24] = ecef_z_or_alt_hp[0]
+
+                ck_a, ck_b = 0, 0
+                for i in range(2, 46):
+                    ck_a = (ck_a + msg[i]) & 0xFF
+                    ck_b = (ck_b + ck_a) & 0xFF
+                msg[46] = ck_a
+                msg[47] = ck_b
+
+                ser.write(msg)
+                ser.write(b'\xb5\x62\x06\x09\x0d\x00\x00\x00\x00\x00\xff\xff\x00\x00\x00\x00\x00\x00\x03\x1d\xab')
+                ser.flush()
+            elif chip_type in ("Unicorecomm", "RTCM3_Source"):
+                base_cmd = f"MODE BASE {lat:.8f} {lon:.8f} {alt:.3f}\r\n".encode("ascii")
+                ser.write(base_cmd)
+                ser.flush()
+                await asyncio.sleep(0.5)
+                ser.write(b"SAVECONFIG\r\n")
+                ser.flush()
+            else:
+                raise RuntimeError(f"Unsupported chip type: {chip_type}")
+    finally:
+        if gnss_reader:
+            await asyncio.sleep(2.0)
+            gnss_reader.resume()
+
+async def auto_base_state_machine(agent: AgentManager, gnss_reader: GNSSReader, mqtt_client: mqtt.Client):
+    global current_state, LAST_GGA_COORD
+    
+    cfg = agent.config.get("auto_base_setup", {})
+    if not cfg:
+        # Default disabled if not in config
+        return
+    if not cfg.get("enabled", False):
+        return
+        
+    logging.info("=== STARTING AUTO BASE SETUP ===")
+    _set_auto_base_progress("starting")
+    await send_status(agent, mqtt_client)
+    
+    port = agent.detected_chip.get("port")
+    
+    # Priority: Manual override from FE payload -> Agent detection
+    chip_type = cfg.get("sensor_type") or agent.detected_chip.get("type", "UNKNOWN")
+    if cfg.get("sensor_type"):
+        logging.info(f"AutoBase: Using manually overridden chip type from Frontend: {chip_type}")
+    
+    if not port:
+        logging.error("AutoBase: No port detected, aborting.")
+        return
+        
+    # State 1: Configure ROVER
+    current_state = "AUTO_SETUP_ROVER"
+    _set_auto_base_progress("set_rover", step=1, total_steps=4)
+    logging.info("AutoBase: Setting chip to ROVER mode...")
+    await send_status(agent, mqtt_client)
+    
+    if gnss_reader:
+        gnss_reader.pause()
+        await asyncio.sleep(1.0)
+        
+    try:
+        with serial_port_lock, serial.Serial(port, DEFAULT_BAUDRATE, timeout=2) as ser:
+            if chip_type == "Ublox":
+                msg = bytearray(b'\xb5\x62\x06\x71\x28\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')
+                CK_A, CK_B = 0, 0
+                for i in range (2, 46):
+                    CK_A = (CK_A + msg[i]) & 0xFF
+                    CK_B = (CK_B + CK_A) & 0xFF
+                msg[46] = CK_A
+                msg[47] = CK_B
+                ser.write(msg)
+                ser.write(b'\xb5\x62\x06\x09\x0d\x00\x00\x00\x00\x00\xff\xff\x00\x00\x00\x00\x00\x00\x03\x1d\xab')
+                ser.flush()
+                logging.info("AutoBase: Ublox ROVER mode set")
+            elif chip_type in ("Unicorecomm", "RTCM3_Source"):
+                ser.write(b'MODE ROVER\r\n')
+                ser.flush()
+                await asyncio.sleep(0.5)
+                ser.write(b'SAVECONFIG\r\n')
+                ser.flush()
+                logging.info(f"AutoBase: {chip_type} ROVER mode set (MODE ROVER + SAVECONFIG)")
+            else:
+                logging.warning(f"AutoBase: Unknown chip type '{chip_type}', trying Unicorecomm commands...")
+                ser.write(b'MODE ROVER\r\n')
+                ser.flush()
+                await asyncio.sleep(0.5)
+                ser.write(b'SAVECONFIG\r\n')
+                ser.flush()
+    except Exception as e:
+        logging.error(f"AutoBase: Failed to set ROVER mode: {e}")
+    finally:
+        if gnss_reader:
+            await asyncio.sleep(2.0)
+            gnss_reader.resume()
+            
+    # Start temporary NTRIP client to get RTCM
+    ntrip_host = cfg.get("ip", "14.238.1.125")
+    ntrip_port = str(cfg.get("port", "2101"))
+    ntrip_user = cfg.get("user", "aitogy")
+    ntrip_pass = cfg.get("password", "123")
+    ntrip_mount = cfg.get("mountpoint", "VRS.105M3")
+    
+    temp_cfg = {
+        'rtcmserver1': ntrip_host,
+        'rtcmport1': ntrip_port,
+        'rtcmusername1': ntrip_user,
+        'rtcmpassword1': ntrip_pass,
+        'rtcmmountpoint1': ntrip_mount,
+        'reconnectioninterval': 5
+    }
+    
+    temp_client = NTRIPClientWorker(temp_cfg, agent.log)
+    global active_auto_base_client
+    active_auto_base_client = temp_client
+    
+    # CRITICAL: Enable RTCM dispatch flag so packets reach the inject queue!
+    # Without this, dispatch_rtcm_data() drops ALL packets (rtcm_stream_active_flag=False)
+    global rtcm_stream_active_flag
+    saved_rtcm_flag = rtcm_stream_active_flag
+    rtcm_stream_active_flag = True
+    logging.info("AutoBase: Temporarily enabled rtcm_stream_active_flag for CORS injection")
+    
+    temp_client.start()
+    
+    # Register GNSSReader's inject queue so RTCM from CORS goes to chip serial
+    if gnss_reader:
+        with subscriber_lock:
+            if gnss_reader.rtcm_inject_queue not in rtcm_subscribers:
+                rtcm_subscribers.append(gnss_reader.rtcm_inject_queue)
+        logging.info("AutoBase: Registered RTCM injection to chip serial port")
+    
+    # State 2: Wait for FIX
+    current_state = "AUTO_SETUP_WAIT_FIX"
+    timeout = int(cfg.get("timeout", 3600))
+    fixed_streak_required = int(cfg.get("fixed_streak_seconds", 5))
+    start_time = time.time()
+    _set_auto_base_progress(
+        "wait_fix",
+        step=2,
+        total_steps=4,
+        timeout=timeout,
+        elapsed=0,
+        fix_status=globals().get('LAST_GGA_FIX_STATUS'),
+        fixed_streak=0,
+        fixed_streak_required=fixed_streak_required,
+    )
+    await send_status(agent, mqtt_client)
+    
+    logging.info(
+        f"AutoBase: Waiting for stable RTK Fix... (Timeout: {timeout}s, required_streak={fixed_streak_required}s)"
+    )
+    
+    fixed_streak = 0
     while True:
-        await asyncio.sleep(max(1, STATUS_PUBLISH_INTERVAL_SECONDS))
+        if _is_rtk_usable_status(globals().get('LAST_GGA_FIX_STATUS')):
+            fixed_streak += 1
+        else:
+            fixed_streak = 0
+        if fixed_streak >= fixed_streak_required:
+            break
+        if time.time() - start_time > timeout:
+            logging.error("AutoBase: RTK Fix timeout!")
+            _set_auto_base_progress("failed", step=2, total_steps=4, reason="RTK fix timeout")
+            temp_client.stop()
+            _cleanup_inject_queue(gnss_reader)
+            rtcm_stream_active_flag = saved_rtcm_flag
+            logging.info(f"AutoBase: Restored rtcm_stream_active_flag to {saved_rtcm_flag}")
+            current_state = "ONLINE"
+            await send_status(agent, mqtt_client)
+            return
+        elapsed = int(time.time() - start_time)
+        _set_auto_base_progress(
+            "wait_fix",
+            step=2,
+            total_steps=4,
+            timeout=timeout,
+            elapsed=elapsed,
+            fix_status=globals().get('LAST_GGA_FIX_STATUS'),
+            fixed_streak=fixed_streak,
+            fixed_streak_required=fixed_streak_required,
+        )
+        await asyncio.sleep(1)
+        
+    # State 3: Average Position
+    current_state = "AUTO_SETUP_AVERAGING"
+    configured_samples = int(cfg.get("samples", 60))
+    samples_needed = 60
+    averaging_seconds = 60
+    if configured_samples != samples_needed:
+        logging.info(
+            f"AutoBase: Override requested samples={configured_samples} -> fixed {samples_needed} samples / {averaging_seconds}s"
+        )
+    logging.info(
+        f"AutoBase: Stable RTK usable status confirmed ({fixed_streak_required}s, fixed/float). "
+        f"Collecting up to {samples_needed} samples in {averaging_seconds}s..."
+    )
+    _set_auto_base_progress(
+        "averaging",
+        step=3,
+        total_steps=4,
+        samples_collected=0,
+        samples_target=samples_needed,
+        averaging_seconds=averaging_seconds,
+        elapsed=0
+    )
+    await send_status(agent, mqtt_client)
+    
+    coords = []
+    averaging_start = time.time()
+    sample_deadline = averaging_start + averaging_seconds
+    while len(coords) < samples_needed and time.time() < sample_deadline:
+        elapsed = int(time.time() - averaging_start)
+        await asyncio.sleep(1)
+        if not _is_rtk_usable_status(globals().get('LAST_GGA_FIX_STATUS')):
+            _set_auto_base_progress(
+                "averaging",
+                step=3,
+                total_steps=4,
+                samples_collected=len(coords),
+                samples_target=samples_needed,
+                fix_status=globals().get('LAST_GGA_FIX_STATUS'),
+                averaging_seconds=averaging_seconds,
+                elapsed=elapsed
+            )
+            continue
+        coord = globals().get('LAST_GGA_COORD')
+        if (
+            coord
+            and len(coord) >= 3
+            and coord[0] is not None
+            and coord[1] is not None
+            and coord[2] is not None
+            and -90.0 <= float(coord[0]) <= 90.0
+            and -180.0 <= float(coord[1]) <= 180.0
+        ):
+            coords.append(coord)
+            _set_auto_base_progress(
+                "averaging",
+                step=3,
+                total_steps=4,
+                samples_collected=len(coords),
+                samples_target=samples_needed,
+                averaging_seconds=averaging_seconds,
+                elapsed=elapsed,
+                latest_coord={"lat": float(coord[0]), "lon": float(coord[1]), "alt": float(coord[2])}
+            )
+            await send_status(agent, mqtt_client)
+            
+    if len(coords) < max(5, min(samples_needed, 15)):
+        logging.error("AutoBase: Failed to collect samples.")
+        _set_auto_base_progress(
+            "failed",
+            step=3,
+            total_steps=4,
+            reason=f"Insufficient valid RTK samples ({len(coords)}/{samples_needed})"
+        )
+        temp_client.stop()
+        _cleanup_inject_queue(gnss_reader)
+        rtcm_stream_active_flag = saved_rtcm_flag
+        logging.info(f"AutoBase: Restored rtcm_stream_active_flag to {saved_rtcm_flag}")
+        current_state = "ONLINE"
         await send_status(agent, mqtt_client)
+        return
+        
+    avg_lat = _plain_mean([float(c[0]) for c in coords])
+    avg_lon = _plain_mean([float(c[1]) for c in coords])
+    avg_alt = _plain_mean([float(c[2]) for c in coords])
+    
+    logging.info(f"AutoBase: Averaged Pos -> Lat: {avg_lat:.8f}, Lon: {avg_lon:.8f}, Alt: {avg_alt:.3f}")
+
+    transform_applied = False
+    vn2000_neh = None
+    datum_snapshot = _datum_snapshot()
+    projection_source = "vn2000_table"
+    province_code = None
+    province_name = None
+    province_hint = None
+    if cfg.get("l0_deg") is not None:
+        datum_snapshot.l0 = math.radians(float(cfg.get("l0_deg")))
+        projection_source = "manual"
+    if cfg.get("k0") is not None:
+        datum_snapshot.k0 = float(cfg.get("k0"))
+        if projection_source != "manual":
+            projection_source = "manual_k0"
+    # Do not use RTCM1025 for projection parameters.
+    # Always infer L0 from VN2000 central-meridian table (unless manual override is provided).
+    if cfg.get("l0_deg") is None:
+        projection = _infer_vn2000_projection(avg_lat, avg_lon)
+        inferred_l0_deg = float(projection.get("l0_deg", 105.0))
+        datum_snapshot.l0 = math.radians(inferred_l0_deg)
+        if cfg.get("k0") is None:
+            datum_snapshot.k0 = float(projection.get("k0", 0.9999))
+        projection_source = str(projection.get("source") or "vn2000_table")
+        province_code = projection.get("province_code")
+        province_name = projection.get("province_name")
+        province_hint = projection.get("province_hint")
+        logging.info(
+            "AutoBase: Using VN2000 auto projection "
+            f"(province={province_name}, code={province_code}, hint={province_hint}, "
+            f"L0={inferred_l0_deg:.2f}, k0={datum_snapshot.k0:.6f}, source={projection_source})"
+        )
+
+    if bool(cfg.get("enable_itrf_vn2000_transform", True)):
+        try:
+            if not _is_valid_vn2000_projection_params(datum_snapshot):
+                logging.warning(
+                    "AutoBase: Skip ITRF->VN2000 transform due to invalid L0/k0 "
+                    f"(L0={math.degrees(datum_snapshot.l0):.6f}, k0={datum_snapshot.k0:.6f})"
+                )
+            else:
+                n_vn, e_vn, h_vn2000, local_lat, local_lon, local_alt = _transform_itrf_to_vn2000_neh_and_llh(avg_lat, avg_lon, avg_alt, datum_snapshot)
+                if (
+                    math.isfinite(local_lat) and math.isfinite(local_lon) and math.isfinite(local_alt)
+                    and -90.0 <= local_lat <= 90.0
+                    and -180.0 <= local_lon <= 180.0
+                    and -1000.0 <= local_alt <= 100000.0
+                ):
+                    vn2000_neh = {"north": n_vn, "east": e_vn, "h": h_vn2000}
+                    logging.info(
+                        "AutoBase: ITRF->VN2000 transform applied "
+                        f"(L0={math.degrees(datum_snapshot.l0):.6f}, k0={datum_snapshot.k0:.6f}, source={projection_source}) "
+                        f"-> Lat: {local_lat:.8f}, Lon: {local_lon:.8f}, Alt: {local_alt:.3f}, "
+                        f"N: {n_vn:.4f}, E: {e_vn:.4f}, H: {h_vn2000:.4f}"
+                    )
+                    avg_lat, avg_lon, avg_alt = local_lat, local_lon, local_alt
+                    transform_applied = True
+                else:
+                    logging.warning(
+                        "AutoBase: Skip transformed coordinate out of range, fallback to LLH "
+                        f"(lat={local_lat}, lon={local_lon}, alt={local_alt})"
+                    )
+        except Exception as e:
+            logging.warning(f"AutoBase: ITRF->VN2000 transform failed, fallback to averaged LLH: {e}")
+    
+    temp_client.stop()
+    temp_client.join(timeout=5)
+    _cleanup_inject_queue(gnss_reader)
+    logging.info("AutoBase: NTRIP client stopped, inject queue cleaned up")
+    
+    # State 4: Set BASE Mode
+    current_state = "AUTO_SETUP_BASE"
+    _set_auto_base_progress(
+        "set_base",
+        step=4,
+        total_steps=4,
+        averaged_coord={"lat": avg_lat, "lon": avg_lon, "alt": avg_alt},
+        sample_count=len(coords),
+        transform_applied=transform_applied,
+        datum_status={
+            "rtcm1021": datum_snapshot.rtcm1021_update,
+            "rtcm1023": datum_snapshot.rtcm1023_update,
+            "rtcm1025": datum_snapshot.rtcm1025_update,
+            "projection_source": projection_source,
+            "province_code": province_code,
+            "province_name": province_name,
+            "province_hint": province_hint,
+            "vn2000_neh": vn2000_neh,
+        }
+    )
+    logging.info("AutoBase: Setting chip to BASE mode...")
+    await send_status(agent, mqtt_client)
+    
+    try:
+        await _apply_base_mode_to_chip(chip_type, port, avg_lat, avg_lon, avg_alt, gnss_reader)
+    except Exception as e:
+        logging.error(f"AutoBase: Failed to set BASE mode: {e}")
+             
+    # Save base config in agent
+    agent.config['base_config'] = {
+        'coords': {
+            'lat': avg_lat,
+            'lon': avg_lon,
+            'alt': avg_alt
+        },
+        'altitude_reference': 'ELLIPSOID',
+        'base_setup_method': 'AUTO_CORS',
+        'auto_configured': True,
+        'itrf_vn2000_transform_applied': transform_applied,
+        'datum_1021_updated': datum_snapshot.rtcm1021_update,
+        'datum_1023_updated': datum_snapshot.rtcm1023_update,
+        'datum_1025_updated': datum_snapshot.rtcm1025_update,
+        'central_meridian_deg': round(math.degrees(datum_snapshot.l0), 8),
+        'k0': datum_snapshot.k0,
+        'projection_source': projection_source,
+        'province_code': province_code,
+        'province_name': province_name,
+        'province_hint': province_hint,
+        'vn2000_neh': vn2000_neh,
+        'auto_base_raw_itrf_llh': {
+            'lat': _plain_mean([float(c[0]) for c in coords]),
+            'lon': _plain_mean([float(c[1]) for c in coords]),
+            'alt': _plain_mean([float(c[2]) for c in coords]),
+        },
+        'samples_collected': len(coords),
+        'timestamp': int(time.time())
+    }
+    agent.save_config()
+    rtcm_stream_active_flag = saved_rtcm_flag
+    logging.info(f"AutoBase: Restored rtcm_stream_active_flag to {saved_rtcm_flag}")
+    
+    # Disable auto_base_setup so it doesn't restart on reboot
+    agent.config['auto_base_setup'] = {"enabled": False}
+    agent.save_config()
+    
+    current_state = "ONLINE"
+    _set_auto_base_progress(
+        "completed",
+        step=4,
+        total_steps=4,
+        averaged_coord={"lat": avg_lat, "lon": avg_lon, "alt": avg_alt},
+        sample_count=len(coords),
+        transform_applied=transform_applied
+    )
+    logging.info("=== AUTO BASE SETUP COMPLETE ===")
+    await send_status(agent, mqtt_client)
 
 # ==============================================================================
 # === MAIN FUNCTION                                                         ===
@@ -2219,9 +3661,10 @@ async def main():
     # ========== Start Background Tasks ==========
     status_task = asyncio.create_task(status_publisher_task(agent, mqtt_client))
     ws_task = asyncio.create_task(websocket_task(agent, gnss_reader, mqtt_client))
+    auto_base_task = asyncio.create_task(auto_base_state_machine(agent, gnss_reader, mqtt_client))
     
     try:
-        await asyncio.gather(status_task, ws_task)
+        await asyncio.gather(status_task, ws_task, auto_base_task)
     except asyncio.CancelledError:
         logging.info("Tasks cancelled - shutting down gracefully")
     finally:
@@ -2260,53 +3703,13 @@ async def main():
 # ==============================================================================
 if __name__ == "__main__":
     try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    # ------------------------------------------------------------
-
-    stop_event = asyncio.Event()
-
-    def shutdown_handler(signum, frame):
-        logging.warning(f"Received shutdown signal {signum}. Cleaning up...")
-        loop.call_soon_threadsafe(stop_event.set)
-
-    if IS_RASPBERRY_PI:
-        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
-            try:
-                loop.add_signal_handler(sig, lambda: stop_event.set())
-            except NotImplementedError:
-                signal.signal(sig, shutdown_handler)
-    elif IS_WINDOWS:
-        signal.signal(signal.SIGINT, shutdown_handler)
-        signal.signal(signal.SIGTERM, shutdown_handler)
-    
-    main_task = loop.create_task(main())
-    stop_task = loop.create_task(stop_event.wait())
-    
-    try:
-        done, pending = loop.run_until_complete(
-            asyncio.wait([main_task, stop_task], return_when=asyncio.FIRST_COMPLETED)
-        )
-
-        for task in pending:
-            task.cancel()
-            try:
-                loop.run_until_complete(task)
-            except asyncio.CancelledError:
-                pass
-                
+        asyncio.run(main())
     except KeyboardInterrupt:
-        logging.info("\nAgent stopped by user (Ctrl+C).")
+        logging.info("Agent stopped by user (Ctrl+C).")
     except Exception as e:
         logging.critical(f"FATAL ERROR in main execution: {e}", exc_info=True)
         if IS_WINDOWS:
             input("A critical error occurred, press Enter to exit.")
     finally:
-        try:
-            remove_lock_file()
-            loop.run_until_complete(loop.shutdown_asyncgens())
-        finally:
-            loop.close()
-            logging.info("Final cleanup complete.")
+        remove_lock_file()
+        logging.info("Final cleanup complete.")
