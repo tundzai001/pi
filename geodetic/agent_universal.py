@@ -2627,21 +2627,24 @@ class AgentManager:
             selected_mountpoint = self._normalize_mountpoint(cfg.get('active_mountpoint'))
             server1_mp = self._normalize_mountpoint(cfg.get('mountpoint1'))
             server2_mp = self._normalize_mountpoint(cfg.get('mountpoint2'))
+            server1_connected = bool(self.ntrip_connection_status.get('server1'))
+            server2_connected = bool(self.ntrip_connection_status.get('server2'))
 
             synth_server1_bps = 0
             synth_server2_bps = 0
 
-            if can_push_server1 or can_push_server2:
+            # Only synthesize per-server egress bitrate when that server is truly connected to caster.
+            if (can_push_server1 and server1_connected) or (can_push_server2 and server2_connected):
                 if selected_mountpoint:
-                    if selected_mountpoint == server1_mp and can_push_server1:
+                    if selected_mountpoint == server1_mp and can_push_server1 and server1_connected:
                         synth_server1_bps = ingress_bps
-                    elif selected_mountpoint == server2_mp and can_push_server2:
+                    elif selected_mountpoint == server2_mp and can_push_server2 and server2_connected:
                         synth_server2_bps = ingress_bps
-                elif can_push_server1 and not can_push_server2:
+                elif can_push_server1 and server1_connected and not (can_push_server2 and server2_connected):
                     synth_server1_bps = ingress_bps
-                elif can_push_server2 and not can_push_server1:
+                elif can_push_server2 and server2_connected and not (can_push_server1 and server1_connected):
                     synth_server2_bps = ingress_bps
-                elif can_push_server1 and can_push_server2:
+                elif can_push_server1 and server1_connected and can_push_server2 and server2_connected:
                     # No mountpoint selected: duplicate ingress for compatibility dashboards.
                     synth_server1_bps = ingress_bps
                     synth_server2_bps = ingress_bps
