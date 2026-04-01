@@ -214,6 +214,33 @@ def _compute_any_server_can_push(cfg: dict) -> bool:
         if _get_server_stream_switches(cfg, server_id)['can_push']:
             return True
     return False
+
+
+def _resolve_preferred_server_for_mountpoint(cfg: dict, mountpoint: str | None) -> int | None:
+    target_mp = _normalize_mountpoint_value(mountpoint)
+    if not target_mp:
+        return None
+
+    candidates = []
+    for sid in (1, 2):
+        server_mp = _normalize_mountpoint_value(cfg.get(f'mountpoint{sid}'))
+        enabled = _to_bool(cfg.get(f'server{sid}_enabled'), False)
+        if enabled and server_mp and server_mp == target_mp:
+            candidates.append(sid)
+
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    preferred_hosts = ('aitogy.com.vn',)
+    for marker in preferred_hosts:
+        for sid in candidates:
+            host = str(cfg.get(f'serverhost{sid}', '') or '').strip().lower()
+            if host and marker in host:
+                return sid
+
+    return sorted(candidates)[0]
 # Internal RTCM ingress bitrate tracker (independent from NTRIP socket forwarding)
 rtcm_input_stats_lock = threading.Lock()
 rtcm_input_window_bytes = 0
@@ -262,6 +289,50 @@ def generate_pi_license_base(serial_number: str) -> str:
         return base_code_str[:12]
     return base_code_str.ljust(12, '0')
 
+CHIP_DETECT_BAUD_HINTS = {}
+
+
+def _ordered_baud_rates(port_device: str, common_baud_rates: list[int]) -> list[int]:
+    hint = CHIP_DETECT_BAUD_HINTS.get(str(port_device or "").strip())
+    if not hint or hint not in common_baud_rates:
+        return list(common_baud_rates)
+    return [hint] + [baud for baud in common_baud_rates if baud != hint]
+
+
+def _remember_baud_hint(port_device: str, baud: int) -> None:
+    if not port_device:
+        return
+    CHIP_DETECT_BAUD_HINTS[str(port_device).strip()] = int(baud)
+
+
+def _wait_for_serial_response(ser, wait_seconds: float, max_bytes: int = 2048) -> bytes:
+    deadline = time.time() + max(0.1, float(wait_seconds))
+    chunks = []
+    seen_data = False
+    idle_ticks_after_data = 0
+
+    while time.time() < deadline:
+        waiting = int(getattr(ser, 'in_waiting', 0) or 0)
+        if waiting > 0:
+            read_size = min(waiting, max_bytes)
+            chunk = ser.read(read_size)
+            if chunk:
+                chunks.append(chunk)
+                seen_data = True
+                idle_ticks_after_data = 0
+                if sum(len(x) for x in chunks) >= max_bytes:
+                    break
+            time.sleep(0.03)
+            continue
+
+        if seen_data:
+            idle_ticks_after_data += 1
+            if idle_ticks_after_data >= 3:
+                break
+        time.sleep(0.05)
+
+    return b''.join(chunks)
+
 # ==============================================================================
 # === EMBEDDED CHIP DETECTOR                                                ===
 # ==============================================================================
@@ -272,9 +343,9 @@ def get_chip_info(port: str, baudrate: int) -> dict | None:
             ser.reset_input_buffer()
             ser.write(b'\xB5\x62\x0A\x04\x00\x00\x0E\x34')
             ser.flush()
-            time.sleep(0.5)
-            response = ser.read(100)
+            response = _wait_for_serial_response(ser, wait_seconds=0.6, max_bytes=160)
             if b'\xB5\x62\x0A\x04' in response:
+                _remember_baud_hint(port, baudrate)
                 return {"type": "Ublox"}
     except Exception:
         pass
@@ -291,11 +362,11 @@ def get_chip_info(port: str, baudrate: int) -> dict | None:
                 ser.reset_input_buffer()
                 ser.write(test_cmd)
                 ser.flush()
-                time.sleep(1.5)
-                response = ser.read(1024)
+                response = _wait_for_serial_response(ser, wait_seconds=1.0, max_bytes=1024)
             
                 unicore_keywords = [b'Unicore', b'UM982', b'UM9', b'UB4', b'FIRMWARE', b'COMPTYPE']
                 if any(keyword in response for keyword in unicore_keywords):
+                    _remember_baud_hint(port, baudrate)
                     return {"type": "Unicorecomm"}
         except Exception:
             continue
@@ -317,7 +388,7 @@ def find_chip_robustly():
         if 'bluetooth' in port.device.lower() or 'rfcomm' in port.device.lower():
             continue
             
-        for baud in common_baud_rates:
+        for baud in _ordered_baud_rates(port.device, common_baud_rates):
             logging.info(f"  -> [ACTIVE] Probing {port.device} @ {baud}...")
             
             # === TEST UNICORECOMM FIRST ===
@@ -335,10 +406,8 @@ def find_chip_robustly():
                         
                         ser.write(cmd)
                         ser.flush()
-                        time.sleep(2.0)  
-                        
-                        if ser.in_waiting > 0:
-                            response = ser.read(ser.in_waiting)
+                        response = _wait_for_serial_response(ser, wait_seconds=1.2, max_bytes=2048)
+                        if response:
                             response_str = response.decode('ascii', errors='ignore')
                             
                             # Check keywords
@@ -346,6 +415,7 @@ def find_chip_robustly():
                             if any(kw in response_str for kw in unicore_keywords):
                                 logging.info(f"!!! [ACTIVE] Detected UM982/Unicorecomm on {port.device} @ {baud}")
                                 logging.info(f"    Response snippet: {response_str[:100]}")
+                                _remember_baud_hint(port.device, baud)
                                 return {"port": port.device, "type": "Unicorecomm", "baud": baud}
                 except Exception as e:
                     logging.debug(f"Unicore command test failed: {e}")
@@ -357,13 +427,11 @@ def find_chip_robustly():
                     ser.reset_input_buffer()
                     ser.write(b'\xB5\x62\x0A\x04\x00\x00\x0E\x34')
                     ser.flush()
-                    time.sleep(1.0)
-                    
-                    if ser.in_waiting > 0:
-                        response = ser.read(512)
-                        if b'\xB5\x62\x0A\x04' in response:
-                            logging.info(f"!!! [ACTIVE] Detected U-blox on {port.device} @ {baud}")
-                            return {"port": port.device, "type": "Ublox", "baud": baud}
+                    response = _wait_for_serial_response(ser, wait_seconds=0.9, max_bytes=512)
+                    if b'\xB5\x62\x0A\x04' in response:
+                        logging.info(f"!!! [ACTIVE] Detected U-blox on {port.device} @ {baud}")
+                        _remember_baud_hint(port.device, baud)
+                        return {"port": port.device, "type": "Ublox", "baud": baud}
             except Exception as e:
                 logging.debug(f"Ublox test failed: {e}")
     
@@ -375,18 +443,17 @@ def find_chip_robustly():
         if 'bluetooth' in port.device.lower() or 'rfcomm' in port.device.lower():
             continue
             
-        for baud in common_baud_rates:
+        for baud in _ordered_baud_rates(port.device, common_baud_rates):
             logging.info(f"  -> [PASSIVE] Listening on {port.device} @ {baud}...")
             try:
                 with serial.Serial(port.device, baud, timeout=4.0) as ser:
-                    time.sleep(3.0)
-                    
-                    if ser.in_waiting > 0:
-                        raw_data = ser.read(ser.in_waiting)
+                    raw_data = _wait_for_serial_response(ser, wait_seconds=1.6, max_bytes=4096)
+                    if raw_data:
                         
                         # Check for RTCM3 first (priority)
                         if b'\xD3' in raw_data:
                             logging.info(f"!!! [PASSIVE] Detected RTCM3 output on {port.device} @ {baud}")
+                            _remember_baud_hint(port.device, baud)
                             return {"port": port.device, "type": "RTCM3_Source", "baud": baud}
                         
                         # Check for NMEA (last resort)
@@ -398,6 +465,7 @@ def find_chip_robustly():
                                 chip_type = "Generic_NMEA"
                             
                             logging.info(f"!!! [PASSIVE] Detected {chip_type} on {port.device} @ {baud}")
+                            _remember_baud_hint(port.device, baud)
                             return {"port": port.device, "type": chip_type, "baud": baud}
                         
             except Exception as e:
@@ -418,13 +486,13 @@ def find_chip_fallback():
             
         logging.info(f"[Fallback] Testing {port.device}...")
         
-        for baud in [115200, 460800, 921600, 38400]:
+        for baud in _ordered_baud_rates(port.device, [115200, 460800, 921600, 38400]):
             try:
                 with serial.Serial(port.device, baud, timeout=3) as ser:
                     ser.reset_input_buffer()
                     ser.write(b'unlog\r\n')
                     ser.flush()
-                    time.sleep(1.0)
+                    _wait_for_serial_response(ser, wait_seconds=0.6, max_bytes=512)
                     
                     # Clear buffer
                     if ser.in_waiting > 0:
@@ -433,24 +501,22 @@ def find_chip_fallback():
                     # Test version command
                     ser.write(b'version\r\n')
                     ser.flush()
-                    time.sleep(2.0)
-                    
-                    if ser.in_waiting > 0:
-                        response = ser.read(ser.in_waiting)
+                    response = _wait_for_serial_response(ser, wait_seconds=1.2, max_bytes=2048)
+                    if response:
                         response_str = response.decode('ascii', errors='ignore')
                         
                         if any(kw in response_str for kw in ['UM982', 'Unicore', 'FIRMWARE']):
                             logging.info(f"[Fallback] Found UM982 on {port.device} @ {baud}")
+                            _remember_baud_hint(port.device, baud)
                             return {"port": port.device, "type": "Unicorecomm", "baud": baud}
                     
                     # Test for any GNSS data
                     ser.reset_input_buffer()
-                    time.sleep(2)
-                    if ser.in_waiting > 0:
-                        data = ser.read(ser.in_waiting)
-                        if b'$G' in data or b'\xB5\x62' in data or b'\xD3' in data:
-                            logging.info(f"[Fallback] Found GNSS-like data on {port.device} @ {baud}")
-                            return {"port": port.device, "type": "Generic", "baud": baud}
+                    data = _wait_for_serial_response(ser, wait_seconds=1.2, max_bytes=2048)
+                    if b'$G' in data or b'\xB5\x62' in data or b'\xD3' in data:
+                        logging.info(f"[Fallback] Found GNSS-like data on {port.device} @ {baud}")
+                        _remember_baud_hint(port.device, baud)
+                        return {"port": port.device, "type": "Generic", "baud": baud}
                             
             except Exception as e:
                 logging.debug(f"Fallback test error: {e}")
@@ -1371,37 +1437,34 @@ def dispatch_nmea_data(data):
     """
     Enhanced NMEA dispatcher with overflow protection
     """
+    # Parse GGA outside lock to keep subscriber fan-out fast under high NMEA throughput.
+    try:
+        s = None
+        if isinstance(data, (bytes, bytearray)):
+            s = data.decode('ascii', errors='ignore')
+        elif isinstance(data, str):
+            s = data
+
+        if s and '$G' in s and 'GGA' in s[:10]:
+            try:
+                new_status, lat, lon, alt = parse_gga_data(s)
+                globals()['LAST_GGA_FIX_STATUS'] = new_status
+                if lat is not None:
+                    globals()['LAST_GGA_COORD'] = (lat, lon, alt)
+                raw_line = s.strip()
+                if '\n' in raw_line:
+                    raw_line = next((l.strip() for l in raw_line.split('\n') if 'GGA' in l), raw_line)
+                globals()['LAST_RAW_GGA'] = raw_line
+                globals()['LAST_RAW_GGA_TS'] = time.time()
+                ag = globals().get('agent')
+                if ag and hasattr(ag, 'last_gga_fix_status'):
+                    ag.last_gga_fix_status = new_status
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     with subscriber_lock:
-        # Try to detect GGA sentences and update last-known fix status
-        try:
-            s = None
-            if isinstance(data, (bytes, bytearray)):
-                s = data.decode('ascii', errors='ignore')
-            elif isinstance(data, str):
-                s = data
-
-            if s and '$G' in s and 'GGA' in s[:10]:
-                # If this is a GGA sentence, parse fix quality
-                try:
-                    new_status, lat, lon, alt = parse_gga_data(s)
-                    globals()['LAST_GGA_FIX_STATUS'] = new_status
-                    if lat is not None:
-                        globals()['LAST_GGA_COORD'] = (lat, lon, alt)
-                    # Store raw GGA for NTRIP VRS usage
-                    raw_line = s.strip()
-                    if '\n' in raw_line:
-                        raw_line = next((l.strip() for l in raw_line.split('\n') if 'GGA' in l), raw_line)
-                    globals()['LAST_RAW_GGA'] = raw_line
-                    globals()['LAST_RAW_GGA_TS'] = time.time()
-                    ag = globals().get('agent')
-                    if ag and hasattr(ag, 'last_gga_fix_status'):
-                        ag.last_gga_fix_status = new_status
-                except Exception:
-                    pass
-
-        except Exception:
-            pass
-
         for queue in list(nmea_subscribers):
             try:
                 queue.put_nowait(data)
@@ -2464,7 +2527,30 @@ class AgentManager:
         services = self.config.setdefault('services', {})
         should_restart = False
 
+        def _maybe_remap_to_comvn(target_sid: int | None, mp_value: str | None) -> int | None:
+            if target_sid not in (1, 2):
+                return target_sid
+            target_mp = self._normalize_mountpoint(mp_value)
+            if not target_mp:
+                return target_sid
+
+            target_host = str(services.get(f'server{target_sid}_host', services.get(f'serverhost{target_sid}', '')) or '').strip().lower()
+            if 'aitogy.com.vn' in target_host:
+                return target_sid
+
+            for sid in (1, 2):
+                sid_mp = self._normalize_mountpoint(services.get(f'mountpoint{sid}'))
+                sid_host = str(services.get(f'server{sid}_host', services.get(f'serverhost{sid}', '')) or '').strip().lower()
+                if sid != target_sid and sid_mp == target_mp and 'aitogy.com.vn' in sid_host:
+                    logging.info(
+                        f"[RTCM ROUTE] Remap server {target_sid} -> {sid} for mountpoint '{target_mp}' "
+                        f"to prefer aitogy.com.vn"
+                    )
+                    return sid
+            return target_sid
+
         if server_id in (1, 2):
+            server_id = _maybe_remap_to_comvn(server_id, mountpoint)
             prev_switch = _get_server_stream_switches(services, server_id)
             prev_mountpoint = self._normalize_mountpoint(services.get('active_mountpoint'))
 
@@ -2481,23 +2567,50 @@ class AgentManager:
             new_switch = _get_server_stream_switches(services, server_id)
             new_mountpoint = self._normalize_mountpoint(services.get('active_mountpoint'))
             should_restart = (prev_switch['can_push'] != new_switch['can_push']) or (prev_mountpoint != new_mountpoint)
+            if not bool(active):
+                # Keep other server streams stable; worker loop can enter standby without full restart.
+                should_restart = False
         else:
             prev_active = bool(services.get('stream_active', False))
             prev_mountpoint = self._normalize_mountpoint(services.get('active_mountpoint'))
+            prev_any_can_push = _compute_any_server_can_push(services)
             target_mp = self._normalize_mountpoint(mountpoint)
 
             target_server_id = None
             if target_mp:
+                target_server_id = _resolve_preferred_server_for_mountpoint(services, target_mp)
+                target_server_id = _maybe_remap_to_comvn(target_server_id, target_mp)
+
+            # For deactivate commands without explicit target, prefer current active mountpoint.
+            if target_server_id is None and not bool(active):
+                active_mp = self._normalize_mountpoint(services.get('active_mountpoint'))
+                if active_mp:
+                    target_server_id = _resolve_preferred_server_for_mountpoint(services, active_mp)
+                    target_server_id = _maybe_remap_to_comvn(target_server_id, active_mp)
+
+            # If still unknown on deactivate, affect only enabled on-demand servers and keep always-on servers untouched.
+            if target_server_id is None and not bool(active):
+                on_demand_servers = []
                 for sid in (1, 2):
-                    if self._normalize_mountpoint(services.get(f'mountpoint{sid}')) == target_mp:
-                        target_server_id = sid
-                        break
+                    sw = _get_server_stream_switches(services, sid)
+                    if sw['enabled'] and sw['on_demand']:
+                        on_demand_servers.append(sid)
+
+                if len(on_demand_servers) == 1:
+                    target_server_id = on_demand_servers[0]
+                elif len(on_demand_servers) > 1:
+                    for sid in on_demand_servers:
+                        services[f'server{sid}_stream_on_demand'] = True
+                        services[f'server{sid}_stream_active'] = False
+                    services.pop('active_mountpoint', None)
+
+                    new_mountpoint = self._normalize_mountpoint(services.get('active_mountpoint'))
+                    should_restart = (prev_any_can_push != _compute_any_server_can_push(services)) or (prev_mountpoint != new_mountpoint)
 
             # Backward-compatible behavior: if mountpoint maps to a known server,
             # apply active/sleep directly to that specific server.
             if target_server_id in (1, 2):
                 prev_switch = _get_server_stream_switches(services, target_server_id)
-                services['stream_on_demand'] = True
                 services[f'server{target_server_id}_stream_on_demand'] = True
                 services[f'server{target_server_id}_stream_active'] = bool(active)
 
@@ -2509,7 +2622,10 @@ class AgentManager:
                 new_switch = _get_server_stream_switches(services, target_server_id)
                 new_mountpoint = self._normalize_mountpoint(services.get('active_mountpoint'))
                 should_restart = (prev_switch['can_push'] != new_switch['can_push']) or (prev_mountpoint != new_mountpoint)
-            else:
+                if not bool(active):
+                    # Avoid bouncing unaffected server workers during sleep transition.
+                    should_restart = False
+            elif not should_restart:
                 services['stream_on_demand'] = True
                 services['stream_active'] = bool(active)
 
@@ -2658,6 +2774,29 @@ class AgentManager:
                 (can_push_server2 and bool(self.ntrip_connection_status.get('server2')))
             )
             status["ntrip_status"] = self.ntrip_connection_status.copy()
+            status["ntrip_stream_state"] = {
+                "selected_mountpoint": cfg.get("active_mountpoint"),
+                "server1": {
+                    "enabled": bool(server1_switch['enabled']),
+                    "on_demand": bool(server1_switch['on_demand']),
+                    "active": bool(server1_switch['active']),
+                    "can_push": bool(server1_switch['can_push']),
+                    "sleep": bool(server1_switch['enabled'] and server1_switch['on_demand'] and not server1_switch['active']),
+                    "connected": server1_connected,
+                    "bps": int(status["ntrip_stats"].get("server1_bps", 0)),
+                    "mountpoint": cfg.get("mountpoint1"),
+                },
+                "server2": {
+                    "enabled": bool(server2_switch['enabled']),
+                    "on_demand": bool(server2_switch['on_demand']),
+                    "active": bool(server2_switch['active']),
+                    "can_push": bool(server2_switch['can_push']),
+                    "sleep": bool(server2_switch['enabled'] and server2_switch['on_demand'] and not server2_switch['active']),
+                    "connected": server2_connected,
+                    "bps": int(status["ntrip_stats"].get("server2_bps", 0)),
+                    "mountpoint": cfg.get("mountpoint2"),
+                },
+            }
             
             for key, bps in self.service_stats.items():
                 if 'bps' in key and bps > 0 and bps < 100:
