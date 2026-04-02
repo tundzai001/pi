@@ -2829,8 +2829,17 @@ class AgentManager:
             server_switch = _get_server_stream_switches(cfg, server_id)
             if not server_switch['enabled']:
                 return False
-            if not server_switch['can_push']:
+            
+            # Non-on-demand (Always-On) servers ALWAYS publish if enabled.
+            if not server_switch['on_demand']:
+                return True
+                
+            # On-demand servers must be in their 'active' state.
+            if not server_switch['active']:
                 return False
+            
+            # If a specific mountpoint is selected (steered), we only publish
+            # from on-demand servers that match that mountpoint.
             if not selected_mountpoint:
                 return True
 
