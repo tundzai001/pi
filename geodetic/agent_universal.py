@@ -1,6 +1,8 @@
 #agent_universal.py
+AGENT_VERSION = "V1.1.0"
 
 import asyncio
+import gc
 import base64
 import json
 import logging
@@ -70,7 +72,7 @@ else:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- CONNECTION CONFIGURATION ---
-BACKEND_HOST = "aitogy.click"
+BACKEND_HOST = os.getenv("BACKEND_HOST", "aitogy.click")
 MQTT_BROKER = "45.117.179.134"
 MQTT_PORT = 1883
 # === THÊM 2 DÒNG NÀY ===
@@ -230,17 +232,8 @@ def _resolve_preferred_server_for_mountpoint(cfg: dict, mountpoint: str | None) 
 
     if not candidates:
         return None
-    if len(candidates) == 1:
-        return candidates[0]
-
-    preferred_hosts = ('aitogy.com.vn',)
-    for marker in preferred_hosts:
-        for sid in candidates:
-            host = str(cfg.get(f'serverhost{sid}', '') or '').strip().lower()
-            if host and marker in host:
-                return sid
-
     return sorted(candidates)[0]
+
 # Internal RTCM ingress bitrate tracker (independent from NTRIP socket forwarding)
 rtcm_input_stats_lock = threading.Lock()
 rtcm_input_window_bytes = 0
@@ -1593,6 +1586,18 @@ class NTRIPServerWorker(threading.Thread):
                     self.connection_status[f'server{self.server_id}'] = False
                 time.sleep(2)
                 continue
+                
+            server_switches = _get_server_stream_switches(self.config, self.server_id)
+            if not server_switches['can_push']:
+                with self.stats_lock:
+                    self.connection_status[f'server{self.server_id}'] = False
+                try:
+                    while True:
+                        self.queue.get_nowait()
+                except Empty:
+                    pass
+                time.sleep(1)
+                continue
             
             client_socket = None
             try:
@@ -1651,21 +1656,14 @@ class NTRIPServerWorker(threading.Thread):
                         server_switches = _get_server_stream_switches(self.config, self.server_id)
                         if not server_switches['can_push']:
                             if not standby_logged:
-                                self.log("INFO", f"S{self.server_id}: RTCM stream inactive for this server, holding push in standby.")
+                                self.log("INFO", f"S{self.server_id}: RTCM stream inactive for this server, disconnecting to enter standby.")
                                 standby_logged = True
-
+                            
                             with self.stats_lock:
                                 self.stats[f'server{self.server_id}_bps'] = 0
-
-                            # Drop queued stale RTCM packets accumulated before deactivation.
-                            try:
-                                while True:
-                                    self.queue.get_nowait()
-                            except Empty:
-                                pass
-
-                            time.sleep(0.2)
-                            continue
+                                self.connection_status[f'server{self.server_id}'] = False
+                                
+                            break  # Break inner loop to close socket and drop to outer standby gate
 
                         standby_logged = False
                         data_chunk = self.queue.get(timeout=1.0)
@@ -2443,11 +2441,21 @@ class AgentManager:
     def _force_rtcm_standby_on_startup(self):
         global rtcm_stream_active_flag
         services = self.config.setdefault('services', {})
-        services['stream_on_demand'] = True
-        services['stream_active'] = False
-        services.pop('active_mountpoint', None)
-        self.rtcm_stream_active = False
-        rtcm_stream_active_flag = False
+        
+        global_on_demand = _to_bool(services.get('stream_on_demand', False), False)
+        
+        if global_on_demand:
+            services['stream_active'] = False
+            services.pop('active_mountpoint', None)
+            
+        for sid in (1, 2):
+            if _to_bool(services.get(f'server{sid}_stream_on_demand', global_on_demand), global_on_demand):
+                services[f'server{sid}_stream_active'] = False
+            else:
+                services[f'server{sid}_stream_active'] = True
+                
+        self.rtcm_stream_active = _compute_any_server_can_push(services)
+        rtcm_stream_active_flag = self.rtcm_stream_active
         self.save_config()
     
     def load_config(self):
@@ -2522,127 +2530,107 @@ class AgentManager:
         cleaned = str(value).strip()
         return cleaned.lower() if cleaned else None
 
-    def set_rtcm_stream_active(self, active: bool, mountpoint: str = None, server_id: int = None):
+    def set_rtcm_stream_active(self, active: bool, mountpoint: str = None, server_id: int = None, address: str = None):
         global rtcm_stream_active_flag
         services = self.config.setdefault('services', {})
         should_restart = False
 
-        def _maybe_remap_to_comvn(target_sid: int | None, mp_value: str | None) -> int | None:
-            if target_sid not in (1, 2):
-                return target_sid
-            target_mp = self._normalize_mountpoint(mp_value)
-            if not target_mp:
-                return target_sid
-
-            target_host = str(services.get(f'server{target_sid}_host', services.get(f'serverhost{target_sid}', '')) or '').strip().lower()
-            if 'aitogy.com.vn' in target_host:
-                return target_sid
-
+        if address and not server_id:
+            # Match server by address/host
+            normalized_addr = str(address).strip().lower()
             for sid in (1, 2):
-                sid_mp = self._normalize_mountpoint(services.get(f'mountpoint{sid}'))
                 sid_host = str(services.get(f'server{sid}_host', services.get(f'serverhost{sid}', '')) or '').strip().lower()
-                if sid != target_sid and sid_mp == target_mp and 'aitogy.com.vn' in sid_host:
-                    logging.info(
-                        f"[RTCM ROUTE] Remap server {target_sid} -> {sid} for mountpoint '{target_mp}' "
-                        f"to prefer aitogy.com.vn"
-                    )
-                    return sid
-            return target_sid
+                if normalized_addr in sid_host or sid_host in normalized_addr:
+                    server_id = sid
+                    logging.info(f"[STREAM CONTROL] Matched address '{address}' to server {sid} (host: {sid_host})")
+                    break
 
         if server_id in (1, 2):
-            server_id = _maybe_remap_to_comvn(server_id, mountpoint)
             prev_switch = _get_server_stream_switches(services, server_id)
             prev_mountpoint = self._normalize_mountpoint(services.get('active_mountpoint'))
 
-            services['stream_on_demand'] = True
-            services[f'server{server_id}_stream_on_demand'] = True
-            services[f'server{server_id}_stream_active'] = bool(active)
-
-            # Optional selector for dashboards still using mountpoint targeting.
-            if mountpoint and bool(active):
-                services['active_mountpoint'] = str(mountpoint)
-            elif not bool(active) and prev_mountpoint == self._normalize_mountpoint(services.get(f'mountpoint{server_id}')):
-                services.pop('active_mountpoint', None)
-
-            new_switch = _get_server_stream_switches(services, server_id)
-            new_mountpoint = self._normalize_mountpoint(services.get('active_mountpoint'))
-            should_restart = (prev_switch['can_push'] != new_switch['can_push']) or (prev_mountpoint != new_mountpoint)
-            if not bool(active):
-                # Keep other server streams stable; worker loop can enter standby without full restart.
+            if not bool(active) and not prev_switch['on_demand']:
+                logging.info(f"[STREAM CONTROL] Ignoring sleep command for explicit server {server_id} because it is in Always-On mode.")
                 should_restart = False
+            else:
+                services[f'server{server_id}_stream_active'] = bool(active)
+    
+                # Optional selector for dashboards still using mountpoint targeting.
+                if mountpoint and bool(active):
+                    services['active_mountpoint'] = str(mountpoint)
+                elif not bool(active) and prev_mountpoint == self._normalize_mountpoint(services.get(f'mountpoint{server_id}')):
+                    services.pop('active_mountpoint', None)
+    
+                new_switch = _get_server_stream_switches(services, server_id)
+                new_mountpoint = self._normalize_mountpoint(services.get('active_mountpoint'))
+                should_restart = (prev_switch['can_push'] != new_switch['can_push']) or (prev_mountpoint != new_mountpoint)
         else:
             prev_active = bool(services.get('stream_active', False))
             prev_mountpoint = self._normalize_mountpoint(services.get('active_mountpoint'))
             prev_any_can_push = _compute_any_server_can_push(services)
             target_mp = self._normalize_mountpoint(mountpoint)
-
-            target_server_id = None
-            if target_mp:
-                target_server_id = _resolve_preferred_server_for_mountpoint(services, target_mp)
-                target_server_id = _maybe_remap_to_comvn(target_server_id, target_mp)
-
-            # For deactivate commands without explicit target, prefer current active mountpoint.
-            if target_server_id is None and not bool(active):
-                active_mp = self._normalize_mountpoint(services.get('active_mountpoint'))
-                if active_mp:
-                    target_server_id = _resolve_preferred_server_for_mountpoint(services, active_mp)
-                    target_server_id = _maybe_remap_to_comvn(target_server_id, active_mp)
-
-            # If still unknown on deactivate, affect only enabled on-demand servers and keep always-on servers untouched.
-            if target_server_id is None and not bool(active):
-                on_demand_servers = []
-                for sid in (1, 2):
-                    sw = _get_server_stream_switches(services, sid)
-                    if sw['enabled'] and sw['on_demand']:
-                        on_demand_servers.append(sid)
-
-                if len(on_demand_servers) == 1:
-                    target_server_id = on_demand_servers[0]
-                elif len(on_demand_servers) > 1:
-                    for sid in on_demand_servers:
-                        services[f'server{sid}_stream_on_demand'] = True
-                        services[f'server{sid}_stream_active'] = False
-                    services.pop('active_mountpoint', None)
-
-                    new_mountpoint = self._normalize_mountpoint(services.get('active_mountpoint'))
-                    should_restart = (prev_any_can_push != _compute_any_server_can_push(services)) or (prev_mountpoint != new_mountpoint)
-
-            # Backward-compatible behavior: if mountpoint maps to a known server,
-            # apply active/sleep directly to that specific server.
-            if target_server_id in (1, 2):
-                prev_switch = _get_server_stream_switches(services, target_server_id)
-                services[f'server{target_server_id}_stream_on_demand'] = True
-                services[f'server{target_server_id}_stream_active'] = bool(active)
-
-                if mountpoint and bool(active):
-                    services['active_mountpoint'] = str(mountpoint)
-                elif not bool(active) and prev_mountpoint == self._normalize_mountpoint(services.get(f'mountpoint{target_server_id}')):
-                    services.pop('active_mountpoint', None)
-
-                new_switch = _get_server_stream_switches(services, target_server_id)
-                new_mountpoint = self._normalize_mountpoint(services.get('active_mountpoint'))
-                should_restart = (prev_switch['can_push'] != new_switch['can_push']) or (prev_mountpoint != new_mountpoint)
+            
+            # Identify which servers to apply the command to
+            target_sids = []
+            if server_id is not None:
+                if server_id in (1, 2):
+                    target_sids = [server_id]
+            else:
                 if not bool(active):
-                    # Avoid bouncing unaffected server workers during sleep transition.
-                    should_restart = False
-            elif not should_restart:
-                services['stream_on_demand'] = True
-                services['stream_active'] = bool(active)
+                    # Shut down ALL on-demand servers matching the target mountpoint
+                    # or ALL on-demand servers if no mountpoint provided.
+                    match_mp = target_mp or self._normalize_mountpoint(services.get('active_mountpoint'))
+                    for sid in (1, 2):
+                        sw = _get_server_stream_switches(services, sid)
+                        sid_mp = self._normalize_mountpoint(services.get(f'mountpoint{sid}'))
+                        if sw['enabled'] and sw['on_demand']:
+                            if match_mp is None or sid_mp == match_mp:
+                                target_sids.append(sid)
+                else:
+                    # Activate specific mountpoint -> resolve to the preferred server
+                    if target_mp:
+                        sid = _resolve_preferred_server_for_mountpoint(services, target_mp)
+                        if sid: target_sids.append(sid)
 
-                # Optional mountpoint selector from backend control plane.
-                if mountpoint and bool(active):
-                    services['active_mountpoint'] = str(mountpoint)
-                elif not bool(active):
-                    services.pop('active_mountpoint', None)
-
+            if target_sids:
+                for sid in target_sids:
+                    prev_sw = _get_server_stream_switches(services, sid)
+                    if not bool(active) and not prev_sw['on_demand']:
+                        logging.info(f"[STREAM CONTROL] Ignoring sleep command for server {sid} because it is Always-On.")
+                        continue
+                    
+                    services[f'server{sid}_stream_active'] = bool(active)
+                    
+                    if mountpoint and bool(active):
+                        services['active_mountpoint'] = str(mountpoint)
+                    elif not bool(active) and prev_mountpoint == self._normalize_mountpoint(services.get(f'mountpoint{sid}')):
+                        services.pop('active_mountpoint', None)
+                        
                 new_mountpoint = self._normalize_mountpoint(services.get('active_mountpoint'))
-                should_restart = (prev_active != bool(active)) or (prev_mountpoint != new_mountpoint)
+                should_restart = (prev_any_can_push != _compute_any_server_can_push(services)) or (prev_mountpoint != new_mountpoint)
+            else:
+                if not should_restart:
+                    global_on_demand = _to_bool(services.get('stream_on_demand', False), False)
+                    if not bool(active) and not global_on_demand:
+                        logging.info("[STREAM CONTROL] Ignoring global sleep command because agent is in Always-On mode.")
+                    else:
+                        services['stream_active'] = bool(active)
+                        if mountpoint and bool(active):
+                            services['active_mountpoint'] = str(mountpoint)
+                        elif not bool(active):
+                            services.pop('active_mountpoint', None)
+                        
+                        new_mountpoint = self._normalize_mountpoint(services.get('active_mountpoint'))
+                        should_restart = (prev_active != bool(active)) or (prev_mountpoint != new_mountpoint)
 
         self.rtcm_stream_active = _compute_any_server_can_push(services)
         rtcm_stream_active_flag = self.rtcm_stream_active  # Update global dispatch gate
         self.save_config()
         if should_restart:
+            logging.info(f"[STREAM CONTROL] Restarting services to apply new configuration (active={self.rtcm_stream_active})")
             self.restart_services()
+        else:
+            logging.debug("[STREAM CONTROL] Service state unchanged. Skipping restart.")
     
     def get_base_config(self):
         return self.config.get('base_config', {})
@@ -2680,6 +2668,7 @@ class AgentManager:
             "serial": self.serial_number,
             "name": self.config.get('device_name'),
             "status": final_status, 
+            "version": AGENT_VERSION,
             "timestamp": int(time.time()),
             "rtk_fix_status": getattr(self, 'last_gga_fix_status', globals().get('LAST_GGA_FIX_STATUS', 'NO_FIX')),
             "base_mode_active": bool(self.get_base_config()),
@@ -3136,6 +3125,7 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
         elif command == "SET_RTCM_STREAM_ACTIVE":
             active = bool(payload.get("active", False))
             mountpoint = payload.get("mountpoint")
+            address = payload.get("address") or payload.get("ip") or payload.get("host")
             raw_server_id = payload.get("server_id", payload.get("server"))
             server_id = None
             try:
@@ -3146,12 +3136,14 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
             except (TypeError, ValueError):
                 server_id = None
 
-            agent.set_rtcm_stream_active(active, mountpoint=mountpoint, server_id=server_id)
+            agent.set_rtcm_stream_active(active, mountpoint=mountpoint, server_id=server_id, address=address)
             rtcm_stream_active_flag = bool(agent.rtcm_stream_active)  # Update global dispatch gate immediately
 
             if active:
                 if server_id:
                     logging.info(f"[RTCM] Stream activated for server {server_id} by control plane")
+                elif address:
+                    logging.info(f"[RTCM] Stream activated for address '{address}' by control plane")
                 elif mountpoint:
                     logging.info(f"[RTCM] Stream activated for mountpoint '{mountpoint}' by control plane")
                 else:
@@ -3278,7 +3270,7 @@ def setup_mqtt_client(loop: asyncio.AbstractEventLoop, agent: AgentManager, gnss
     })
     client.will_set(f"pi/devices/{MACHINE_SERIAL}/status", payload=last_will, qos=1, retain=True)
     
-    client.connect_async(MQTT_BROKER, MQTT_PORT, 60)
+    client.connect_async(MQTT_BROKER, MQTT_PORT, 30)
     client.loop_start()
     return client
 
@@ -3325,6 +3317,29 @@ async def websocket_task(agent: AgentManager, gnss_reader: GNSSReader, mqtt_clie
                 await asyncio.sleep(10)
             except asyncio.CancelledError:
                 raise
+
+async def memory_guard_task():
+    """Background task to periodically clean up and monitor RAM usage."""
+    logging.info("[MEM GUARD] Memory guard task started (Interval: 30m)")
+    while True:
+        try:
+            # 1. Force Python garbage collection
+            collected = gc.collect()
+            
+            # 2. Check current RAM usage
+            process = psutil.Process(os.getpid())
+            ram_mb = process.memory_info().rss / (1024 * 1024)
+            
+            if ram_mb > 200:
+                logging.warning(f"[MEM GUARD] High RAM usage detected: {ram_mb:.2f} MB. GC collected {collected} objects.")
+            else:
+                logging.info(f"[MEM GUARD] Current RAM usage: {ram_mb:.2f} MB. GC collected {collected} objects.")
+                
+        except Exception as e:
+            logging.error(f"[MEM GUARD] Error during cleanup: {e}")
+            
+        await asyncio.sleep(1800) # Every 30 minutes
+
 
 async def status_publisher_task(agent: AgentManager, mqtt_client: mqtt.Client):
     try:
@@ -3948,9 +3963,10 @@ async def main():
     status_task = asyncio.create_task(status_publisher_task(agent, mqtt_client))
     ws_task = asyncio.create_task(websocket_task(agent, gnss_reader, mqtt_client))
     auto_base_task = asyncio.create_task(auto_base_state_machine(agent, gnss_reader, mqtt_client))
+    mem_guard_task = asyncio.create_task(memory_guard_task())
     
     try:
-        await asyncio.gather(status_task, ws_task, auto_base_task)
+        await asyncio.gather(status_task, ws_task, auto_base_task, mem_guard_task)
     except asyncio.CancelledError:
         logging.info("Tasks cancelled - shutting down gracefully")
     finally:
@@ -3978,6 +3994,19 @@ async def main():
         
         # Stop MQTT
         if mqtt_client:
+            try:
+                # Explicitly publish offline status before disconnecting
+                offline_msg = json.dumps({
+                    "serial": MACHINE_SERIAL,
+                    "status": "offline",
+                    "timestamp": int(time.time()),
+                    "cleanup": True
+                })
+                mqtt_client.publish(f"pi/devices/{MACHINE_SERIAL}/status", offline_msg, qos=1, retain=True)
+                time.sleep(0.5) # Give it a moment to send
+            except Exception as e:
+                logging.error(f"Failed to send final offline status: {e}")
+
             mqtt_client.loop_stop()
             mqtt_client.disconnect()
         
