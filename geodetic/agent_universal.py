@@ -3412,6 +3412,11 @@ async def _apply_base_mode_to_chip(chip_type: str, port: str, lat: float, lon: f
         gnss_reader.pause()
         await asyncio.sleep(1.0)
 
+    # Ensure coordinates are floats for mathematical operations
+    lat = float(lat)
+    lon = float(lon)
+    alt = float(alt)
+
     try:
         with serial_port_lock, serial.Serial(port, DEFAULT_BAUDRATE, timeout=2) as ser:
             if chip_type == "Ublox":
@@ -3422,11 +3427,11 @@ async def _apply_base_mode_to_chip(chip_type: str, port: str, lat: float, lon: f
 
                 multiplier = 10000000
                 ecef_x_or_lat = int(lat * multiplier).to_bytes(4, byteorder='little', signed=True)
-                ecef_x_or_lat_hp = int((lat * multiplier - int(lat * multiplier)) * 100).to_bytes(1, byteorder='little', signed=True)
+                ecef_x_or_lat_hp = int(round((lat * multiplier - int(lat * multiplier)) * 100)).to_bytes(1, byteorder='little', signed=True)
                 ecef_y_or_lon = int(lon * multiplier).to_bytes(4, byteorder='little', signed=True)
-                ecef_y_or_lon_hp = int((lon * multiplier - int(lon * multiplier)) * 100).to_bytes(1, byteorder='little', signed=True)
+                ecef_y_or_lon_hp = int(round((lon * multiplier - int(lon * multiplier)) * 100)).to_bytes(1, byteorder='little', signed=True)
                 ecef_z_or_alt = int(alt * 100).to_bytes(4, byteorder='little', signed=True)
-                ecef_z_or_alt_hp = int((alt * 100 - int(alt * 100)) * 100).to_bytes(1, byteorder='little', signed=True)
+                ecef_z_or_alt_hp = int(round((alt * 100 - int(alt * 100)) * 100)).to_bytes(1, byteorder='little', signed=True)
                 fixed_pos_acc = int(accuracy * 10000).to_bytes(4, byteorder='little', signed=False)
 
                 for i in range(4):
@@ -3450,7 +3455,8 @@ async def _apply_base_mode_to_chip(chip_type: str, port: str, lat: float, lon: f
                 ser.write(b'\xb5\x62\x06\x09\x0d\x00\x00\x00\x00\x00\xff\xff\x00\x00\x00\x00\x00\x00\x03\x1d\xab')
                 ser.flush()
             elif chip_type in ("Unicorecomm", "RTCM3_Source"):
-                base_cmd = f"MODE BASE {lat:.8f} {lon:.8f} {alt:.3f}\r\n".encode("ascii")
+                # Use higher precision for command string to avoid rounding
+                base_cmd = f"MODE BASE {lat:.10f} {lon:.10f} {alt:.3f}\r\n".encode("ascii")
                 ser.write(base_cmd)
                 ser.flush()
                 await asyncio.sleep(0.5)
