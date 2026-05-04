@@ -1,5 +1,5 @@
 #agent_universal.py
-AGENT_VERSION = "V1.1.0"
+AGENT_VERSION = "V1.1.1"
 
 import asyncio
 import gc
@@ -59,11 +59,24 @@ REMOTE_LOCK_PATH = os.path.join(BASE_DIR, "remote.lock")
 
 # --- LOGGING CONFIGURATION ---
 if IS_WINDOWS:
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
     LOG_FILE_PATH = os.path.join(BASE_DIR, "agent.log")
     log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     file_handler = RotatingFileHandler(LOG_FILE_PATH, maxBytes=5*1024*1024, backupCount=3, encoding='utf-8')
     file_handler.setFormatter(log_formatter)
-    console_handler = logging.StreamHandler(sys.stdout)
+    
+    class SafeStreamHandler(logging.StreamHandler):
+        def emit(self, record):
+            try:
+                super().emit(record)
+            except UnicodeEncodeError:
+                record.msg = str(record.msg).encode('utf-8', 'replace').decode('ascii', 'replace')
+                super().emit(record)
+                
+    console_handler = SafeStreamHandler(sys.stdout)
     console_handler.setFormatter(log_formatter)
     if logging.root.hasHandlers():
         logging.root.handlers.clear()
@@ -2460,20 +2473,47 @@ class AgentManager:
     
     def load_config(self):
         try:
-            with open(CONFIG_PATH, 'r') as f:
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
                 self.config = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            platform_prefix = "PC" if IS_WINDOWS else "Pi"
-            self.config = {
-                "device_name": f"{platform_prefix}-{self.serial_number[-6:]}",
-                "is_provisioned": False,
-                "services": {}
-            }
+            return
+        except Exception as e:
+            self.log("WARNING", f"Failed to load primary config ({e}), trying backup...")
+            
+        bak_path = CONFIG_PATH + '.bak'
+        try:
+            with open(bak_path, 'r', encoding='utf-8') as f:
+                self.config = json.load(f)
+            self.log("INFO", "Successfully recovered config from backup")
             self.save_config()
+            return
+        except Exception as e:
+            self.log("WARNING", f"Backup config also failed or missing ({e}). Resetting to default.")
+            
+        platform_prefix = "PC" if IS_WINDOWS else "Pi"
+        self.config = {
+            "device_name": f"{platform_prefix}-{self.serial_number[-6:]}",
+            "is_provisioned": False,
+            "services": {}
+        }
+        self.save_config()
     
     def save_config(self):
-        with open(CONFIG_PATH, 'w') as f:
-            json.dump(self.config, f, indent=4)
+        tmp_path = CONFIG_PATH + '.tmp'
+        bak_path = CONFIG_PATH + '.bak'
+        try:
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(self.config, f, indent=4, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            if os.path.exists(CONFIG_PATH):
+                import shutil
+                try:
+                    shutil.copy2(CONFIG_PATH, bak_path)
+                except Exception:
+                    pass
+            os.replace(tmp_path, CONFIG_PATH)
+        except Exception as e:
+            self.log("ERROR", f"Critical error saving config: {e}")
     
     def update_name(self, name: str):
         if name:
