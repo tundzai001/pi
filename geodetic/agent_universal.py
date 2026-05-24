@@ -1,5 +1,5 @@
 #agent_universal.py
-AGENT_VERSION = "V1.1.1"
+AGENT_VERSION = "V1.1.2"
 
 import asyncio
 import gc
@@ -85,29 +85,65 @@ else:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- CONNECTION CONFIGURATION ---
-BACKEND_HOST = os.getenv("BACKEND_HOST", "aitogy.click")
-MQTT_BROKER = "45.117.179.134"
-MQTT_PORT = 1883
-# === THÊM 2 DÒNG NÀY ===
-MQTT_USERNAME = os.getenv("MQTT_USERNAME", "mqttUser")
-MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "MqttPassword123$%^")
+DEFAULT_BACKEND_HOST = "aitogy.click"
+DEFAULT_MQTT_BROKER = "45.117.179.134"
+DEFAULT_MQTT_PORT = 1883
+DEFAULT_MQTT_USERNAME = "mqttUser"
+DEFAULT_MQTT_PASSWORD = "MqttPassword123$%^"
+
+BACKEND_HOST = DEFAULT_BACKEND_HOST
+MQTT_BROKER = DEFAULT_MQTT_BROKER
+MQTT_PORT = DEFAULT_MQTT_PORT
+MQTT_USERNAME = DEFAULT_MQTT_USERNAME
+MQTT_PASSWORD = DEFAULT_MQTT_PASSWORD
 DEFAULT_BAUDRATE = 115200 if IS_RASPBERRY_PI else 460800
-STATUS_PUBLISH_INTERVAL_SECONDS = int(os.getenv("STATUS_PUBLISH_INTERVAL_SECONDS", "5"))
-NMEA_IDLE_PUBLISH_INTERVAL_SECONDS = float(os.getenv("NMEA_IDLE_PUBLISH_INTERVAL_SECONDS", "1.0"))
+STATUS_PUBLISH_INTERVAL_SECONDS = 5
+NMEA_IDLE_PUBLISH_INTERVAL_SECONDS = 1.0
+NMEA_MQTT_PUBLISH_INTERVAL_SECONDS = 1.0
+SYSTEM_INFO_INTERVAL_SECONDS = 30
 # Force-enable parser debug in code (no environment variable required).
 PARSER_DEBUG_ENABLED = False
 PARSER_DEBUG_INTERVAL_SECONDS = 2.0
 
 # --- GLOBAL VARIABLES ---
+AGENT_START_TS = time.time()
 MACHINE_SERIAL = ""
 rtcm_subscribers = []
 nmea_subscribers = []
 subscriber_lock = threading.Lock()
 serial_port_lock = threading.Lock()
+telemetry_lock = threading.Lock()
 current_state = "INITIALIZING"
 active_websocket_connection = None
 is_remotely_locked = False 
 initialization_complete = asyncio.Event()
+last_command_result = {}
+transport_status = {
+    "mqtt_connected": False,
+    "websocket_connected": False,
+    "active_channel": None,
+    "mqtt_broker": MQTT_BROKER,
+    "websocket_host": BACKEND_HOST,
+    "last_mqtt_connect_ts": 0,
+    "last_mqtt_disconnect_ts": 0,
+    "last_websocket_connect_ts": 0,
+    "last_websocket_disconnect_ts": 0,
+}
+reconnect_counters = {
+    "mqtt": 0,
+    "websocket": 0,
+    "serial": 0,
+    "ntrip_server1": 0,
+    "ntrip_server2": 0,
+    "ntrip_client": 0,
+}
+queue_metrics = {
+    "rtcm_dispatch_drops": 0,
+    "nmea_dispatch_drops": 0,
+    "rtcm_inject_drops": 0,
+}
+system_info_cache_lock = threading.Lock()
+system_info_cache = {"timestamp": 0.0, "payload": {}}
 # Last parsed GGA fix status (updated by NMEA dispatcher)
 LAST_GGA_FIX_STATUS = "NO_FIX"
 LAST_GGA_COORD = None
@@ -118,6 +154,173 @@ LAST_HPPOSLLH_COORD = None
 LAST_HPPOSLLH_TS = 0.0
 LAST_UBX_NUMSV = None
 LAST_UBX_NUMSV_TS = 0.0
+LAST_UBX_HACC_MM = None
+LAST_UBX_HACC_TS = 0.0
+LAST_NMEA_TYPE_COUNTS = {}
+LAST_GST_HACC_M = None
+LAST_GST_SEMI_MAJOR_M = None
+LAST_GST_SEMI_MINOR_M = None
+LAST_GST_TS = 0.0
+LAST_GSV_AVG_SNR = None
+LAST_GSV_SNR_SAMPLES = 0
+LAST_GSV_TS = 0.0
+
+
+def _runtime_serial_baud(agent=None, gnss_reader=None) -> int:
+    """Use the detected GNSS baud for command writes; DEFAULT_BAUDRATE is only a fallback."""
+    candidates = [
+        getattr(gnss_reader, "baudrate", None),
+        (getattr(agent, "detected_chip", {}) or {}).get("baud") if agent else None,
+        DEFAULT_BAUDRATE,
+    ]
+    for value in candidates:
+        try:
+            baud = int(value)
+            if baud > 0:
+                return baud
+        except (TypeError, ValueError):
+            continue
+    return DEFAULT_BAUDRATE
+
+
+def _delay_marker_seconds(command_bytes: bytes) -> float | None:
+    if not command_bytes.startswith(b"$DELAY_") or not command_bytes.endswith(b"$"):
+        return None
+    try:
+        return max(0.0, min(10.0, int(command_bytes[7:-1]) / 1000.0))
+    except ValueError:
+        return None
+
+
+def _update_local_nmea_health(sentence: str) -> None:
+    if not sentence or not sentence.startswith("$") or len(sentence) < 6:
+        return
+    try:
+        head = sentence.split(",", 1)[0]
+        nmea_type = head[-3:]
+        counts = globals().setdefault("LAST_NMEA_TYPE_COUNTS", {})
+        counts[nmea_type] = int(counts.get(nmea_type, 0)) + 1
+        if len(counts) > 16:
+            for key in list(counts.keys())[:-16]:
+                counts.pop(key, None)
+
+        parts = sentence.split("*", 1)[0].split(",")
+        if nmea_type == "GST" and len(parts) > 7:
+            semi_major = float(parts[3]) if len(parts) > 3 and parts[3] else None
+            semi_minor = float(parts[4]) if len(parts) > 4 and parts[4] else None
+            globals()["LAST_GST_SEMI_MAJOR_M"] = semi_major
+            globals()["LAST_GST_SEMI_MINOR_M"] = semi_minor
+            lat_sigma = float(parts[6]) if parts[6] else None
+            lon_sigma = float(parts[7]) if parts[7] else None
+            hacc = None
+            hacc_source = None
+            if lat_sigma is not None and lon_sigma is not None:
+                hacc = (lat_sigma ** 2 + lon_sigma ** 2) ** 0.5
+                hacc_source = "gst_lat_lon_sigma"
+            if hacc is not None and hacc > 0:
+                globals()["LAST_GST_HACC_M"] = hacc
+                globals()["LAST_GST_HACC_SOURCE"] = hacc_source
+            globals()["LAST_GST_TS"] = time.time()
+        elif nmea_type == "GSV" and len(parts) > 7:
+            snrs = []
+            fields = parts[4:]
+            for i in range(0, len(fields), 4):
+                if len(fields[i:i + 4]) < 4:
+                    continue
+                try:
+                    snr = int(fields[i + 3]) if fields[i + 3] else 0
+                except ValueError:
+                    snr = 0
+                if snr > 0:
+                    snrs.append(snr)
+            if snrs:
+                globals()["LAST_GSV_AVG_SNR"] = sum(snrs) / len(snrs)
+                globals()["LAST_GSV_SNR_SAMPLES"] = len(snrs)
+                globals()["LAST_GSV_TS"] = time.time()
+    except Exception:
+        return
+
+
+def _telemetry_inc(section: str, key: str, amount: int = 1) -> None:
+    target = reconnect_counters if section == "reconnect" else queue_metrics
+    with telemetry_lock:
+        target[key] = int(target.get(key, 0)) + int(amount)
+
+
+def _set_transport_state(channel: str, connected: bool) -> None:
+    now_ts = int(time.time())
+    with telemetry_lock:
+        if channel == "mqtt":
+            transport_status["mqtt_connected"] = bool(connected)
+            transport_status["last_mqtt_connect_ts" if connected else "last_mqtt_disconnect_ts"] = now_ts
+        elif channel == "websocket":
+            transport_status["websocket_connected"] = bool(connected)
+            transport_status["last_websocket_connect_ts" if connected else "last_websocket_disconnect_ts"] = now_ts
+
+        if transport_status.get("websocket_connected"):
+            transport_status["active_channel"] = "websocket"
+        elif transport_status.get("mqtt_connected"):
+            transport_status["active_channel"] = "mqtt"
+        else:
+            transport_status["active_channel"] = None
+
+
+def _record_command_result(command: str, source: str, status: str, detail: str = "", command_id: str = None) -> None:
+    with telemetry_lock:
+        last_command_result.clear()
+        last_command_result.update({
+            "command": command or "UNKNOWN",
+            "source": source,
+            "status": status,
+            "detail": str(detail or "")[:300],
+            "command_id": command_id,
+            "timestamp": int(time.time()),
+        })
+
+
+def _snapshot_agent_telemetry() -> dict:
+    with telemetry_lock:
+        return {
+            "transport_status": dict(transport_status),
+            "last_command_result": dict(last_command_result),
+            "reconnect_counters": dict(reconnect_counters),
+            "queue_metrics": dict(queue_metrics),
+        }
+
+
+def _get_mqtt_runtime_config(agent=None) -> dict:
+    cfg = {}
+    if agent is not None and isinstance(getattr(agent, "config", None), dict):
+        cfg = agent.config.get("mqtt") or agent.config.get("mqtt_config") or {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+
+    broker = (
+        cfg.get("broker")
+        or cfg.get("host")
+        or MQTT_BROKER
+    )
+    port = cfg.get("port") or MQTT_PORT
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        port = 1883
+
+    return {
+        "broker": str(broker or BACKEND_HOST).strip(),
+        "port": port,
+        "username": cfg.get("username") or cfg.get("user") or DEFAULT_MQTT_USERNAME,
+        "password": cfg.get("password") or cfg.get("pass") or DEFAULT_MQTT_PASSWORD,
+    }
+
+
+def _should_forward_nmea_to_backend(data: bytes) -> bool:
+    try:
+        text = data.decode("ascii", errors="ignore")
+    except Exception:
+        return False
+    return any(token in text[:12] for token in ("GGA", "GSA", "GSV", "GST"))
+
 
 @dataclass
 class EllipPara:
@@ -726,6 +929,22 @@ def get_system_info() -> dict:
     except Exception as e:
         logging.error(f"Error collecting system info: {e}")
         return {}
+
+
+def get_cached_system_info() -> dict:
+    now = time.time()
+    with system_info_cache_lock:
+        cached_ts = float(system_info_cache.get("timestamp") or 0.0)
+        cached_payload = system_info_cache.get("payload") or {}
+        if cached_payload and now - cached_ts < max(5, SYSTEM_INFO_INTERVAL_SECONDS):
+            return dict(cached_payload)
+
+    payload = get_system_info()
+    if payload:
+        with system_info_cache_lock:
+            system_info_cache["timestamp"] = now
+            system_info_cache["payload"] = payload
+    return payload
     
 def parse_gga_data(gga_sentence: str) -> tuple:
     """
@@ -860,6 +1079,8 @@ def _mark_gnss_data_stale():
     globals()['LAST_HPPOSLLH_TS'] = 0.0
     globals()['LAST_UBX_NUMSV'] = None
     globals()['LAST_UBX_NUMSV_TS'] = 0.0
+    globals()['LAST_UBX_HACC_MM'] = None
+    globals()['LAST_UBX_HACC_TS'] = 0.0
 
 def _crc24q(data: bytes) -> int:
     crc = 0
@@ -1431,6 +1652,7 @@ def dispatch_rtcm_data(data):
             try:
                 queue.put_nowait(data)
             except Full:
+                _telemetry_inc("queue", "rtcm_dispatch_drops")
                 # Drop 2 oldest packets and force insert
                 try:
                     queue.get_nowait()
@@ -1450,6 +1672,9 @@ def dispatch_nmea_data(data):
             s = data.decode('ascii', errors='ignore')
         elif isinstance(data, str):
             s = data
+
+        if s and '$G' in s:
+            _update_local_nmea_health(s.strip())
 
         if s and '$G' in s and 'GGA' in s[:10]:
             try:
@@ -1475,6 +1700,7 @@ def dispatch_nmea_data(data):
             try:
                 queue.put_nowait(data)
             except Full:
+                _telemetry_inc("queue", "nmea_dispatch_drops")
                 try:
                     queue.get_nowait()
                     queue.put_nowait(data)
@@ -1515,7 +1741,7 @@ class NMEAPublisher(threading.Thread):
                     continue
                 
                 data_chunk = self.queue.get(timeout=1.0)
-                if active_websocket_connection and self.loop and not self.loop.is_closed():
+                if active_websocket_connection and self.loop and not self.loop.is_closed() and _should_forward_nmea_to_backend(data_chunk):
                     try:
                         ws_message = {
                             "type": "nmea_update",
@@ -1531,8 +1757,11 @@ class NMEAPublisher(threading.Thread):
                 if self.mqtt_client and self.mqtt_client.is_connected():
                     try:
                         now = time.time()
-                        # When no live websocket consumer is attached, limit MQTT raw_data publish rate.
-                        if active_websocket_connection or (now - self.last_mqtt_publish_ts) >= NMEA_IDLE_PUBLISH_INTERVAL_SECONDS:
+                        # Keep parsed WebSocket data realtime, but throttle raw MQTT NMEA to reduce Pi CPU/network load.
+                        publish_interval = max(0.2, NMEA_MQTT_PUBLISH_INTERVAL_SECONDS)
+                        if not active_websocket_connection:
+                            publish_interval = max(publish_interval, NMEA_IDLE_PUBLISH_INTERVAL_SECONDS)
+                        if (now - self.last_mqtt_publish_ts) >= publish_interval:
                             self.mqtt_client.publish(topic, data_chunk, qos=0)
                             self.last_mqtt_publish_ts = now
                     except Exception as e:
@@ -1723,6 +1952,7 @@ class NTRIPServerWorker(threading.Thread):
                         self.last_stat_update = now
 
             except Exception as e:
+                _telemetry_inc("reconnect", f"ntrip_server{self.server_id}")
                 self.log("WARNING", f"S{self.server_id}: Connection error: {e}.")
                 with self.stats_lock:
                     self.stats[f'server{self.server_id}_bps'] = 0
@@ -1849,6 +2079,7 @@ class NTRIPClientWorker(threading.Thread):
                             self._last_rtcm_log_time = now_log
 
             except Exception as e:
+                _telemetry_inc("reconnect", "ntrip_client")
                 self.log("WARNING", f"[RTCM Client] Connection error: {e}.")
             finally:
                 if client_socket: client_socket.close()
@@ -1916,6 +2147,7 @@ class GNSSReader(threading.Thread):
         try:
             self.rtcm_inject_queue.put_nowait(data)
         except Full:
+            _telemetry_inc("queue", "rtcm_inject_drops")
             try:
                 self.rtcm_inject_queue.get_nowait()
                 self.rtcm_inject_queue.put_nowait(data)
@@ -2080,7 +2312,7 @@ class GNSSReader(threading.Thread):
                     except Exception:
                         pass
 
-                # UBX-NAV-PVT (class=0x01, id=0x07): numSV at payload offset 23.
+                # UBX-NAV-PVT (class=0x01, id=0x07): numSV at offset 23, hAcc at offset 40.
                 if ubx_class == 0x01 and ubx_id == 0x07 and payload_length >= 24:
                     try:
                         payload = packet[6:6 + payload_length]
@@ -2088,6 +2320,11 @@ class GNSSReader(threading.Thread):
                         if 0 <= num_sv <= 99:
                             globals()['LAST_UBX_NUMSV'] = num_sv
                             globals()['LAST_UBX_NUMSV_TS'] = time.time()
+                        if payload_length >= 44:
+                            hacc_mm = struct.unpack_from('<I', payload, 40)[0]
+                            if 0 <= hacc_mm <= 10000000:
+                                globals()['LAST_UBX_HACC_MM'] = int(hacc_mm)
+                                globals()['LAST_UBX_HACC_TS'] = time.time()
                     except Exception:
                         pass
                 
@@ -2145,7 +2382,7 @@ class GNSSReader(threading.Thread):
                 try:
                     sentence_str = sentence.decode('ascii', errors='ignore')
                     
-                    important_types = ['GGA', 'GSA', 'GSV']
+                    important_types = ['GGA', 'GSA', 'GSV', 'GST']
                     is_important = any(nmea_type in sentence_str[:10] for nmea_type in important_types)
                     
                     if is_important:
@@ -2392,6 +2629,7 @@ class GNSSReader(threading.Thread):
             
             # ==================== CONNECTION ERROR HANDLING ====================
             except (serial.SerialException, OSError, FileNotFoundError) as conn_error:
+                _telemetry_inc("reconnect", "serial")
                 error_count += 1
                 
                 # Exponential backoff (capped at 30 seconds)
@@ -2441,6 +2679,7 @@ class AgentManager:
         self.detected_chip = {"port": None, "type": "UNKNOWN"}
         self.service_workers = []
         self.nmea_publisher = None
+        self.gnss_reader = None
         self.service_stats = {}
         self.ntrip_connection_status = {} 
         self.stats_lock = threading.Lock()
@@ -2752,6 +2991,42 @@ class AgentManager:
             status["gnss_stats"] = self.gnss_reader.get_statistics()
             status["parser_debug"] = status["gnss_stats"].get("parser_debug", {})
 
+        now = time.time()
+        numsv = globals().get("LAST_UBX_NUMSV")
+        numsv_ts = float(globals().get("LAST_UBX_NUMSV_TS") or 0.0)
+        if numsv is not None and now - numsv_ts <= 15:
+            status["satellite_count"] = int(numsv)
+
+        hacc_mm = globals().get("LAST_UBX_HACC_MM")
+        hacc_ts = float(globals().get("LAST_UBX_HACC_TS") or 0.0)
+        if hacc_mm is not None and now - hacc_ts <= 15:
+            status["hacc"] = int(hacc_mm)
+
+        nmea_health = {
+            "type_counts": dict(globals().get("LAST_NMEA_TYPE_COUNTS") or {}),
+            "gsv_snr_samples": int(globals().get("LAST_GSV_SNR_SAMPLES") or 0),
+        }
+        gst_hacc = globals().get("LAST_GST_HACC_M")
+        gst_ts = float(globals().get("LAST_GST_TS") or 0.0)
+        if now - gst_ts <= 15:
+            semi_major = globals().get("LAST_GST_SEMI_MAJOR_M")
+            semi_minor = globals().get("LAST_GST_SEMI_MINOR_M")
+            if semi_major is not None:
+                nmea_health["gst_semi_major_sigma"] = float(semi_major)
+            if semi_minor is not None:
+                nmea_health["gst_semi_minor_sigma"] = float(semi_minor)
+            nmea_health["seconds_since_gst"] = round(now - gst_ts, 1)
+            if gst_hacc is not None:
+                nmea_health["hacc"] = float(gst_hacc)
+                nmea_health["hacc_source"] = globals().get("LAST_GST_HACC_SOURCE") or "gst_lat_lon_sigma"
+                status.setdefault("hacc", float(gst_hacc))
+        gsv_avg_snr = globals().get("LAST_GSV_AVG_SNR")
+        gsv_ts = float(globals().get("LAST_GSV_TS") or 0.0)
+        if gsv_avg_snr is not None and now - gsv_ts <= 15:
+            nmea_health["avg_snr"] = round(float(gsv_avg_snr), 1)
+            nmea_health["seconds_since_gsv"] = round(now - gsv_ts, 1)
+        status["nmea_health"] = nmea_health
+
         with self.stats_lock:
             if self.service_stats:
                 status["ntrip_stats"] = self.service_stats.copy()
@@ -2830,6 +3105,33 @@ class AgentManager:
             for key, bps in self.service_stats.items():
                 if 'bps' in key and bps > 0 and bps < 100:
                     status["warning"] = f"Low data rate detected on {key}: {bps} bps"
+
+        telemetry = _snapshot_agent_telemetry()
+        status.update(telemetry)
+
+        serial_health = {
+            "port": self.detected_chip.get("port"),
+            "baud": self.detected_chip.get("baud"),
+            "seconds_since_data": None,
+            "rtcm_inject_queue_depth": 0,
+            "service_queue_depths": {},
+        }
+        if hasattr(self, 'gnss_reader') and self.gnss_reader:
+            try:
+                stats = self.gnss_reader.get_statistics()
+                serial_health["seconds_since_data"] = stats.get("seconds_since_data")
+                serial_health["last_data_time"] = int(stats.get("last_data_time") or 0)
+                serial_health["buffer_overflows"] = stats.get("buffer_overflows", 0)
+                serial_health["parse_errors"] = stats.get("parse_errors", 0)
+                serial_health["rtcm_inject_queue_depth"] = self.gnss_reader.rtcm_inject_queue.qsize()
+            except Exception:
+                pass
+        for worker in list(self.service_workers):
+            try:
+                serial_health["service_queue_depths"][worker.name] = worker.queue.qsize()
+            except Exception:
+                pass
+        status["serial_health"] = serial_health
         
         return status
     
@@ -2906,7 +3208,7 @@ async def send_status(agent: AgentManager, mqtt_client: mqtt.Client):
     status_payload = agent.get_full_status()
     
     try:
-        system_info = get_system_info()
+        system_info = get_cached_system_info()
         if system_info:
             status_payload['system_info'] = system_info
             logging.debug(f"System info collected: CPU={system_info.get('cpu', {}).get('usage_percent')}%, Temp={system_info.get('temperature', {}).get('celsius')}°C")
@@ -2919,6 +3221,7 @@ async def send_status(agent: AgentManager, mqtt_client: mqtt.Client):
             ws_message = {"type": "status_update", "payload": status_payload}
             await active_websocket_connection.send(json.dumps(ws_message))
         except Exception as e:
+            _set_transport_state("websocket", False)
             logging.error(f"Failed to send status via WebSocket: {e}")
 
     # Gửi qua MQTT
@@ -2927,35 +3230,109 @@ async def send_status(agent: AgentManager, mqtt_client: mqtt.Client):
             topic = f"pi/devices/{MACHINE_SERIAL}/status"
             mqtt_client.publish(topic, json.dumps(status_payload), qos=1, retain=True)
         except Exception as e:
+            _set_transport_state("mqtt", False)
             logging.warning(f"MQTT publish failed: {e}")
 
 # ==============================================================================
 # === ASYNC FUNCTIONS - PROCESS COMMAND (UPDATED)                           ===
 # ==============================================================================
+def _validate_command_payload(command: str, payload: dict, data: dict, agent: AgentManager, gnss_reader: GNSSReader) -> tuple[bool, str]:
+    if not command:
+        return False, "missing command"
+    if payload is None:
+        payload = {}
+    if not isinstance(payload, dict):
+        return False, "payload must be an object"
+
+    if command == "PROVISION_DEVICE" and not str(payload.get("name") or "").strip():
+        return False, "missing payload.name"
+    if command == "DEPLOY_LICENSE" and not str(payload.get("license_key") or "").strip():
+        return False, "missing payload.license_key"
+    if command == "DEPLOY_SERVICE_CONFIG" and not payload:
+        return False, "missing service config payload"
+    if command == "SET_RTCM_STREAM_ACTIVE" and "active" not in payload:
+        return False, "missing payload.active"
+    if command == "APPLY_VN2000_PROVINCE" and not str(payload.get("province_code") or "").strip():
+        return False, "missing payload.province_code"
+    if command == "EXECUTE_RAW_COMMANDS":
+        commands_b64 = payload.get("commands_b64")
+        if not isinstance(commands_b64, list) or not commands_b64:
+            return False, "missing payload.commands_b64"
+        if len(commands_b64) > 200:
+            return False, "too many raw commands"
+        for item in commands_b64:
+            if not isinstance(item, str) or len(item) > 4096:
+                return False, "invalid raw command item"
+            try:
+                base64.b64decode(item, validate=True)
+            except Exception:
+                return False, "raw command is not valid base64"
+        if not agent.detected_chip.get("port"):
+            return False, "no detected serial port"
+
+    known_commands = {
+        "LOCK_DEVICE",
+        "UNLOCK_DEVICE",
+        "PROVISION_DEVICE",
+        "DEPLOY_LICENSE",
+        "TRIGGER_AUTO_BASE",
+        "STOP_AUTO_BASE",
+        "APPLY_VN2000_PROVINCE",
+        "EXECUTE_RAW_COMMANDS",
+        "DEPLOY_SERVICE_CONFIG",
+        "SET_RTCM_STREAM_ACTIVE",
+        "DELETE_DEVICE",
+        "CHECK_BASE_STATUS",
+    }
+    if command not in known_commands:
+        return False, f"unsupported command: {command}"
+    return True, ""
+
 async def process_command(source: str, data: dict, agent: AgentManager, gnss_reader: GNSSReader, mqtt_client: mqtt.Client):
     global current_state, rtcm_stream_active_flag, active_auto_base_task, active_auto_base_client
+    if not isinstance(data, dict):
+        _record_command_result("UNKNOWN", source, "rejected", "command envelope must be an object")
+        logging.warning("Rejected malformed command envelope from %s", source)
+        return
     command = data.get("command")
     payload = data.get("payload", {})
+    if payload is None:
+        payload = {}
+    command_id = data.get("command_id") or (payload.get("command_id") if isinstance(payload, dict) else None) or str(uuid.uuid4())
     logging.info(f"Received command '{command}' from {source.upper()}")
+
+    is_valid, validation_error = _validate_command_payload(command, payload, data, agent, gnss_reader)
+    if not is_valid:
+        _record_command_result(command, source, "rejected", validation_error, command_id)
+        logging.warning(f"Rejected command '{command}' from {source.upper()}: {validation_error}")
+        await send_status(agent, mqtt_client)
+        return
+    _record_command_result(command, source, "running", "", command_id)
     
     if command == "LOCK_DEVICE":
         if create_remote_lock():
             logging.warning("DEVICE LOCKED REMOTELY")
+            _record_command_result(command, source, "success", "device locked", command_id)
         else:
             logging.error("!!! Failed to create remote lock file.")
+            _record_command_result(command, source, "error", "failed to create remote lock", command_id)
         await send_status(agent, mqtt_client)
         return
     
     if command == "UNLOCK_DEVICE":
         if remove_remote_lock():
             logging.info(" DEVICE UNLOCKED")
+            _record_command_result(command, source, "success", "device unlocked", command_id)
         else:
             logging.error("!!! Failed to remove remote lock file.")
+            _record_command_result(command, source, "error", "failed to remove remote lock", command_id)
         await send_status(agent, mqtt_client)
         return
     
     if is_remote_locked():
         logging.warning(f"Command '{command}' REJECTED - Device is locked")
+        _record_command_result(command, source, "rejected", "device is locked", command_id)
+        await send_status(agent, mqtt_client)
         return
     
     previous_state = current_state
@@ -2971,6 +3348,8 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
     if is_long_running:
         if not create_lock_file():
             logging.warning(f"Rejected command '{command}', device is busy.")
+            _record_command_result(command, source, "rejected", "device is busy", command_id)
+            await send_status(agent, mqtt_client)
             return
         current_state = "CONFIGURING"
         await send_status(agent, mqtt_client)
@@ -2986,6 +3365,7 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
                 with open(LICENSE_PATH, "w") as f:
                     f.write(payload["license_key"])
                 current_state = "REBOOTING"
+                _record_command_result(command, source, "success", "license deployed; rebooting", command_id)
                 await send_status(agent, mqtt_client)
                 await asyncio.sleep(2)
                 remove_lock_file()
@@ -3002,8 +3382,8 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
                 "enabled": True,
                 "ip": auto_setup_metadata.get("ip", "14.238.1.125"),
                 "port": auto_setup_metadata.get("port", 2101),
-                "user": auto_setup_metadata.get("user", "aitogy"),
-                "password": auto_setup_metadata.get("password", "123"),
+                "user": auto_setup_metadata.get("user", ""),
+                "password": auto_setup_metadata.get("password", ""),
                 "mountpoint": raw_mp,
                 "timeout": auto_setup_metadata.get("timeout", 3600),
                 "samples": auto_setup_metadata.get("samples", 60),
@@ -3119,16 +3499,16 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
                     await asyncio.sleep(1.0)
                 
                 try:
-                    with serial_port_lock, serial.Serial(port, DEFAULT_BAUDRATE, timeout=2) as ser:
+                    baud = _runtime_serial_baud(agent, gnss_reader)
+                    logging.info(f"Opening GNSS command port {port} @ {baud} baud")
+                    with serial_port_lock, serial.Serial(port, baud, timeout=2) as ser:
                         for cmd_b64 in commands_b64:
                             decoded_cmd = base64.b64decode(cmd_b64)
                             
                             # Handle delay markers
-                            if decoded_cmd == b'$DELAY_500$':
-                                await asyncio.sleep(0.5)
-                                continue
-                            elif decoded_cmd == b'$DELAY_200$':
-                                await asyncio.sleep(0.2)
+                            delay_seconds = _delay_marker_seconds(decoded_cmd)
+                            if delay_seconds is not None:
+                                await asyncio.sleep(delay_seconds)
                                 continue
                             
                             # Send command
@@ -3147,6 +3527,7 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
                     
                 except Exception as e:
                     logging.error(f"Raw command execution error: {e}")
+                    raise
                 finally:
                     if gnss_reader:
                         await asyncio.sleep(2.0)  # Wait for chip to stabilize
@@ -3210,6 +3591,7 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
                 if os.path.exists(path):
                     os.remove(path)
             current_state = "REBOOTING_FOR_RESET"
+            _record_command_result(command, source, "success", "device reset requested", command_id)
             await send_status(agent, mqtt_client)
             await asyncio.sleep(3)
             remove_lock_file()
@@ -3219,7 +3601,8 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
             port = agent.detected_chip.get("port")
             if port and agent.detected_chip.get("type") == "Unicorecomm":
                 try:
-                    with serial_port_lock, serial.Serial(port, DEFAULT_BAUDRATE, timeout=2) as ser:
+                    baud = _runtime_serial_baud(agent, gnss_reader)
+                    with serial_port_lock, serial.Serial(port, baud, timeout=2) as ser:
                         # Get base station status
                         logging.info("Checking UM982 base mode status...")
                         ser.write(b'mode\r\n')
@@ -3242,7 +3625,11 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
                     logging.error(f"Status check failed: {e}")
             else:
                 logging.warning(f"CHECK_BASE_STATUS only works for Unicorecomm chips")
-    
+
+        _record_command_result(command, source, "success", "", command_id)
+    except Exception as e:
+        _record_command_result(command, source, "error", str(e), command_id)
+        logging.error(f"Command '{command}' failed: {e}", exc_info=True)
     finally:
         if current_state == "CONFIGURING":
             current_state = previous_state
@@ -3252,6 +3639,7 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
             remove_lock_file()
 
 def setup_mqtt_client(loop: asyncio.AbstractEventLoop, agent: AgentManager, gnss_reader: GNSSReader):
+    mqtt_cfg = _get_mqtt_runtime_config(agent)
     if hasattr(mqtt, 'CallbackAPIVersion'):
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"agent-{MACHINE_SERIAL}-{os.getpid()}")
     else:
@@ -3266,13 +3654,23 @@ def setup_mqtt_client(loop: asyncio.AbstractEventLoop, agent: AgentManager, gnss
 
     def on_connect(c, userdata, flags, rc, properties=None):
         if rc == 0:
+            _set_transport_state("mqtt", True)
             logging.info("Connected to MQTT Broker.")
             for topic in command_topics:
                 result, mid = c.subscribe(topic, qos=1)
                 logging.info(f"MQTT subscribe topic='{topic}' result={result} mid={mid}")
             asyncio.run_coroutine_threadsafe(send_status(userdata["agent"], c), loop)
         else:
+            _telemetry_inc("reconnect", "mqtt")
+            _set_transport_state("mqtt", False)
             logging.error(f"!!! MQTT connection failed, code: {rc}")
+
+    def on_disconnect(c, userdata, *args):
+        rc = args[-2] if len(args) >= 2 else (args[0] if args else 0)
+        _set_transport_state("mqtt", False)
+        if rc != 0:
+            _telemetry_inc("reconnect", "mqtt")
+            logging.warning(f"MQTT disconnected unexpectedly (rc={rc}).")
 
     def on_subscribe(c, userdata, mid, granted_qos, properties=None):
         logging.info(f"MQTT subscribe acknowledged mid={mid} qos={granted_qos}")
@@ -3295,12 +3693,13 @@ def setup_mqtt_client(loop: asyncio.AbstractEventLoop, agent: AgentManager, gnss
             logging.error(f"Error processing MQTT message: {e}")
     
     client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
     client.on_subscribe = on_subscribe
     client.on_message = on_message
     client.reconnect_delay_set(min_delay=5, max_delay=120)
 
-    if MQTT_USERNAME and MQTT_PASSWORD:
-        client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+    if mqtt_cfg.get("username") and mqtt_cfg.get("password"):
+        client.username_pw_set(mqtt_cfg["username"], mqtt_cfg["password"])
     # ==================================
     
     last_will = json.dumps({
@@ -3310,7 +3709,9 @@ def setup_mqtt_client(loop: asyncio.AbstractEventLoop, agent: AgentManager, gnss
     })
     client.will_set(f"pi/devices/{MACHINE_SERIAL}/status", payload=last_will, qos=1, retain=True)
     
-    client.connect_async(MQTT_BROKER, MQTT_PORT, 30)
+    with telemetry_lock:
+        transport_status["mqtt_broker"] = mqtt_cfg["broker"]
+    client.connect_async(mqtt_cfg["broker"], mqtt_cfg["port"], 30)
     client.loop_start()
     return client
 
@@ -3322,13 +3723,14 @@ async def websocket_task(agent: AgentManager, gnss_reader: GNSSReader, mqtt_clie
         try:
             async with websockets.connect(
                 ws_uri,
-                ping_interval=20,
-                ping_timeout=10,
+                ping_interval=30,
+                ping_timeout=60,
                 close_timeout=10,
                 open_timeout=30  
             ) as websocket:
                 logging.info(f"Secondary channel (WebSocket) connected: {ws_uri}")
                 active_websocket_connection = websocket
+                _set_transport_state("websocket", True)
                 
                 await send_status(agent, mqtt_client)
                 
@@ -3340,12 +3742,15 @@ async def websocket_task(agent: AgentManager, gnss_reader: GNSSReader, mqtt_clie
             logging.info("websocket_task cancelled")
             break
         except asyncio.TimeoutError:
+            _telemetry_inc("reconnect", "websocket")
             logging.warning("WebSocket connection timeout. Retrying in 10s...")
             await asyncio.sleep(10)
         except websockets.exceptions.WebSocketException as e:
+            _telemetry_inc("reconnect", "websocket")
             logging.warning(f"WebSocket error: {e}. Retrying in 10s...")
             await asyncio.sleep(10)
         except Exception as e:
+            _telemetry_inc("reconnect", "websocket")
             if mqtt_client and mqtt_client.is_connected():
                 logging.info(f"Secondary channel (WebSocket) failed. Main MQTT OK. Retry in 10s. Error: {e}")
             else:
@@ -3353,6 +3758,7 @@ async def websocket_task(agent: AgentManager, gnss_reader: GNSSReader, mqtt_clie
             await asyncio.sleep(10)
         finally:
             active_websocket_connection = None
+            _set_transport_state("websocket", False)
             try:
                 await asyncio.sleep(10)
             except asyncio.CancelledError:
@@ -3458,7 +3864,9 @@ async def _apply_base_mode_to_chip(chip_type: str, port: str, lat: float, lon: f
     alt = float(alt)
 
     try:
-        with serial_port_lock, serial.Serial(port, DEFAULT_BAUDRATE, timeout=2) as ser:
+        baud = _runtime_serial_baud(gnss_reader=gnss_reader)
+        logging.info(f"Opening GNSS base-mode port {port} @ {baud} baud")
+        with serial_port_lock, serial.Serial(port, baud, timeout=2) as ser:
             if chip_type == "Ublox":
                 accuracy = 0.01
                 msg = bytearray(b'\xb5\x62\x06\x71\x28\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')
@@ -3545,7 +3953,9 @@ async def auto_base_state_machine(agent: AgentManager, gnss_reader: GNSSReader, 
         await asyncio.sleep(1.0)
         
     try:
-        with serial_port_lock, serial.Serial(port, DEFAULT_BAUDRATE, timeout=2) as ser:
+        baud = _runtime_serial_baud(gnss_reader=gnss_reader)
+        logging.info(f"Opening GNSS rover-mode port {port} @ {baud} baud")
+        with serial_port_lock, serial.Serial(port, baud, timeout=2) as ser:
             if chip_type == "Ublox":
                 msg = bytearray(b'\xb5\x62\x06\x71\x28\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')
                 CK_A, CK_B = 0, 0
@@ -3582,8 +3992,8 @@ async def auto_base_state_machine(agent: AgentManager, gnss_reader: GNSSReader, 
     # Start temporary NTRIP client to get RTCM
     ntrip_host = cfg.get("ip", "14.238.1.125")
     ntrip_port = str(cfg.get("port", "2101"))
-    ntrip_user = cfg.get("user", "aitogy")
-    ntrip_pass = cfg.get("password", "123")
+    ntrip_user = cfg.get("user", "")
+    ntrip_pass = cfg.get("password", "")
     ntrip_mount = cfg.get("mountpoint", "VRS.105M3")
     
     temp_cfg = {
@@ -3979,12 +4389,14 @@ async def main():
     logging.info("=" * 60)
     
     gnss_reader = None
+    agent.gnss_reader = None
     if chip_info.get("port") and chip_info.get("baud"): 
         gnss_reader = GNSSReader(
             agent.log, 
             port=chip_info["port"], 
             baudrate=chip_info["baud"] 
         )
+        agent.gnss_reader = gnss_reader
         gnss_reader.start()
         logging.info(f"GNSS Reader thread started.")
     else:
