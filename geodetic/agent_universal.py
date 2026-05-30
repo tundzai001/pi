@@ -3487,8 +3487,22 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
             
         elif command == "EXECUTE_RAW_COMMANDS":
             if data.get("original_config", {}).get("mode") == "BASE":
+                try:
+                    if active_auto_base_client:
+                        active_auto_base_client.stop()
+                except Exception:
+                    pass
+                try:
+                    if active_auto_base_task:
+                        active_auto_base_task.cancel()
+                except Exception:
+                    pass
+                active_auto_base_client = None
+                active_auto_base_task = None
+                agent.config['auto_base_setup'] = {"enabled": False}
                 agent.config['base_config'] = data["original_config"]["params"]
                 agent.save_config()
+                agent.restart_services()
             
             commands_b64 = payload.get("commands_b64", [])
             port = agent.detected_chip.get("port")
@@ -3524,6 +3538,8 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
                     
                     current_state = "ONLINE"
                     logging.info("All base station commands executed successfully")
+                    if data.get("original_config", {}).get("mode") == "BASE":
+                        agent.restart_services()
                     
                 except Exception as e:
                     logging.error(f"Raw command execution error: {e}")
