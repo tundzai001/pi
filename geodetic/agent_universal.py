@@ -1,9 +1,10 @@
 #agent_universal.py
-AGENT_VERSION = "V1.1.2"
+AGENT_VERSION = "V1.1.4"
 
 import asyncio
 import gc
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -945,6 +946,18 @@ def get_cached_system_info() -> dict:
             system_info_cache["timestamp"] = now
             system_info_cache["payload"] = payload
     return payload
+
+def get_license_fingerprint() -> str | None:
+    try:
+        if not os.path.exists(LICENSE_PATH):
+            return None
+        with open(LICENSE_PATH, "r", encoding="utf-8") as f:
+            token = f.read().strip()
+        if not token:
+            return None
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+    except Exception:
+        return None
     
 def parse_gga_data(gga_sentence: str) -> tuple:
     """
@@ -2948,6 +2961,7 @@ class AgentManager:
             "name": self.config.get('device_name'),
             "status": final_status, 
             "version": AGENT_VERSION,
+            "agent_token_fingerprint": get_license_fingerprint(),
             "timestamp": int(time.time()),
             "rtk_fix_status": getattr(self, 'last_gga_fix_status', globals().get('LAST_GGA_FIX_STATUS', 'NO_FIX')),
             "base_mode_active": bool(self.get_base_config()),
@@ -3733,7 +3747,20 @@ def setup_mqtt_client(loop: asyncio.AbstractEventLoop, agent: AgentManager, gnss
 
 async def websocket_task(agent: AgentManager, gnss_reader: GNSSReader, mqtt_client: mqtt.Client):
     global active_websocket_connection
-    ws_uri = f"ws://{BACKEND_HOST}:8000/ws/pi/{MACHINE_SERIAL}"
+    
+    # Read Token from license.key
+    auth_token = ""
+    if os.path.exists(LICENSE_PATH):
+        try:
+            with open(LICENSE_PATH, "r") as f:
+                auth_token = f.read().strip()
+        except Exception as e:
+            logging.error(f"Error reading license key: {e}")
+            
+    if auth_token:
+        ws_uri = f"ws://{BACKEND_HOST}:8000/ws/pi/{MACHINE_SERIAL}?token={urllib.parse.quote(auth_token, safe='')}"
+    else:
+        ws_uri = f"ws://{BACKEND_HOST}:8000/ws/pi/{MACHINE_SERIAL}"
     
     while True:
         try:
