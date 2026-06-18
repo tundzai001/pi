@@ -31,6 +31,13 @@ import unicodedata
 import urllib.parse
 import urllib.request
 
+try:
+    from pyrtcm import RTCMReader
+    from io import BytesIO
+    HAS_PYRTCM = True
+except ImportError:
+    HAS_PYRTCM = False
+
 # --- PLATFORM DETECTION ---
 IS_WINDOWS = platform.system() == "Windows"
 IS_RASPBERRY_PI = platform.system() == "Linux" and os.path.exists('/proc/cpuinfo')
@@ -1646,6 +1653,34 @@ def dispatch_rtcm_data(data):
     global rtcm_input_window_bytes, rtcm_input_window_start_ts, rtcm_input_bps
     # Parse datum messages (1021/1023/1025) regardless of stream forwarding state.
     _update_datum_from_rtcm_packet(data)
+    
+    # Decode RTCM directly at source to extract SNR/Satellites without NMEA
+    if globals().get("HAS_PYRTCM"):
+        try:
+            rtr = RTCMReader(BytesIO(data), quitonerror=False)
+            for _, parsed in rtr:
+                if parsed and parsed.identity in ["1074", "1084", "1094", "1114", "1124", "1077", "1087", "1097", "1117", "1127"]:
+                    nsat = getattr(parsed, "NSat", 0)
+                    if nsat > 0:
+                        if "RTCM_SAT_COUNTS" not in globals():
+                            globals()["RTCM_SAT_COUNTS"] = {}
+                        globals()["RTCM_SAT_COUNTS"][parsed.identity] = nsat
+                        globals()["LAST_UBX_NUMSV"] = sum(globals()["RTCM_SAT_COUNTS"].values())
+                    
+                    snrs = []
+                    for i in range(1, 65):
+                        attr = f"DF400_{i:02d}"
+                        if hasattr(parsed, attr):
+                            val = getattr(parsed, attr)
+                            if val is not None and val > 0:
+                                snrs.append(val)
+                    if snrs:
+                        globals()["LAST_GSV_AVG_SNR"] = sum(snrs) / len(snrs)
+                        globals()["LAST_GSV_SNR_SAMPLES"] = len(snrs)
+                        globals()["LAST_GSV_TS"] = time.time()
+        except Exception:
+            pass
+
     now = time.time()
     with rtcm_input_stats_lock:
         rtcm_input_window_bytes += len(data)
