@@ -1653,33 +1653,6 @@ def dispatch_rtcm_data(data):
     global rtcm_input_window_bytes, rtcm_input_window_start_ts, rtcm_input_bps
     # Parse datum messages (1021/1023/1025) regardless of stream forwarding state.
     _update_datum_from_rtcm_packet(data)
-    
-    # Decode RTCM directly at source to extract SNR/Satellites without NMEA
-    if globals().get("HAS_PYRTCM"):
-        try:
-            rtr = RTCMReader(BytesIO(data), quitonerror=False)
-            for _, parsed in rtr:
-                if parsed and parsed.identity in ["1074", "1084", "1094", "1114", "1124", "1077", "1087", "1097", "1117", "1127"]:
-                    nsat = getattr(parsed, "NSat", 0)
-                    if nsat > 0:
-                        if "RTCM_SAT_COUNTS" not in globals():
-                            globals()["RTCM_SAT_COUNTS"] = {}
-                        globals()["RTCM_SAT_COUNTS"][parsed.identity] = nsat
-                        globals()["LAST_UBX_NUMSV"] = sum(globals()["RTCM_SAT_COUNTS"].values())
-                    
-                    snrs = []
-                    for i in range(1, 65):
-                        attr = f"DF400_{i:02d}"
-                        if hasattr(parsed, attr):
-                            val = getattr(parsed, attr)
-                            if val is not None and val > 0:
-                                snrs.append(val)
-                    if snrs:
-                        globals()["LAST_GSV_AVG_SNR"] = sum(snrs) / len(snrs)
-                        globals()["LAST_GSV_SNR_SAMPLES"] = len(snrs)
-                        globals()["LAST_GSV_TS"] = time.time()
-        except Exception:
-            pass
 
     now = time.time()
     with rtcm_input_stats_lock:
@@ -1819,6 +1792,48 @@ class NMEAPublisher(threading.Thread):
                 continue
             except Exception as e:
                 logging.error(f"Error in NMEAPublisher: {e}", exc_info=True)
+
+class RTCMPublisherMQTT(threading.Thread):
+    def __init__(self, mqtt_client: mqtt.Client, serial_number: str, loop: asyncio.AbstractEventLoop):
+        super().__init__()
+        self.daemon = True
+        self.name = "RTCMPublisherMQTT"
+        self._stop_event = threading.Event()
+        self.mqtt_client = mqtt_client
+        self.serial_number = serial_number
+        self.loop = loop
+        self.queue = Queue(maxsize=1000)
+        with subscriber_lock:
+            rtcm_subscribers.append(self.queue)
+    
+    def stop(self):
+        self._stop_event.set()
+        with subscriber_lock:
+            if self.queue in rtcm_subscribers:
+                rtcm_subscribers.remove(self.queue)
+
+    def run(self):
+        logging.info("RTCM MQTT Publisher thread started.")
+        topic = f"pi/devices/{self.serial_number}/raw_data"
+        
+        while not self._stop_event.is_set():
+            try:
+                if is_remote_locked():
+                    time.sleep(1)
+                    continue
+                
+                data_chunk = self.queue.get(timeout=1.0)
+                
+                if self.mqtt_client and self.mqtt_client.is_connected():
+                    try:
+                        self.mqtt_client.publish(topic, data_chunk, qos=0)
+                    except Exception as e:
+                        logging.warning(f"Failed to publish RTCM to MQTT: {e}")
+                        
+            except Empty:
+                continue
+            except Exception as e:
+                logging.error(f"Error in RTCMPublisherMQTT: {e}", exc_info=True)
 
 class NTRIPServerWorker(threading.Thread):
     def __init__(self, server_id, config, log_callback, stats_dict, stats_lock, connection_status_dict):
@@ -4485,6 +4500,10 @@ async def main():
     agent.nmea_publisher.start()
     logging.info("NMEA Publisher thread started.")
     
+    agent.rtcm_mqtt_publisher = RTCMPublisherMQTT(mqtt_client, MACHINE_SERIAL, loop)
+    agent.rtcm_mqtt_publisher.start()
+    logging.info("RTCM MQTT Publisher thread started.")
+    
     if not agent.config.get('is_provisioned'):
         current_state = "UNPROVISIONED"
     else:
@@ -4510,9 +4529,13 @@ async def main():
         logging.info("Main loop interrupted. Starting cleanup...")
         
         # Stop NMEA publisher
-        if agent.nmea_publisher and agent.nmea_publisher.is_alive():
+        if getattr(agent, 'nmea_publisher', None) and agent.nmea_publisher.is_alive():
             agent.nmea_publisher.stop()
             agent.nmea_publisher.join(timeout=2)
+            
+        if getattr(agent, 'rtcm_mqtt_publisher', None) and agent.rtcm_mqtt_publisher.is_alive():
+            agent.rtcm_mqtt_publisher.stop()
+            agent.rtcm_mqtt_publisher.join(timeout=2)
         
         # Stop services
         agent.restart_services()
