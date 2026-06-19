@@ -1821,77 +1821,57 @@ class RTCMPublisherMQTT(threading.Thread):
 
     def run(self):
         import time, json, logging
+        from queue import Empty
+        
         logging.info("RTCM MQTT Publisher thread started.")
         topic = f"pi/devices/{self.serial_number}/raw_data"
-        last_json_publish = 0
-        sats_by_sys = {}
         
         while not self._stop_event.is_set():
-            now = time.time()
-            if now - last_json_publish >= 1.0:
-                for nav_system, data in list(sats_by_sys.items()):
-                    if now - data["ts"] <= 5.0:
-                        payload = json.dumps({
-                            "type": "rtcm_skyview_calculated",
-                            "navSystem": nav_system,
-                            "satellites": data["sats"]
-                        }).encode('ascii')
-                        if self.mqtt_client and self.mqtt_client.is_connected():
-                            try:
-                                self.mqtt_client.publish(topic, payload, qos=0)
-                            except Exception:
-                                pass
-                    else:
-                        del sats_by_sys[nav_system]
-                last_json_publish = now
-
             try:
-                from queue import Empty
                 data_chunk = self.queue.get(timeout=0.1)
                 
-                if len(data_chunk) >= 5 and data_chunk[0] == 0xD3:
-                    msg_type = (data_chunk[3] << 4) | (data_chunk[4] >> 4)
-                    
-                    if msg_type in (1074, 1075, 1077, 1084, 1085, 1087, 1094, 1095, 1097, 1124, 1125, 1127) and HAS_RTCM_DECODER and self.decoder:
-                        try:
-                            parsed = self.decoder.decode_sync(self.serial_number, data_chunk)
-                            if parsed and parsed.get("satellites"):
-                                nav_system = parsed.get("navSystem", "GPS")
-                                
-                                sats = []
-                                global_sats = globals().setdefault("LAST_RTCM_SKY_VIEW_SATS", {})
-                                for sat in parsed["satellites"]:
-                                    if sat.get("signalCnr", 0) > 0:
-                                        sat_obj = {
-                                            "prn": sat["satelliteId"],
-                                            "snr": sat["signalCnr"],
-                                            "sys": sat["system"],
-                                            "azimuth": sat.get("azimuth", 0.0),
-                                            "elevation": sat.get("elevation", 0.0),
-                                            "id": sat["id"]
-                                        }
-                                        sats.append(sat_obj)
-                                        const_pfx = "GP"
-                                        if sat["system"] == "R": const_pfx = "GL"
-                                        elif sat["system"] == "E": const_pfx = "GA"
-                                        elif sat["system"] == "C": const_pfx = "BD"
-                                        
-                                        global_sats[f"{const_pfx}{sat['satelliteId']}"] = {
-                                            "prn": f"{const_pfx}{sat['satelliteId']}",
-                                            "snr": sat["signalCnr"],
-                                            "ts": time.time()
-                                        }
-                                
-                                if sats:
-                                    sats_by_sys[nav_system] = {"ts": time.time(), "sats": sats}
-                        except Exception as e:
-                            logging.debug(f"RTCMSignalDecoder error: {e}")
-                    else:
-                        if self.mqtt_client and self.mqtt_client.is_connected():
-                            try:
-                                self.mqtt_client.publish(topic, data_chunk, qos=0)
-                            except Exception:
-                                pass
+                # ALWAYS publish the RAW bytes so the NTRIP Caster Backend doesn't break!!!
+                if self.mqtt_client and self.mqtt_client.is_connected():
+                    try:
+                        self.mqtt_client.publish(topic, data_chunk, qos=0)
+                    except Exception:
+                        pass
+                
+                # If we have a decoder, process all RTCM packets (including Ephemeris 1019/1020, Base Pos 1005/1006)
+                if len(data_chunk) >= 5 and data_chunk[0] == 0xD3 and HAS_RTCM_DECODER and self.decoder:
+                    try:
+                        parsed = self.decoder.decode_sync(self.serial_number, data_chunk)
+                        # parsed is only returned for MSM packets (satellites)
+                        if parsed and parsed.get("satellites"):
+                            nav_system = parsed.get("navSystem", "GPS")
+                            
+                            sats = []
+                            for sat in parsed["satellites"]:
+                                if sat.get("cnr", 0) > 0:
+                                    sat_obj = {
+                                        "prn": sat["prn"],
+                                        "snr": sat["cnr"],
+                                        "sys": sat["system"],
+                                        "azimuth": sat.get("azimuth", 0.0),
+                                        "elevation": sat.get("elevation", 0.0),
+                                        "id": sat["id"]
+                                    }
+                                    sats.append(sat_obj)
+                            
+                            if sats:
+                                payload = json.dumps({
+                                    "type": "rtcm_skyview_calculated",
+                                    "navSystem": nav_system,
+                                    "satellites": sats
+                                }).encode('ascii')
+                                if self.mqtt_client and self.mqtt_client.is_connected():
+                                    try:
+                                        self.mqtt_client.publish(topic, payload, qos=0)
+                                    except Exception:
+                                        pass
+                    except Exception as e:
+                        logging.debug(f"RTCMSignalDecoder error: {e}")
+
             except Empty:
                 pass
             except Exception as e:
