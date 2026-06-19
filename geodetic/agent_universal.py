@@ -31,13 +31,6 @@ import unicodedata
 import urllib.parse
 import urllib.request
 
-try:
-    from pyrtcm import RTCMReader
-    from io import BytesIO
-    HAS_PYRTCM = True
-except ImportError:
-    HAS_PYRTCM = False
-
 # --- PLATFORM DETECTION ---
 IS_WINDOWS = platform.system() == "Windows"
 IS_RASPBERRY_PI = platform.system() == "Linux" and os.path.exists('/proc/cpuinfo')
@@ -253,46 +246,6 @@ def _telemetry_inc(section: str, key: str, amount: int = 1) -> None:
     target = reconnect_counters if section == "reconnect" else queue_metrics
     with telemetry_lock:
         target[key] = int(target.get(key, 0)) + int(amount)
-
-
-def _update_rtcm_sky_view(data: bytes) -> None:
-    if not HAS_PYRTCM:
-        return
-    try:
-        rtr = RTCMReader(BytesIO(data), quitonerror=False)
-        for _, parsed in rtr:
-            if not parsed or not hasattr(parsed, 'identity'):
-                continue
-            identity = str(parsed.identity)
-            if identity in ('1074', '1084', '1094', '1124', '1075', '1085', '1095', '1125', '1077', '1087', '1097', '1127'):
-                constellation = "GP"
-                if identity.startswith('108'): constellation = "GL"
-                elif identity.startswith('109'): constellation = "GA"
-                elif identity.startswith('112'): constellation = "BD"
-                
-                sats = globals().setdefault("LAST_RTCM_SKY_VIEW_SATS", {})
-                now = time.time()
-                
-                for i in range(1, 65):
-                    prn_attr = getattr(parsed, f"PRN_{i:02d}", None)
-                    if prn_attr is not None:
-                        try:
-                            prn = int(prn_attr)
-                            snr = 0
-                            cnr_attr = getattr(parsed, f"DF403_{i:02d}", None)
-                            if cnr_attr is None:
-                                cnr_attr = getattr(parsed, f"DF400_{i:02d}", None)
-                            if cnr_attr is not None:
-                                snr = int(cnr_attr)
-                            sats[f"{constellation}{prn}"] = {
-                                "prn": f"{constellation}{prn}",
-                                "snr": snr,
-                                "ts": now
-                            }
-                        except ValueError:
-                            pass
-    except Exception:
-        pass
 
 
 def _set_transport_state(channel: str, connected: bool) -> None:
@@ -1693,8 +1646,6 @@ def dispatch_rtcm_data(data):
     global rtcm_input_window_bytes, rtcm_input_window_start_ts, rtcm_input_bps
     # Parse datum messages (1021/1023/1025) regardless of stream forwarding state.
     _update_datum_from_rtcm_packet(data)
-    _update_rtcm_sky_view(data)
-
     now = time.time()
     with rtcm_input_stats_lock:
         rtcm_input_window_bytes += len(data)
@@ -1706,13 +1657,11 @@ def dispatch_rtcm_data(data):
 
     # Check if RTCM streaming is active (can be disabled by SET_RTCM_STREAM_ACTIVE command)
     global rtcm_stream_active_flag
-    global rtcm_mqtt_queue
+    if not rtcm_stream_active_flag:
+        return  # Drop RTCM data if stream is inactive
     
     with subscriber_lock:
         for queue in list(rtcm_subscribers):
-            if not rtcm_stream_active_flag and queue != globals().get("rtcm_mqtt_queue"):
-                continue  # Drop for NTRIP queues if stream is inactive
-                
             try:
                 queue.put_nowait(data)
             except Full:
@@ -1835,105 +1784,6 @@ class NMEAPublisher(threading.Thread):
                 continue
             except Exception as e:
                 logging.error(f"Error in NMEAPublisher: {e}", exc_info=True)
-
-class RTCMPublisherMQTT(threading.Thread):
-    def __init__(self, mqtt_client: mqtt.Client, serial_number: str, loop: asyncio.AbstractEventLoop):
-        super().__init__()
-        self.daemon = True
-        self.name = "RTCMPublisherMQTT"
-        self._stop_event = threading.Event()
-        self.mqtt_client = mqtt_client
-        self.serial_number = serial_number
-        self.loop = loop
-        self.queue = Queue(maxsize=1000)
-        global rtcm_mqtt_queue
-        rtcm_mqtt_queue = self.queue
-        with subscriber_lock:
-            rtcm_subscribers.append(self.queue)
-    
-    def stop(self):
-        self._stop_event.set()
-        with subscriber_lock:
-            if self.queue in rtcm_subscribers:
-                rtcm_subscribers.remove(self.queue)
-
-    def run(self):
-        logging.info("RTCM MQTT Publisher thread started.")
-        topic = f"pi/devices/{self.serial_number}/raw_data"
-        last_json_publish = 0
-        sats_by_sys = {}
-        
-        while not self._stop_event.is_set():
-            now = time.time()
-            if now - last_json_publish >= 1.0:
-                for nav_system, data in list(sats_by_sys.items()):
-                    if now - data["ts"] <= 5.0:
-                        payload = json.dumps({
-                            "type": "rtcm_skyview",
-                            "navSystem": nav_system,
-                            "satellites": data["sats"]
-                        }).encode('ascii')
-                        if self.mqtt_client and self.mqtt_client.is_connected():
-                            try:
-                                self.mqtt_client.publish(topic, payload, qos=0)
-                            except Exception:
-                                pass
-                    else:
-                        del sats_by_sys[nav_system]
-                last_json_publish = now
-
-            try:
-                if is_remote_locked():
-                    time.sleep(1)
-                    continue
-                
-                data_chunk = self.queue.get(timeout=0.1)
-                
-                if len(data_chunk) >= 5 and data_chunk[0] == 0xD3:
-                    msg_type = (data_chunk[3] << 4) | (data_chunk[4] >> 4)
-                    
-                    if msg_type in (1019, 1020, 1042, 1044, 1045, 1046, 1005, 1006):
-                        if self.mqtt_client and self.mqtt_client.is_connected():
-                            try:
-                                self.mqtt_client.publish(topic, data_chunk, qos=0)
-                            except Exception:
-                                pass
-                    elif msg_type in (1074, 1075, 1077, 1084, 1085, 1087, 1094, 1095, 1097, 1124, 1125, 1127):
-                        if HAS_PYRTCM:
-                            try:
-                                from io import BytesIO
-                                from pyrtcm import RTCMReader
-                                rtr = RTCMReader(BytesIO(data_chunk), quitonerror=False)
-                                for _, parsed in rtr:
-                                    if parsed and hasattr(parsed, 'identity'):
-                                        identity = str(parsed.identity)
-                                        nav_system = "GPS"
-                                        sys_code = "G"
-                                        if identity.startswith('108'): nav_system, sys_code = "GLONASS", "R"
-                                        elif identity.startswith('109'): nav_system, sys_code = "Galileo", "E"
-                                        elif identity.startswith('112'): nav_system, sys_code = "BeiDou", "C"
-                                        
-                                        sats = []
-                                        for i in range(1, 65):
-                                            prn_attr = getattr(parsed, f"PRN_{i:02d}", None)
-                                            if prn_attr is not None:
-                                                prn = int(prn_attr)
-                                                snr = 0
-                                                cnr_attr = getattr(parsed, f"DF403_{i:02d}", getattr(parsed, f"DF400_{i:02d}", None))
-                                                if cnr_attr is not None:
-                                                    snr = int(cnr_attr)
-                                                if snr > 0:
-                                                    sats.append({"prn": prn, "snr": snr, "sys": sys_code})
-                                        
-                                        if sats:
-                                            sats_by_sys[nav_system] = {"ts": time.time(), "sats": sats}
-                            except Exception:
-                                pass
-                        
-            except Empty:
-                continue
-            except Exception as e:
-                logging.error(f"Error in RTCMPublisherMQTT: {e}", exc_info=True)
 
 class NTRIPServerWorker(threading.Thread):
     def __init__(self, server_id, config, log_callback, stats_dict, stats_lock, connection_status_dict):
@@ -3191,20 +3041,6 @@ class AgentManager:
             nmea_health["seconds_since_gsv"] = round(now - gsv_ts, 1)
         status["nmea_health"] = nmea_health
 
-        rtcm_sats = globals().get("LAST_RTCM_SKY_VIEW_SATS", {})
-        sky_view = []
-        for key, sat in list(rtcm_sats.items()):
-            if now - sat["ts"] > 15:
-                del rtcm_sats[key]
-            else:
-                sky_view.append({
-                    "prn": sat["prn"],
-                    "snr": sat["snr"]
-                })
-        
-        if sky_view:
-            status["sky_view"] = sky_view
-
         with self.stats_lock:
             if self.service_stats:
                 status["ntrip_stats"] = self.service_stats.copy()
@@ -3894,6 +3730,7 @@ def setup_mqtt_client(loop: asyncio.AbstractEventLoop, agent: AgentManager, gnss
 
     if mqtt_cfg.get("username") and mqtt_cfg.get("password"):
         client.username_pw_set(mqtt_cfg["username"], mqtt_cfg["password"])
+    # ==================================
     
     last_will = json.dumps({
         "serial": MACHINE_SERIAL,
@@ -4613,10 +4450,6 @@ async def main():
     agent.nmea_publisher.start()
     logging.info("NMEA Publisher thread started.")
     
-    agent.rtcm_mqtt_publisher = RTCMPublisherMQTT(mqtt_client, MACHINE_SERIAL, loop)
-    agent.rtcm_mqtt_publisher.start()
-    logging.info("RTCM MQTT Publisher thread started.")
-    
     if not agent.config.get('is_provisioned'):
         current_state = "UNPROVISIONED"
     else:
@@ -4642,13 +4475,9 @@ async def main():
         logging.info("Main loop interrupted. Starting cleanup...")
         
         # Stop NMEA publisher
-        if getattr(agent, 'nmea_publisher', None) and agent.nmea_publisher.is_alive():
+        if agent.nmea_publisher and agent.nmea_publisher.is_alive():
             agent.nmea_publisher.stop()
             agent.nmea_publisher.join(timeout=2)
-            
-        if getattr(agent, 'rtcm_mqtt_publisher', None) and agent.rtcm_mqtt_publisher.is_alive():
-            agent.rtcm_mqtt_publisher.stop()
-            agent.rtcm_mqtt_publisher.join(timeout=2)
         
         # Stop services
         agent.restart_services()
