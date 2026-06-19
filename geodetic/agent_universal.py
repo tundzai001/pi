@@ -2665,6 +2665,7 @@ class RTCMPublisherMQTT(threading.Thread):
                                                 "talker": sat.get("talker", "RTCM"),
                                                 "azimuth": sat.get("azimuth", 0.0),
                                                 "elevation": sat.get("elevation", 0.0),
+                                                "isTracking": sat.get("isTracking", True),
                                                 "id": sat["id"]
                                             }
                                             sats.append(sat_obj)
