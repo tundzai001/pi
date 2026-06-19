@@ -2259,7 +2259,7 @@ class RTCMSignalDecoder:
             azimuth = 0.0
             
             cached = self._azel_cache[serial].get(sat_str_id)
-            if cached and now_s - cached[0] < 120.0:
+            if cached and now_s - cached[0] < 10.0:
                 azimuth, elevation = cached[1], cached[2]
             else:
                 if base_pos:
