@@ -2412,7 +2412,7 @@ class RTCMSignalDecoder:
         satellites: list[dict[str, Any]] = []
         for satellite_id in satellite_ids:
             best_signal_id, best_cnr = self._best_signal(signal_cnr, satellite_id)
-            if best_cnr <= 0:
+            if best_cnr < 0:
                 continue
                 
             sat_str_id = f"RTCM:{info.system}:{satellite_id}"
@@ -2424,7 +2424,7 @@ class RTCMSignalDecoder:
             if serial not in self._azel_cache: self._azel_cache[serial] = {}
             cached = self._azel_cache[serial].get(sat_str_id)
             
-            if cached and now - cached[0] < 120.0:
+            if cached and now - cached[0] < 10.0:
                 azimuth, elevation = cached[1], cached[2]
             else:
                 base_pos = self._base_positions.get(serial)
@@ -2648,11 +2648,15 @@ class RTCMPublisherMQTT(threading.Thread):
                             # Loop until the buffer is completely drained
                             while parsed is not None:
                                 if parsed.get("satellites"):
-                                    nav_system = parsed.get("navSystem", "GPS")
+                                    nav_system = "GPS"
+                                    for pkt in parsed.get("packets", []):
+                                        if "navSystem" in pkt:
+                                            nav_system = pkt["navSystem"]
+                                            break
                                     
                                     sats = []
                                     for sat in parsed["satellites"]:
-                                        if sat.get("cnr", 0) > 0:
+                                        if True:
                                             sat_obj = {
                                                 "prn": sat["prn"],
                                                 "snr": sat["cnr"],
