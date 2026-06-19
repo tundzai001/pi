@@ -30,6 +30,12 @@ import random
 import unicodedata
 import urllib.parse
 import urllib.request
+try:
+    from rtcm_decoder import RTCMSignalDecoder
+    HAS_RTCM_DECODER = True
+except ImportError:
+    HAS_RTCM_DECODER = False
+
 
 # --- PLATFORM DETECTION ---
 IS_WINDOWS = platform.system() == "Windows"
