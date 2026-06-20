@@ -3908,7 +3908,7 @@ class AgentManager:
 
         status = {
             "serial": self.serial_number,
-            "rtcm_stats": self.decoder.get_stats(self.serial_number) if getattr(self, "decoder", None) else {},
+            "rtcm_stats": self.rtcm_mqtt_publisher.decoder.get_stats(self.serial_number) if (getattr(self, "rtcm_mqtt_publisher", None) and getattr(self.rtcm_mqtt_publisher, "decoder", None)) else {},
             "name": self.config.get('device_name'),
             "status": final_status, 
             "version": AGENT_VERSION,
