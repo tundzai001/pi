@@ -2292,7 +2292,8 @@ class RTCMSignalDecoder:
 
     def get_stats(self, serial: str) -> dict[str, Any]:
         if hasattr(self, '_stats_by_serial'):
-            return self._stats_by_serial.get(serial, {})
+            raw = self._stats_by_serial.get(serial, {})
+            return {k: {"interval": v["interval"], "count": v["count"]} for k, v in raw.items()}
         return {}
 
     def decode_sync(self, serial: str, payload: bytes) -> dict[str, Any] | None:
@@ -3886,7 +3887,7 @@ class AgentManager:
 
         status = {
             "serial": self.serial_number,
-            "rtcm_stats": self.decoder.get_stats(self.serial_number) if hasattr(self, "decoder") else {},
+            "rtcm_stats": self.decoder.get_stats(self.serial_number) if getattr(self, "decoder", None) else {},
             "name": self.config.get('device_name'),
             "status": final_status, 
             "version": AGENT_VERSION,
