@@ -2290,6 +2290,11 @@ class RTCMSignalDecoder:
             "satellites": satellites_out
         }
 
+    def get_stats(self, serial: str) -> dict[str, Any]:
+        if hasattr(self, '_stats_by_serial'):
+            return self._stats_by_serial.get(serial, {})
+        return {}
+
     def decode_sync(self, serial: str, payload: bytes) -> dict[str, Any] | None:
         buffer = self._buffers.get(serial, b"") + payload
         packets: list[dict[str, Any]] = []
@@ -2321,6 +2326,23 @@ class RTCMSignalDecoder:
 
             payload_bytes = packet[3:-3]
             message_type = (payload_bytes[0] << 4) | (payload_bytes[1] >> 4) if len(payload_bytes) >= 2 else -1
+
+            if message_type > 0:
+                import time
+                now = time.time()
+                if not hasattr(self, '_stats_by_serial'):
+                    self._stats_by_serial = {}
+                if serial not in self._stats_by_serial:
+                    self._stats_by_serial[serial] = {}
+                msg_str = str(message_type)
+                if msg_str not in self._stats_by_serial[serial]:
+                    self._stats_by_serial[serial][msg_str] = {"last_seen": now, "interval": 0.0, "count": 1}
+                else:
+                    last_seen = self._stats_by_serial[serial][msg_str]["last_seen"]
+                    self._stats_by_serial[serial][msg_str]["interval"] = round(now - last_seen, 2)
+                    self._stats_by_serial[serial][msg_str]["last_seen"] = now
+                    self._stats_by_serial[serial][msg_str]["count"] += 1
+
             try:
                 if message_type in (1005, 1006):
                     self._decode_1005(payload_bytes, serial)
@@ -2452,7 +2474,7 @@ class RTCMSignalDecoder:
                     "cnr": best_cnr,
                     "signalId": best_signal_id,
                     "messageType": message_type,
-                    "isTracking": True,
+                    "isTracking": best_cnr > 0,
                     "elevation": elevation,
                     "azimuth": azimuth,
                     "lastSeen": now_ms,
@@ -3864,6 +3886,7 @@ class AgentManager:
 
         status = {
             "serial": self.serial_number,
+            "rtcm_stats": self.decoder.get_stats(self.serial_number) if hasattr(self, "decoder") else {},
             "name": self.config.get('device_name'),
             "status": final_status, 
             "version": AGENT_VERSION,
