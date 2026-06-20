@@ -2675,13 +2675,13 @@ class RTCMPublisherMQTT(threading.Thread):
                                             break
                                     
                                     sats = []
-                                    for sat in parsed["satellites"]:
+                                    for sat in parsed.get("satellites", []):
                                         if True:
                                             sat_obj = {
                                                 "prn": sat["prn"],
-                                                "snr": sat["cnr"],
-                                                "sys": sat["system"],
-                                                "system": sat["system"],  # Ensure system field is present for frontend!
+                                                "snr": sat.get("cnr", sat.get("snr", 0)),
+                                                "sys": sat.get("system", nav_system),
+                                                "system": sat.get("system", nav_system),
                                                 "talker": sat.get("talker", "RTCM"),
                                                 "azimuth": sat.get("azimuth", 0.0),
                                                 "elevation": sat.get("elevation", 0.0),
