@@ -319,6 +319,19 @@ def _get_mqtt_runtime_config(agent=None) -> dict:
 
 
 def _should_forward_nmea_to_backend(data: bytes) -> bool:
+    global nmea_rate_limit_counter, nmea_rate_limit_reset_ts
+    
+    # NMEA sentences can be easily filtered
+    # Return True if we allow it, False to drop
+    now = time.time()
+    if now - nmea_rate_limit_reset_ts > 1.0:
+        nmea_rate_limit_counter = 0
+        nmea_rate_limit_reset_ts = now
+        
+    if nmea_rate_limit_counter >= 50: # Max 50 messages/sec (was 15, caused GSV truncation)
+        return False
+        
+    nmea_rate_limit_counter += 1
     try:
         text = data.decode("ascii", errors="ignore")
     except Exception:
@@ -2677,11 +2690,18 @@ class RTCMPublisherMQTT(threading.Thread):
                                     sats = []
                                     for sat in parsed.get("satellites", []):
                                         if True:
+                                            sys_mapped = sat.get("system", nav_system)
+                                            if sys_mapped == "us": sys_mapped = "GPS"
+                                            elif sys_mapped == "ru": sys_mapped = "GLONASS"
+                                            elif sys_mapped == "eu": sys_mapped = "GALILEO"
+                                            elif sys_mapped == "cn": sys_mapped = "BEIDOU"
+                                            elif sys_mapped == "jp": sys_mapped = "QZSS"
+
                                             sat_obj = {
                                                 "prn": sat["prn"],
                                                 "snr": sat.get("cnr", sat.get("snr", 0)),
-                                                "sys": sat.get("system", nav_system),
-                                                "system": sat.get("system", nav_system),
+                                                "sys": sys_mapped,
+                                                "system": sys_mapped,
                                                 "talker": sat.get("talker", "RTCM"),
                                                 "azimuth": sat.get("azimuth", 0.0),
                                                 "elevation": sat.get("elevation", 0.0),
@@ -2695,13 +2715,16 @@ class RTCMPublisherMQTT(threading.Thread):
                                         payload = json.dumps({
                                             "type": "rtcm_skyview_calculated",
                                             "navSystem": nav_system,
-                                            "satellites": sats
+                                            "satellites": sats,
+                                            "timestamp": round(time.time(), 3)
                                         }).encode('ascii')
                                         if self.mqtt_client and self.mqtt_client.is_connected():
                                             try:
                                                 self.mqtt_client.publish(topic, payload, qos=0)
-                                            except Exception:
-                                                pass
+                                            except Exception as e:
+                                                logging.error(f"Failed to publish RTCM skyview: {e}")
+                                        else:
+                                            logging.warning(f"RTCMPublisherMQTT: MQTT not connected!")
                                 
                                 # Feed empty bytes to drain any remaining packets in the buffer
                                 parsed = self.decoder.decode_sync(self.serial_number, b"")
