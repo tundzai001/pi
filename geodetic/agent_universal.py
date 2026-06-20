@@ -2632,24 +2632,21 @@ class RTCMPublisherMQTT(threading.Thread):
                 
                 # If we have a decoder, process all RTCM packets (including Ephemeris 1019/1020, Base Pos 1005/1006)
                 # Note: We do NOT publish raw RTCM bytes to raw_data topic, as the station streams directly to NTRIP.
-                # Optimization: Only decode RTCM if we haven't received GSA/GSV NMEA recently (within 10s), to save Pi CPU.
                 if HAS_RTCM_DECODER and self.decoder:
-                    last_nmea_ts = globals().get('LAST_NMEA_GSV_GSA_TS', 0.0)
-                    if time.time() - last_nmea_ts >= 10.0:
-                        try:
-                            # Try to get base position from agent config or NMEA/UBX if not already received from RTCM 1005/1006
-                            if self.serial_number not in self.decoder._base_positions:
-                                ag = globals().get('agent')
-                                base_coords = None
-                                if ag and hasattr(ag, 'get_base_config'):
-                                    base_cfg = ag.get_base_config() or {}
-                                    base_coords = base_cfg.get("coords") or {}
-                                    if not base_coords and "lat" in base_cfg:
-                                        base_coords = {
-                                            "lat": base_cfg.get("lat"),
-                                            "lon": base_cfg.get("lon"),
-                                            "alt": base_cfg.get("alt", 0.0)
-                                        }
+                    try:
+                        # Try to get base position from agent config or NMEA/UBX if not already received from RTCM 1005/1006
+                        if self.serial_number not in self.decoder._base_positions:
+                            ag = globals().get('agent')
+                            base_coords = None
+                            if ag and hasattr(ag, 'get_base_config'):
+                                base_cfg = ag.get_base_config() or {}
+                                base_coords = base_cfg.get("coords") or {}
+                                if not base_coords and "lat" in base_cfg:
+                                    base_coords = {
+                                        "lat": base_cfg.get("lat"),
+                                        "lon": base_cfg.get("lon"),
+                                        "alt": base_cfg.get("alt", 0.0)
+                                    }
                                 
                                 ref_coord = None
                                 if base_coords and base_coords.get("lat") is not None and base_coords.get("lon") is not None:
@@ -2689,11 +2686,12 @@ class RTCMPublisherMQTT(threading.Thread):
                                                 "azimuth": sat.get("azimuth", 0.0),
                                                 "elevation": sat.get("elevation", 0.0),
                                                 "isTracking": sat.get("isTracking", True),
-                                                "id": sat["id"]
+                                                "last_seen": time.time()
                                             }
                                             sats.append(sat_obj)
                                     
                                     if sats:
+                                        globals()['LAST_RTCM_SATELLITES'] = sats
                                         payload = json.dumps({
                                             "type": "rtcm_skyview_calculated",
                                             "navSystem": nav_system,
@@ -2707,8 +2705,8 @@ class RTCMPublisherMQTT(threading.Thread):
                                 
                                 # Feed empty bytes to drain any remaining packets in the buffer
                                 parsed = self.decoder.decode_sync(self.serial_number, b"")
-                        except Exception as e:
-                            logging.debug(f"RTCMSignalDecoder error: {e}")
+                    except Exception as e:
+                        logging.debug(f"RTCMSignalDecoder error: {e}")
             except Empty:
                 pass
             except Exception as e:
@@ -3892,7 +3890,7 @@ class AgentManager:
             "status": final_status, 
             "version": AGENT_VERSION,
             "agent_token_fingerprint": get_license_fingerprint(),
-            "timestamp": int(time.time()),
+            "timestamp": round(time.time(), 3),
             "rtk_fix_status": getattr(self, 'last_gga_fix_status', globals().get('LAST_GGA_FIX_STATUS', 'NO_FIX')),
             "base_mode_active": bool(self.get_base_config()),
             "detected_chip_type": self.detected_chip.get("type", "UNKNOWN"),
