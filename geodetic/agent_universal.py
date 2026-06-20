@@ -2675,59 +2675,59 @@ class RTCMPublisherMQTT(threading.Thread):
                                     except Exception:
                                         pass
 
-                            # Feed the chunk. It might contain multiple packets!
-                            parsed = self.decoder.decode_sync(self.serial_number, data_chunk)
-                            
-                            # Loop until the buffer is completely drained
-                            while parsed is not None:
-                                if parsed.get("satellites"):
-                                    nav_system = "GPS"
-                                    for pkt in parsed.get("packets", []):
-                                        if "navSystem" in pkt:
-                                            nav_system = pkt["navSystem"]
-                                            break
-                                    
-                                    sats = []
-                                    for sat in parsed.get("satellites", []):
-                                        if True:
-                                            sys_mapped = sat.get("system", nav_system)
-                                            if sys_mapped == "us": sys_mapped = "GPS"
-                                            elif sys_mapped == "ru": sys_mapped = "GLONASS"
-                                            elif sys_mapped == "eu": sys_mapped = "GALILEO"
-                                            elif sys_mapped == "cn": sys_mapped = "BEIDOU"
-                                            elif sys_mapped == "jp": sys_mapped = "QZSS"
-
-                                            sat_obj = {
-                                                "prn": sat["prn"],
-                                                "snr": sat.get("cnr", sat.get("snr", 0)),
-                                                "sys": sys_mapped,
-                                                "system": sys_mapped,
-                                                "talker": sat.get("talker", "RTCM"),
-                                                "azimuth": sat.get("azimuth", 0.0),
-                                                "elevation": sat.get("elevation", 0.0),
-                                                "isTracking": sat.get("isTracking", True),
-                                                "last_seen": time.time()
-                                            }
-                                            sats.append(sat_obj)
-                                    
-                                    if sats:
-                                        globals()['LAST_RTCM_SATELLITES'] = sats
-                                        payload = json.dumps({
-                                            "type": "rtcm_skyview_calculated",
-                                            "navSystem": nav_system,
-                                            "satellites": sats,
-                                            "timestamp": round(time.time(), 3)
-                                        }).encode('ascii')
-                                        if self.mqtt_client and self.mqtt_client.is_connected():
-                                            try:
-                                                self.mqtt_client.publish(topic, payload, qos=0)
-                                            except Exception as e:
-                                                logging.error(f"Failed to publish RTCM skyview: {e}")
-                                        else:
-                                            logging.warning(f"RTCMPublisherMQTT: MQTT not connected!")
+                        # Feed the chunk. It might contain multiple packets!
+                        parsed = self.decoder.decode_sync(self.serial_number, data_chunk)
+                        
+                        # Loop until the buffer is completely drained
+                        while parsed is not None:
+                            if parsed.get("satellites"):
+                                nav_system = "GPS"
+                                for pkt in parsed.get("packets", []):
+                                    if "navSystem" in pkt:
+                                        nav_system = pkt["navSystem"]
+                                        break
                                 
-                                # Feed empty bytes to drain any remaining packets in the buffer
-                                parsed = self.decoder.decode_sync(self.serial_number, b"")
+                                sats = []
+                                for sat in parsed.get("satellites", []):
+                                    if True:
+                                        sys_mapped = sat.get("system", nav_system)
+                                        if sys_mapped == "us": sys_mapped = "GPS"
+                                        elif sys_mapped == "ru": sys_mapped = "GLONASS"
+                                        elif sys_mapped == "eu": sys_mapped = "GALILEO"
+                                        elif sys_mapped == "cn": sys_mapped = "BEIDOU"
+                                        elif sys_mapped == "jp": sys_mapped = "QZSS"
+
+                                        sat_obj = {
+                                            "prn": sat["prn"],
+                                            "snr": sat.get("cnr", sat.get("snr", 0)),
+                                            "sys": sys_mapped,
+                                            "system": sys_mapped,
+                                            "talker": sat.get("talker", "RTCM"),
+                                            "azimuth": sat.get("azimuth", 0.0),
+                                            "elevation": sat.get("elevation", 0.0),
+                                            "isTracking": sat.get("isTracking", True),
+                                            "last_seen": time.time()
+                                        }
+                                        sats.append(sat_obj)
+                                
+                                if sats:
+                                    globals()['LAST_RTCM_SATELLITES'] = sats
+                                    payload = json.dumps({
+                                        "type": "rtcm_skyview_calculated",
+                                        "navSystem": nav_system,
+                                        "satellites": sats,
+                                        "timestamp": round(time.time(), 3)
+                                    }).encode('ascii')
+                                    if self.mqtt_client and self.mqtt_client.is_connected():
+                                        try:
+                                            self.mqtt_client.publish(topic, payload, qos=0)
+                                        except Exception as e:
+                                            logging.error(f"Failed to publish RTCM skyview: {e}")
+                                    else:
+                                        logging.warning(f"RTCMPublisherMQTT: MQTT not connected!")
+                            
+                            # Feed empty bytes to drain any remaining packets in the buffer
+                            parsed = self.decoder.decode_sync(self.serial_number, b"")
                     except Exception as e:
                         logging.debug(f"RTCMSignalDecoder error: {e}")
             except Empty:
