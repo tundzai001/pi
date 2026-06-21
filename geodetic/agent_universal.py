@@ -1,5 +1,5 @@
 #agent_universal.py
-AGENT_VERSION = "V1.2.4"
+AGENT_VERSION = "V1.4.4"
 
 import asyncio
 import gc
@@ -4115,12 +4115,14 @@ class AgentManager:
         elapsed = now_time - getattr(self, 'last_savings_calc_time', now_time)
         self.last_savings_calc_time = now_time
 
+        has_aitogy = False
         sleeping_aitogy_count = 0
         services = self.config.get('services', {})
         for i in (1, 2):
             if services.get(f'server{i}_enabled', False):
                 host = str(services.get(f'server{i}_address', '')).lower()
                 if 'aitogy.com.vn' in host:
+                    has_aitogy = True
                     is_on_demand = _to_bool(services.get(f'server{i}_stream_on_demand', False), False)
                     is_active = _to_bool(services.get(f'server{i}_stream_active', True), True)
                     if is_on_demand and not is_active:
@@ -4138,7 +4140,8 @@ class AgentManager:
         status["savings_stats"] = {
             "total_data_saved_bytes": int(self.cumulative_saved_bytes),
             "total_saved_mwh": round(self.cumulative_saved_mwh, 3),
-            "telemetry_bps": getattr(self, 'telemetry_bps', 0)
+            "telemetry_bps": getattr(self, 'telemetry_bps', 0),
+            "is_sleeping": sleeping_aitogy_count > 0 if has_aitogy else None
         }
         
         return status
