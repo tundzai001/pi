@@ -904,12 +904,20 @@ def get_system_info() -> dict:
         cpu_percent = psutil.cpu_percent(interval=None)
         cpu_freq = psutil.cpu_freq()
         
-        # Temperature (Raspberry Pi)
+        # Temperature & Voltage (Raspberry Pi)
         temp = None
+        core_volts = None
         if IS_RASPBERRY_PI:
             try:
                 with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
                     temp = float(f.read().strip()) / 1000.0  # Celsius
+            except:
+                pass
+            try:
+                import subprocess
+                out = subprocess.check_output(["vcgencmd", "measure_volts", "core"], text=True, timeout=1)
+                if "volt=" in out:
+                    core_volts = float(out.strip().replace("volt=", "").replace("V", ""))
             except:
                 pass
         
@@ -927,6 +935,7 @@ def get_system_info() -> dict:
             "cpu": {
                 "usage_percent": round(cpu_percent, 1),
                 "frequency_mhz": round(cpu_freq.current, 0) if cpu_freq else None,
+                "core_volts": core_volts,
                 "count": psutil.cpu_count()
             },
             "temperature": {
@@ -3646,6 +3655,8 @@ class AgentManager:
         self.service_stats = {}
         self.ntrip_connection_status = {} 
         self.stats_lock = threading.Lock()
+        self.cumulative_saved_bytes = 0
+        self.last_savings_calc_time = time.time()
         self.log = lambda lvl, msg: logging.log(getattr(logging, lvl.upper(), logging.INFO), msg)
         self.rtcm_stream_active = False
         # Last-known RTK/GGA fix status (updated asynchronously by NMEA dispatcher)
@@ -4097,6 +4108,29 @@ class AgentManager:
             except Exception:
                 pass
         status["serial_health"] = serial_health
+        
+        now_time = time.time()
+        elapsed = now_time - getattr(self, 'last_savings_calc_time', now_time)
+        self.last_savings_calc_time = now_time
+
+        sleeping_aitogy_count = 0
+        services = self.config.get('services', {})
+        for i in (1, 2):
+            if services.get(f'server{i}_enabled', False):
+                host = str(services.get(f'server{i}_address', '')).lower()
+                if 'aitogy.com.vn' in host:
+                    is_on_demand = _to_bool(services.get(f'server{i}_stream_on_demand', False), False)
+                    is_active = _to_bool(services.get(f'server{i}_stream_active', True), True)
+                    if is_on_demand and not is_active:
+                        sleeping_aitogy_count += 1
+
+        if sleeping_aitogy_count > 0:
+            saved_bytes = globals().get('rtcm_input_bps', 0) * elapsed * sleeping_aitogy_count
+            self.cumulative_saved_bytes += saved_bytes
+
+        status["savings_stats"] = {
+            "total_data_saved_bytes": int(self.cumulative_saved_bytes)
+        }
         
         return status
     
