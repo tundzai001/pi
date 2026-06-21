@@ -3655,7 +3655,9 @@ class AgentManager:
         self.service_stats = {}
         self.ntrip_connection_status = {} 
         self.stats_lock = threading.Lock()
+        self.active_ntrip_casters = {}
         self.cumulative_saved_bytes = 0
+        self.cumulative_saved_mwh = 0.0
         self.last_savings_calc_time = time.time()
         self.log = lambda lvl, msg: logging.log(getattr(logging, lvl.upper(), logging.INFO), msg)
         self.rtcm_stream_active = False
@@ -4127,9 +4129,16 @@ class AgentManager:
         if sleeping_aitogy_count > 0:
             saved_bytes = globals().get('rtcm_input_bps', 0) * elapsed * sleeping_aitogy_count
             self.cumulative_saved_bytes += saved_bytes
+            
+            # Tính toán lượng điện (mWh) tiết kiệm
+            # 0.7W tiết kiệm = 0.7 Joules/s = 0.7 / 3.6 mWh mỗi giây
+            saved_mwh_per_sec = 0.7 / 3.6 
+            self.cumulative_saved_mwh += saved_mwh_per_sec * elapsed
 
         status["savings_stats"] = {
-            "total_data_saved_bytes": int(self.cumulative_saved_bytes)
+            "total_data_saved_bytes": int(self.cumulative_saved_bytes),
+            "total_saved_mwh": round(self.cumulative_saved_mwh, 3),
+            "telemetry_bps": getattr(self, 'telemetry_bps', 0)
         }
         
         return status
@@ -4214,6 +4223,20 @@ async def send_status(agent: AgentManager, mqtt_client: mqtt.Client):
     except Exception as e:
         logging.error(f"Failed to collect system info: {e}")
 
+    # Đếm byte của JSON payload cho telemetry (Mạng nhẹ)
+    json_payload = json.dumps(status_payload)
+    telemetry_bytes = len(json_payload.encode('utf-8'))
+    
+    # Tính Bps trung bình (giả định interval là 5s, hoặc cập nhật dồn)
+    now = time.time()
+    if hasattr(agent, 'last_telemetry_time'):
+        elapsed = now - agent.last_telemetry_time
+        if elapsed > 0:
+            agent.telemetry_bps = round(telemetry_bytes / elapsed, 2)
+    else:
+        agent.telemetry_bps = round(telemetry_bytes / 5.0, 2)
+    agent.last_telemetry_time = now
+
     # Gửi qua WebSocket
     if active_websocket_connection:
         try:
@@ -4227,7 +4250,7 @@ async def send_status(agent: AgentManager, mqtt_client: mqtt.Client):
     if mqtt_client and mqtt_client.is_connected():
         try:
             topic = f"pi/devices/{MACHINE_SERIAL}/status"
-            mqtt_client.publish(topic, json.dumps(status_payload), qos=1, retain=True)
+            mqtt_client.publish(topic, json_payload, qos=1, retain=True)
         except Exception as e:
             _set_transport_state("mqtt", False)
             logging.warning(f"MQTT publish failed: {e}")
