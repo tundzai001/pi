@@ -1,5 +1,5 @@
 #agent_universal.py
-AGENT_VERSION = "V1.4.4"
+AGENT_VERSION = "V1.8.4"
 
 import asyncio
 import gc
@@ -3938,8 +3938,38 @@ class AgentManager:
             "auto_base_progress": globals().get("AUTO_BASE_PROGRESS", {}),
             "is_locked": is_remote_locked(),
             "is_synced": True
-
         }
+
+        # Antenna / RTCM health check logic
+        rtcm_input_bps_val = globals().get('rtcm_input_bps', 0)
+        numsv_val = globals().get("LAST_UBX_NUMSV")
+        numsv_ts_val = float(globals().get("LAST_UBX_NUMSV_TS") or 0.0)
+        sats_val = int(numsv_val) if (numsv_val is not None and time.time() - numsv_ts_val <= 15) else 0
+        gsv_ts = float(globals().get("LAST_GSV_TS") or 0.0)
+
+        antenna_state = "OK"
+        antenna_message = None
+
+        if final_status in ("online", "sleep", "streaming", "starting"):
+            if rtcm_input_bps_val > 0 and rtcm_input_bps_val < 100:
+                antenna_state = "FAULT"
+                antenna_message = f"Tốc độ nhận RTCM từ máy thu cực thấp ({rtcm_input_bps_val} B/s). Cáp ăng-ten có thể bị lỏng hoặc đứt."
+            elif sats_val == 0 and (time.time() - gsv_ts <= 30):
+                antenna_state = "FAULT"
+                antenna_message = "Không bắt được vệ tinh nào (0 Sats). Vui lòng kiểm tra cáp ăng-ten hoặc nguồn cấp."
+
+        status["antenna_status"] = {
+            "state": antenna_state,
+            "message": antenna_message
+        }
+
+        # Throttled local logging for antenna fault
+        if antenna_state == "FAULT":
+            now_ts = time.time()
+            last_log = getattr(self, "_last_antenna_fault_log_ts", 0)
+            if now_ts - last_log > 300: # Every 5 minutes
+                self.log("ERROR", f"[Antenna Quality] {antenna_message}")
+                self._last_antenna_fault_log_ts = now_ts
         with DATUM_LOCK:
             datum_l0_deg = round(math.degrees(AUTO_BASE_DATUM.l0), 8)
             datum_k0 = AUTO_BASE_DATUM.k0
