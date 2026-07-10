@@ -1,5 +1,5 @@
 #agent_universal.py
-AGENT_VERSION = "V1.8.4"
+AGENT_VERSION = "V1.9.4"
 
 import asyncio
 import gc
@@ -4648,7 +4648,35 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
             current_state = "ONLINE"
             await send_status(agent, mqtt_client)
             
+        elif command == "REBOOT_DEVICE":
+            current_state = "REBOOTING"
+            _record_command_result(command, source, "success", "device reboot requested", command_id)
+            await send_status(agent, mqtt_client)
+            await asyncio.sleep(1) # Chờ để MQTT kịp gửi bản tin
+            
+            if agent.nmea_publisher:
+                agent.nmea_publisher.stop()
+            agent.restart_services()
+            if gnss_reader and gnss_reader.is_alive():
+                gnss_reader.stop()
+                gnss_reader.join(timeout=2)
+            if mqtt_client:
+                mqtt_client.loop_stop()
+                mqtt_client.disconnect()
+            
+            await asyncio.sleep(2)
+            remove_lock_file()
+            
+            # Restart tiến trình (process) thay vì khởi động lại OS
+            logging.info("[REBOOT] Đang khởi động lại tiến trình Agent...")
+            sys.exit(0)
+            
         elif command == "DELETE_DEVICE":
+            current_state = "REBOOTING_FOR_RESET"
+            _record_command_result(command, source, "success", "device reset requested", command_id)
+            await send_status(agent, mqtt_client)
+            await asyncio.sleep(1)
+            
             if agent.nmea_publisher:
                 agent.nmea_publisher.stop()
             agent.restart_services()
@@ -4661,12 +4689,12 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
             for path in [CONFIG_PATH, LICENSE_PATH]:
                 if os.path.exists(path):
                     os.remove(path)
-            current_state = "REBOOTING_FOR_RESET"
-            _record_command_result(command, source, "success", "device reset requested", command_id)
-            await send_status(agent, mqtt_client)
-            await asyncio.sleep(3)
+            
+            await asyncio.sleep(2)
             remove_lock_file()
-            os.execv(sys.executable, [sys.executable] + sys.argv)
+            
+            logging.info("[REBOOT_FOR_RESET] Đang khởi động lại tiến trình Agent...")
+            sys.exit(0)
         
         elif command == "CHECK_BASE_STATUS":
             port = agent.detected_chip.get("port")
