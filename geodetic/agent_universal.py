@@ -4338,6 +4338,7 @@ def _validate_command_payload(command: str, payload: dict, data: dict, agent: Ag
         "SET_RTCM_STREAM_ACTIVE",
         "DELETE_DEVICE",
         "CHECK_BASE_STATUS",
+        "REBOOT_DEVICE",
     }
     if command not in known_commands:
         return False, f"unsupported command: {command}"
