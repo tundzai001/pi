@@ -1,5 +1,5 @@
 #agent_universal.py
-AGENT_VERSION = "V1.9.4"
+AGENT_VERSION = "V2.0.1"
 
 import asyncio
 import gc
@@ -204,6 +204,8 @@ def _update_local_nmea_health(sentence: str) -> None:
         nmea_type = head[-3:]
         counts = globals().setdefault("LAST_NMEA_TYPE_COUNTS", {})
         counts[nmea_type] = int(counts.get(nmea_type, 0)) + 1
+        globals()["LAST_VALID_NMEA_TS"] = time.time()
+        
         if len(counts) > 16:
             for key in list(counts.keys())[:-16]:
                 counts.pop(key, None)
@@ -240,7 +242,7 @@ def _update_local_nmea_health(sentence: str) -> None:
             if snrs:
                 globals()["LAST_GSV_AVG_SNR"] = sum(snrs) / len(snrs)
                 globals()["LAST_GSV_SNR_SAMPLES"] = len(snrs)
-                globals()["LAST_GSV_TS"] = time.time()
+            globals()["LAST_GSV_TS"] = time.time()
     except Exception:
         return
 
@@ -2597,7 +2599,8 @@ class NMEAPublisher(threading.Thread):
                     continue
                 
                 data_chunk = self.queue.get(timeout=1.0)
-                if active_websocket_connection and self.loop and not self.loop.is_closed() and _should_forward_nmea_to_backend(data_chunk):
+                should_forward = _should_forward_nmea_to_backend(data_chunk)
+                if active_websocket_connection and self.loop and not self.loop.is_closed() and should_forward:
                     try:
                         ws_message = {
                             "type": "nmea_update",
@@ -2610,7 +2613,7 @@ class NMEAPublisher(threading.Thread):
                     except Exception as e:
                         logging.debug(f"Failed to send NMEA over websocket: {e}")
 
-                if self.mqtt_client and self.mqtt_client.is_connected() and _should_forward_nmea_to_backend(data_chunk):
+                if self.mqtt_client and self.mqtt_client.is_connected() and should_forward:
                     try:
                         self.mqtt_client.publish(topic, data_chunk, qos=0)
                     except Exception as e:
@@ -2656,6 +2659,13 @@ class RTCMPublisherMQTT(threading.Thread):
                 # Note: We do NOT publish raw RTCM bytes to raw_data topic, as the station streams directly to NTRIP.
                 if HAS_RTCM_DECODER and self.decoder:
                     try:
+                        # If NMEA GSV already provides skyview data, skip RTCM
+                        # decoding. GGA/GSA-only streams still need RTCM decode
+                        # so the UI can render the skyview.
+                        last_gsv_ts = globals().get('LAST_GSV_TS', 0)
+                        if time.time() - last_gsv_ts < 60:
+                            continue
+
                         # Try to get base position from agent config or NMEA/UBX if not already received from RTCM 1005/1006
                         if self.serial_number not in self.decoder._base_positions:
                             ag = globals().get('agent')
@@ -2721,12 +2731,25 @@ class RTCMPublisherMQTT(threading.Thread):
                                 
                                 if sats:
                                     globals()['LAST_RTCM_SATELLITES'] = sats
-                                    payload = json.dumps({
+                                    globals()['LAST_RTCM_SATELLITES_TS'] = time.time()
+                                    decoded_payload = {
                                         "type": "rtcm_skyview_calculated",
                                         "navSystem": nav_system,
                                         "satellites": sats,
                                         "timestamp": round(time.time(), 3)
-                                    }).encode('ascii')
+                                    }
+                                    if active_websocket_connection and self.loop and not self.loop.is_closed():
+                                        try:
+                                            asyncio.run_coroutine_threadsafe(
+                                                active_websocket_connection.send(json.dumps({
+                                                    "type": "rtcm_signal_update",
+                                                    "payload": decoded_payload
+                                                })),
+                                                self.loop
+                                            )
+                                        except Exception as e:
+                                            logging.debug(f"Failed to send RTCM skyview over websocket: {e}")
+                                    payload = json.dumps(decoded_payload).encode('ascii')
                                     if self.mqtt_client and self.mqtt_client.is_connected():
                                         try:
                                             self.mqtt_client.publish(topic, payload, qos=0)
@@ -3946,6 +3969,9 @@ class AgentManager:
         numsv_ts_val = float(globals().get("LAST_UBX_NUMSV_TS") or 0.0)
         sats_val = int(numsv_val) if (numsv_val is not None and time.time() - numsv_ts_val <= 15) else 0
         gsv_ts = float(globals().get("LAST_GSV_TS") or 0.0)
+        
+        rtcm_sats_ts = float(globals().get("LAST_RTCM_SATELLITES_TS") or 0.0)
+        has_rtcm_sats = (time.time() - rtcm_sats_ts) <= 30
 
         antenna_state = "OK"
         antenna_message = None
@@ -3954,7 +3980,7 @@ class AgentManager:
             if rtcm_input_bps_val > 0 and rtcm_input_bps_val < 100:
                 antenna_state = "FAULT"
                 antenna_message = f"Tốc độ nhận RTCM từ máy thu cực thấp ({rtcm_input_bps_val} B/s). Cáp ăng-ten có thể bị lỏng hoặc đứt."
-            elif sats_val == 0 and (time.time() - gsv_ts <= 30):
+            elif sats_val == 0 and not has_rtcm_sats and (time.time() - gsv_ts > 30):
                 antenna_state = "FAULT"
                 antenna_message = "Không bắt được vệ tinh nào (0 Sats). Vui lòng kiểm tra cáp ăng-ten hoặc nguồn cấp."
 
@@ -4145,21 +4171,10 @@ class AgentManager:
         elapsed = now_time - getattr(self, 'last_savings_calc_time', now_time)
         self.last_savings_calc_time = now_time
 
-        has_aitogy = False
-        sleeping_aitogy_count = 0
-        services = self.config.get('services', {})
-        for i in (1, 2):
-            if services.get(f'server{i}_enabled', False):
-                host = str(services.get(f'server{i}_address', '')).lower()
-                if 'aitogy.com.vn' in host:
-                    has_aitogy = True
-                    is_on_demand = _to_bool(services.get(f'server{i}_stream_on_demand', False), False)
-                    is_active = _to_bool(services.get(f'server{i}_stream_active', True), True)
-                    if is_on_demand and not is_active:
-                        sleeping_aitogy_count += 1
-
-        if sleeping_aitogy_count > 0:
-            saved_bytes = globals().get('rtcm_input_bps', 0) * elapsed * sleeping_aitogy_count
+        is_sleeping = not getattr(self, 'rtcm_stream_active', True)
+        
+        if is_sleeping:
+            saved_bytes = globals().get('rtcm_input_bps', 0) * elapsed
             self.cumulative_saved_bytes += saved_bytes
             
             # Tính toán lượng điện (mWh) tiết kiệm
@@ -4171,7 +4186,7 @@ class AgentManager:
             "total_data_saved_bytes": int(self.cumulative_saved_bytes),
             "total_saved_mwh": round(self.cumulative_saved_mwh, 3),
             "telemetry_bps": getattr(self, 'telemetry_bps', 0),
-            "is_sleeping": sleeping_aitogy_count > 0 if has_aitogy else None
+            "is_sleeping": is_sleeping
         }
         
         return status
