@@ -145,6 +145,10 @@ queue_metrics = {
     "rtcm_dispatch_drops": 0,
     "nmea_dispatch_drops": 0,
     "rtcm_inject_drops": 0,
+    "nmea_mqtt_published": 0,
+    "nmea_mqtt_publish_failures": 0,
+    "nmea_ws_forwarded": 0,
+    "nmea_filtered": 0,
 }
 system_info_cache_lock = threading.Lock()
 system_info_cache = {"timestamp": 0.0, "payload": {}}
@@ -169,6 +173,8 @@ LAST_GSV_AVG_SNR = None
 LAST_GSV_SNR_SAMPLES = 0
 LAST_GSV_TS = 0.0
 LAST_CONFIGURED_OUTPUT_MODE = None
+nmea_rate_limit_counter = 0
+nmea_rate_limit_reset_ts = time.time()
 
 
 def _runtime_serial_baud(agent=None, gnss_reader=None) -> int:
@@ -2654,6 +2660,8 @@ class NMEAPublisher(threading.Thread):
                 
                 data_chunk = self.queue.get(timeout=1.0)
                 should_forward = _should_forward_nmea_to_backend(data_chunk)
+                if not should_forward:
+                    _telemetry_inc("queue", "nmea_filtered")
                 if active_websocket_connection and self.loop and not self.loop.is_closed() and should_forward:
                     try:
                         ws_message = {
@@ -2664,13 +2672,20 @@ class NMEAPublisher(threading.Thread):
                             active_websocket_connection.send(json.dumps(ws_message)),
                             self.loop
                         )
+                        _telemetry_inc("queue", "nmea_ws_forwarded")
                     except Exception as e:
                         logging.debug(f"Failed to send NMEA over websocket: {e}")
 
                 if self.mqtt_client and self.mqtt_client.is_connected() and should_forward:
                     try:
-                        self.mqtt_client.publish(topic, data_chunk, qos=0)
+                        result = self.mqtt_client.publish(topic, data_chunk, qos=0)
+                        if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                            _telemetry_inc("queue", "nmea_mqtt_published")
+                        else:
+                            _telemetry_inc("queue", "nmea_mqtt_publish_failures")
+                            logging.warning(f"Failed to publish NMEA to MQTT: rc={result.rc}")
                     except Exception as e:
+                        _telemetry_inc("queue", "nmea_mqtt_publish_failures")
                         logging.warning(f"Failed to publish NMEA to MQTT: {e}")
 
             except Empty:
