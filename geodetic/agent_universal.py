@@ -3374,9 +3374,14 @@ class GNSSReader(threading.Thread):
             
             # ==================== NMEA DETECTION (IMPROVED) ====================
             elif buffer[0] == ord('$'):
-                end_idx = buffer.find(b'\r\n')
+                line_end = buffer.find(b'\n')
+                if line_end >= 0:
+                    sentence_end = line_end + 1
+                else:
+                    line_end = buffer.find(b'\r')
+                    sentence_end = line_end + 1 if line_end >= 0 else -1
                 
-                if end_idx == -1:
+                if sentence_end == -1:
                     if len(buffer) >= 6:
                         try:
                             sentence_start = buffer[:6].decode('ascii', errors='ignore')
@@ -3409,7 +3414,7 @@ class GNSSReader(threading.Thread):
                         self.nmea_incomplete_waits += 1
                         break
                 
-                sentence = buffer[:end_idx + 2]
+                sentence = buffer[:sentence_end]
                 self.nmea_sentence_seen += 1
                 
                 try:
@@ -3428,7 +3433,7 @@ class GNSSReader(threading.Thread):
                             self.bytes_read += len(packet)
                             self.last_data_time = time.time()
                             
-                            buffer = buffer[end_idx + 2:]
+                            buffer = buffer[sentence_end:]
                             processed = True
                             continue
                         else:
@@ -3438,7 +3443,7 @@ class GNSSReader(threading.Thread):
                             continue
                     else:
                         self.nmea_unimportant_skipped += 1
-                        buffer = buffer[end_idx + 2:]
+                        buffer = buffer[sentence_end:]
                         processed = True
                         continue
                         
