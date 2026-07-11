@@ -2352,7 +2352,26 @@ class RTCMSignalDecoder:
     def get_stats(self, serial: str) -> dict[str, Any]:
         if hasattr(self, '_stats_by_serial'):
             raw = self._stats_by_serial.get(serial, {})
-            return {k: {"interval": v["interval"], "count": v["count"]} for k, v in raw.items()}
+            now = time.time()
+            active = {}
+            stale = []
+            for message_type, stat in raw.items():
+                interval = max(0.0, float(stat.get("interval") or 0.0))
+                # Fast MSM/base messages disappear promptly after reconfigure;
+                # slower ephemeris/descriptor messages retain an adaptive TTL.
+                ttl = max(15.0, min(180.0, interval * 3.0 + 2.0))
+                age = now - float(stat.get("last_seen") or 0.0)
+                if age <= ttl:
+                    active[message_type] = {
+                        "interval": interval,
+                        "count": stat.get("count", 0),
+                        "age": round(max(0.0, age), 1),
+                    }
+                else:
+                    stale.append(message_type)
+            for message_type in stale:
+                raw.pop(message_type, None)
+            return active
         return {}
 
     def decode_sync(self, serial: str, payload: bytes) -> dict[str, Any] | None:
@@ -2694,18 +2713,17 @@ class RTCMPublisherMQTT(threading.Thread):
                 # Note: We do NOT publish raw RTCM bytes to raw_data topic, as the station streams directly to NTRIP.
                 if HAS_RTCM_DECODER and self.decoder:
                     try:
-                        if _base_config_expects_nmea_skyview():
-                            continue
-
-                        # If NMEA GSV already provides skyview data, skip RTCM
-                        # decoding. GGA/GSA-only streams still need RTCM decode
-                        # so the UI can render the skyview.
+                        # Always decode RTCM so rtcm_stats reflects the messages
+                        # currently emitted by the receiver. NMEA availability
+                        # only controls whether RTCM-derived skyview is published.
                         last_gsv_ts = globals().get('LAST_GSV_TS', 0)
-                        if time.time() - last_gsv_ts < 60:
-                            continue
+                        publish_rtcm_skyview = (
+                            not _base_config_expects_nmea_skyview()
+                            and time.time() - last_gsv_ts >= 60
+                        )
 
                         # Try to get base position from agent config or NMEA/UBX if not already received from RTCM 1005/1006
-                        if self.serial_number not in self.decoder._base_positions:
+                        if publish_rtcm_skyview and self.serial_number not in self.decoder._base_positions:
                             ag = globals().get('agent')
                             base_coords = None
                             if ag and hasattr(ag, 'get_base_config'):
@@ -2737,7 +2755,7 @@ class RTCMPublisherMQTT(threading.Thread):
                         
                         # Loop until the buffer is completely drained
                         while parsed is not None:
-                            if parsed.get("satellites"):
+                            if publish_rtcm_skyview and parsed.get("satellites"):
                                 nav_system = "GPS"
                                 for pkt in parsed.get("packets", []):
                                     if "navSystem" in pkt:
