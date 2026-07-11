@@ -1762,9 +1762,12 @@ def dispatch_nmea_data(data):
 
 def _base_config_expects_nmea_skyview() -> bool:
     """
-    In diagnostics modes the receiver is configured to emit NMEA GSV, which is
-    the preferred skyview source. RTCM MSM packets are still forwarded to NTRIP,
-    but should not be republished as calculated skyview on raw_data.
+    Return False only when the UI explicitly configured RTCM-only output.
+
+    RTCM MSM packets are still forwarded to NTRIP in combined modes, but they
+    must not be decoded and republished on raw_data. Defaulting to NMEA here is
+    intentional: an absent/stale config must never make calculated RTCM JSON
+    replace the receiver's GGA/GST/GSV sentences.
     """
     try:
         configured_mode = globals().get("LAST_CONFIGURED_OUTPUT_MODE")
@@ -1774,12 +1777,12 @@ def _base_config_expects_nmea_skyview() -> bool:
         ag = globals().get('agent')
         base_cfg = ag.get_base_config() if ag and hasattr(ag, 'get_base_config') else {}
         if not isinstance(base_cfg, dict) or not base_cfg:
-            return False
+            return True
         gnss_options = base_cfg.get("gnss_options") or {}
-        output_mode = str(gnss_options.get("output_mode") or "diagnostics_rtcm").strip().lower()
+        output_mode = str(gnss_options.get("output_mode") or "").strip().lower()
         return output_mode != "rtcm_only"
     except Exception:
-        return False
+        return True
 
 def _remember_output_mode_from_original_config(data: dict) -> None:
     try:
