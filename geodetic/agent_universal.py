@@ -1,5 +1,5 @@
 #agent_universal.py
-AGENT_VERSION = "V2.0.1"
+AGENT_VERSION = "V2.0.2"
 
 import asyncio
 import gc
@@ -1766,7 +1766,7 @@ def dispatch_nmea_data(data):
                 except (Empty, Full):
                     pass  # Silently skip NMEA on overflow
 
-def _base_config_expects_nmea_skyview() -> bool:
+def _base_config_expects_nmea_skyview(agent_manager=None) -> bool:
     """
     Return False only when the UI explicitly configured RTCM-only output.
 
@@ -1776,17 +1776,20 @@ def _base_config_expects_nmea_skyview() -> bool:
     replace the receiver's GGA/GST/GSV sentences.
     """
     try:
+        # Prefer the persisted agent configuration.  LAST_CONFIGURED_OUTPUT_MODE
+        # is only a runtime cache and is reset whenever the process restarts.
+        ag = agent_manager or globals().get('agent')
+        base_cfg = ag.get_base_config() if ag and hasattr(ag, 'get_base_config') else {}
+        if isinstance(base_cfg, dict) and base_cfg:
+            gnss_options = base_cfg.get("gnss_options") or {}
+            output_mode = str(gnss_options.get("output_mode") or "").strip().lower()
+            if output_mode:
+                return output_mode != "rtcm_only"
+
         configured_mode = globals().get("LAST_CONFIGURED_OUTPUT_MODE")
         if configured_mode:
             return str(configured_mode).strip().lower() != "rtcm_only"
-
-        ag = globals().get('agent')
-        base_cfg = ag.get_base_config() if ag and hasattr(ag, 'get_base_config') else {}
-        if not isinstance(base_cfg, dict) or not base_cfg:
-            return True
-        gnss_options = base_cfg.get("gnss_options") or {}
-        output_mode = str(gnss_options.get("output_mode") or "").strip().lower()
-        return output_mode != "rtcm_only"
+        return True
     except Exception:
         return True
 
@@ -2695,7 +2698,7 @@ class NMEAPublisher(threading.Thread):
 
 
 class RTCMPublisherMQTT(threading.Thread):
-    def __init__(self, mqtt_client, serial_number, loop):
+    def __init__(self, mqtt_client, serial_number, loop, agent_manager=None):
         super().__init__()
         self.daemon = True
         self.name = "RTCMPublisherMQTT"
@@ -2703,6 +2706,7 @@ class RTCMPublisherMQTT(threading.Thread):
         self.mqtt_client = mqtt_client
         self.serial_number = serial_number
         self.loop = loop
+        self.agent_manager = agent_manager
         from queue import Queue
         self.queue = Queue(maxsize=1000)
         self.decoder = RTCMSignalDecoder() if HAS_RTCM_DECODER else None
@@ -2733,13 +2737,13 @@ class RTCMPublisherMQTT(threading.Thread):
                         # only controls whether RTCM-derived skyview is published.
                         last_gsv_ts = globals().get('LAST_GSV_TS', 0)
                         publish_rtcm_skyview = (
-                            not _base_config_expects_nmea_skyview()
+                            not _base_config_expects_nmea_skyview(self.agent_manager)
                             and time.time() - last_gsv_ts >= 60
                         )
 
                         # Try to get base position from agent config or NMEA/UBX if not already received from RTCM 1005/1006
                         if publish_rtcm_skyview and self.serial_number not in self.decoder._base_positions:
-                            ag = globals().get('agent')
+                            ag = self.agent_manager or globals().get('agent')
                             base_coords = None
                             if ag and hasattr(ag, 'get_base_config'):
                                 base_cfg = ag.get_base_config() or {}
@@ -5519,7 +5523,7 @@ async def auto_base_state_machine(agent: AgentManager, gnss_reader: GNSSReader, 
 # === MAIN FUNCTION                                                         ===
 # ==============================================================================
 async def main():
-    global current_state
+    global current_state, agent
     logging.info(f"Agent script path: {os.path.abspath(__file__)}")
     logging.info(f"Parser debug default: enabled={PARSER_DEBUG_ENABLED} interval={PARSER_DEBUG_INTERVAL_SECONDS}s")
     
@@ -5610,7 +5614,7 @@ async def main():
     
     agent.nmea_publisher = NMEAPublisher(mqtt_client, MACHINE_SERIAL, loop)
     agent.nmea_publisher.start()
-    agent.rtcm_mqtt_publisher = RTCMPublisherMQTT(mqtt_client, MACHINE_SERIAL, loop)
+    agent.rtcm_mqtt_publisher = RTCMPublisherMQTT(mqtt_client, MACHINE_SERIAL, loop, agent)
     agent.rtcm_mqtt_publisher.start()
     logging.info("NMEA Publisher thread started.")
     
