@@ -1,5 +1,5 @@
 #agent_universal.py
-AGENT_VERSION = "V2.1.1"
+AGENT_VERSION = "V2.2.2"
 
 import asyncio
 import gc
@@ -5036,7 +5036,14 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
         
         elif command == "DEPLOY_SERVICE_CONFIG":
             agent.update_service_config(payload)
-            agent.restart_services()
+            # Confirm the durable config before restarting workers. A restart
+            # may spend several seconds joining NTRIP threads; the dashboard
+            # should not remain falsely out-of-sync during that transition.
+            current_state = "CONFIGURING"
+            await send_status(agent, mqtt_client)
+            # restart_services performs blocking thread joins. Keep them away
+            # from the asyncio loop so status/ACK traffic remains responsive.
+            await asyncio.to_thread(agent.restart_services)
             current_state = "ONLINE"
             await send_status(agent, mqtt_client)
 
