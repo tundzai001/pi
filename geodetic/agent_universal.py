@@ -1,7 +1,8 @@
 #agent_universal.py
-AGENT_VERSION = "V2.2.2"
+AGENT_VERSION = "V2.2.3"
 
 import asyncio
+import copy
 import gc
 import base64
 import hashlib
@@ -30,233 +31,11 @@ import random
 import unicodedata
 import urllib.parse
 import urllib.request
-from typing import Callable, Mapping
-
+try:
+    from control_plane_failover import ControlPlaneFailover, resolve_effective_stream_switch
+except ImportError:
+    from geodetic.control_plane_failover import ControlPlaneFailover, resolve_effective_stream_switch
 HAS_RTCM_DECODER = True
-
-
-# ==============================================================================
-# === EMBEDDED CONTROL-PLANE FAILOVER (was control_plane_failover.py)        ===
-# ==============================================================================
-# Thread-safe control-plane ACK tracking for the GNSS agent.
-#
-# The MQTT socket being connected only proves that the broker is reachable.  It
-# does not prove that the dashboard backend event loop is still processing
-# agent messages.  This module therefore tracks application-level ACKs for the
-# same status probe over both WebSocket and MQTT.
-
-VALID_CHANNELS = ("websocket", "mqtt")
-
-
-def resolve_effective_stream_switch(
-    *,
-    enabled: bool,
-    on_demand: bool,
-    active: bool,
-    fail_open: bool,
-) -> dict[str, bool]:
-    """Overlay fail-open without changing the configured stream flags."""
-    configured_can_push = bool(enabled and ((not on_demand) or active))
-    fail_open_forced = bool(fail_open and enabled and not configured_can_push)
-    return {
-        "configured_can_push": configured_can_push,
-        "fail_open_forced": fail_open_forced,
-        "can_push": configured_can_push or fail_open_forced,
-    }
-
-
-@dataclass(frozen=True)
-class FailoverTransition:
-    changed: bool
-    active: bool
-    reason: str
-
-
-class ControlPlaneFailover:
-    """Decide when both backend response paths are stale.
-
-    A probe is the agent's regular status packet.  ACKs are accepted only for
-    this process boot and for a recently recorded sequence.  Once fail-open is
-    active, a delayed ACK from before the transition cannot recover the agent.
-    """
-
-    def __init__(
-        self,
-        boot_id: str,
-        *,
-        stale_after_seconds: float = 45.0,
-        recovery_after_seconds: float = 5.0,
-        probe_ttl_seconds: float | None = None,
-        clock: Callable[[], float] = time.monotonic,
-    ) -> None:
-        self.boot_id = str(boot_id)
-        self.stale_after_seconds = max(1.0, float(stale_after_seconds))
-        self.recovery_after_seconds = max(0.0, float(recovery_after_seconds))
-        self.probe_ttl_seconds = max(
-            self.stale_after_seconds,
-            float(probe_ttl_seconds or self.stale_after_seconds * 2.0),
-        )
-        self._clock = clock
-        self._lock = threading.Lock()
-        self._armed_at: float | None = None
-        self._probes: dict[int, float] = {}
-        self._latest_probe_sequence = -1
-        self._last_ack_at: dict[str, float | None] = {
-            "websocket": None,
-            "mqtt": None,
-        }
-        self._last_ack_sequence: dict[str, int | None] = {
-            "websocket": None,
-            "mqtt": None,
-        }
-        self._active = False
-        self._entered_at: float | None = None
-        self._entered_after_sequence = -1
-        self._recovery_since: float | None = None
-        self._last_reason = "waiting_for_first_probe"
-
-    @staticmethod
-    def _coerce_sequence(value: object) -> int | None:
-        try:
-            sequence = int(value)
-        except (TypeError, ValueError):
-            return None
-        return sequence if sequence >= 0 else None
-
-    def record_probe(self, sequence: object, *, now: float | None = None) -> bool:
-        parsed = self._coerce_sequence(sequence)
-        if parsed is None:
-            return False
-        current = self._clock() if now is None else float(now)
-        with self._lock:
-            if self._armed_at is None:
-                self._armed_at = current
-                self._last_reason = "startup_grace"
-            self._probes[parsed] = current
-            self._latest_probe_sequence = max(self._latest_probe_sequence, parsed)
-            cutoff = current - self.probe_ttl_seconds
-            for old_sequence, sent_at in tuple(self._probes.items()):
-                if sent_at < cutoff:
-                    self._probes.pop(old_sequence, None)
-        return True
-
-    def record_ack(
-        self,
-        channel: str,
-        payload: Mapping[str, object] | None,
-        *,
-        retained: bool = False,
-        now: float | None = None,
-    ) -> bool:
-        normalized_channel = str(channel or "").strip().lower()
-        if retained or normalized_channel not in VALID_CHANNELS or not isinstance(payload, Mapping):
-            return False
-        if str(payload.get("status_boot_id") or "") != self.boot_id:
-            return False
-        sequence = self._coerce_sequence(payload.get("status_sequence"))
-        if sequence is None:
-            return False
-
-        current = self._clock() if now is None else float(now)
-        with self._lock:
-            sent_at = self._probes.get(sequence)
-            if sent_at is None or current - sent_at >= self.stale_after_seconds:
-                return False
-            previous_sequence = self._last_ack_sequence[normalized_channel]
-            if previous_sequence is not None and sequence <= previous_sequence:
-                return False
-            # A queued pre-failure ACK must not make a stalled backend look
-            # recovered when its event loop finally drains an old backlog.
-            if self._active and sequence <= self._entered_after_sequence:
-                return False
-            self._last_ack_at[normalized_channel] = current
-            self._last_ack_sequence[normalized_channel] = sequence
-            if self._active and self._recovery_since is None:
-                self._recovery_since = current
-        return True
-
-    def _channel_is_stale(self, channel: str, now: float) -> bool:
-        baseline = self._last_ack_at[channel]
-        if baseline is None:
-            baseline = self._armed_at
-        return baseline is None or (now - baseline) >= self.stale_after_seconds
-
-    def evaluate(self, *, now: float | None = None) -> FailoverTransition:
-        current = self._clock() if now is None else float(now)
-        with self._lock:
-            if self._armed_at is None:
-                return FailoverTransition(False, self._active, "waiting_for_first_probe")
-
-            stale_channels = [
-                channel for channel in VALID_CHANNELS
-                if self._channel_is_stale(channel, current)
-            ]
-            both_stale = len(stale_channels) == len(VALID_CHANNELS)
-
-            if not self._active and both_stale:
-                self._active = True
-                self._entered_at = current
-                self._entered_after_sequence = self._latest_probe_sequence
-                self._recovery_since = None
-                self._last_reason = "websocket_and_mqtt_ack_stale"
-                return FailoverTransition(True, True, self._last_reason)
-
-            if self._active:
-                eligible_recovery_ack = any(
-                    not self._channel_is_stale(channel, current)
-                    and self._last_ack_sequence[channel] is not None
-                    and self._last_ack_sequence[channel] > self._entered_after_sequence
-                    for channel in VALID_CHANNELS
-                )
-                if eligible_recovery_ack:
-                    if self._recovery_since is None:
-                        self._recovery_since = current
-                    if current - self._recovery_since >= self.recovery_after_seconds:
-                        self._active = False
-                        self._entered_at = None
-                        self._recovery_since = None
-                        self._last_reason = "fresh_backend_ack_received"
-                        return FailoverTransition(True, False, self._last_reason)
-                    self._last_reason = "recovery_confirmation"
-                else:
-                    self._recovery_since = None
-                    self._last_reason = "websocket_and_mqtt_ack_stale"
-            else:
-                self._last_reason = (
-                    "control_plane_healthy" if not stale_channels
-                    else f"degraded_{stale_channels[0]}_ack_stale"
-                )
-
-            return FailoverTransition(False, self._active, self._last_reason)
-
-    @property
-    def active(self) -> bool:
-        with self._lock:
-            return self._active
-
-    def snapshot(self, *, now: float | None = None) -> dict:
-        current = self._clock() if now is None else float(now)
-        with self._lock:
-            def age(channel: str) -> float | None:
-                ack_at = self._last_ack_at[channel]
-                return None if ack_at is None else round(max(0.0, current - ack_at), 1)
-
-            return {
-                "active": self._active,
-                "reason": self._last_reason,
-                "stale_after_seconds": self.stale_after_seconds,
-                "recovery_after_seconds": self.recovery_after_seconds,
-                "armed": self._armed_at is not None,
-                "entered_at_monotonic": self._entered_at,
-                "latest_probe_sequence": self._latest_probe_sequence,
-                "last_ack_sequence": dict(self._last_ack_sequence),
-                "ack_age_seconds": {
-                    "websocket": age("websocket"),
-                    "mqtt": age("mqtt"),
-                },
-            }
-
-# === END EMBEDDED CONTROL-PLANE FAILOVER ===
 
 
 
@@ -4730,6 +4509,20 @@ def _validate_command_payload(command: str, payload: dict, data: dict, agent: Ag
         return False, "missing payload.active"
     if command == "APPLY_VN2000_PROVINCE" and not str(payload.get("province_code") or "").strip():
         return False, "missing payload.province_code"
+    if command == "TRIGGER_AUTO_BASE":
+        required_fields = ("ip", "port", "user", "password", "mountpoint")
+        if any(not str(payload.get(key) or "").strip() for key in required_fields if key != "password"):
+            return False, "missing CORS connection fields"
+        if not str(payload.get("password") or ""):
+            return False, "missing CORS connection fields"
+        try:
+            port = int(payload.get("port"))
+        except (TypeError, ValueError):
+            return False, "invalid CORS port"
+        if not 1 <= port <= 65535:
+            return False, "invalid CORS port"
+        if any(char in "\r\n" for char in "".join(str(payload.get(key) or "") for key in required_fields)):
+            return False, "invalid CORS connection fields"
     if command == "EXECUTE_RAW_COMMANDS":
         commands_b64 = payload.get("commands_b64")
         if not isinstance(commands_b64, list) or not commands_b64:
@@ -4752,6 +4545,7 @@ def _validate_command_payload(command: str, payload: dict, data: dict, agent: Ag
         "PROVISION_DEVICE",
         "DEPLOY_LICENSE",
         "TRIGGER_AUTO_BASE",
+        "TRIGGER_BASE_REFERENCE_CHECK",
         "STOP_AUTO_BASE",
         "APPLY_VN2000_PROVINCE",
         "EXECUTE_RAW_COMMANDS",
@@ -4819,6 +4613,7 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
         "PROVISION_DEVICE",
         "DEPLOY_LICENSE",
         "TRIGGER_AUTO_BASE",
+        "TRIGGER_BASE_REFERENCE_CHECK",
         "APPLY_VN2000_PROVINCE",
     ]
     
@@ -4851,16 +4646,14 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
         elif command == "TRIGGER_AUTO_BASE":
             logging.info("Received TRIGGER_AUTO_BASE command. Configuring and starting state machine...")
             auto_setup_metadata = payload
-            raw_mp = auto_setup_metadata.get("mountpoint", "VRS.105M3")
-            if raw_mp == "VRS":
-                raw_mp = "VRS.105M3" # Force fallback if backend sent stale 'VRS'
+            raw_mp = str(auto_setup_metadata.get("mountpoint") or "").strip()
                 
             agent.config['auto_base_setup'] = {
                 "enabled": True,
-                "ip": auto_setup_metadata.get("ip", "14.238.1.125"),
-                "port": auto_setup_metadata.get("port", 2101),
-                "user": auto_setup_metadata.get("user", ""),
-                "password": auto_setup_metadata.get("password", ""),
+                "ip": str(auto_setup_metadata.get("ip") or "").strip(),
+                "port": int(auto_setup_metadata.get("port")),
+                "user": str(auto_setup_metadata.get("user") or "").strip(),
+                "password": str(auto_setup_metadata.get("password") or ""),
                 "mountpoint": raw_mp,
                 "timeout": auto_setup_metadata.get("timeout", 3600),
                 "samples": auto_setup_metadata.get("samples", 60),
@@ -4887,6 +4680,59 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
             
             # Start the state machine as a background task
             active_auto_base_task = asyncio.create_task(auto_base_state_machine(agent, gnss_reader, mqtt_client))
+
+        elif command == "TRIGGER_BASE_REFERENCE_CHECK":
+            logging.info("Received TRIGGER_BASE_REFERENCE_CHECK command.")
+            reference = payload.get("reference_coords") or {}
+            try:
+                reference = {
+                    "lat": float(reference["lat"]),
+                    "lon": float(reference["lon"]),
+                    "alt": float(reference["alt"]),
+                }
+            except (KeyError, TypeError, ValueError):
+                raise ValueError("reference_coords must contain valid lat, lon, alt")
+            if not (-90.0 <= reference["lat"] <= 90.0 and -180.0 <= reference["lon"] <= 180.0):
+                raise ValueError("reference_coords is out of range")
+            original_base_config = copy.deepcopy(agent.get_base_config() or {})
+            original_coords = original_base_config.get("coords") or original_base_config
+            try:
+                restore_coords = {
+                    "lat": float(original_coords["lat"]),
+                    "lon": float(original_coords["lon"]),
+                    "alt": float(original_coords["alt"]),
+                }
+            except (KeyError, TypeError, ValueError):
+                raise ValueError("stored base coordinate is missing; refusing reference check")
+            if not (-90.0 <= restore_coords["lat"] <= 90.0 and -180.0 <= restore_coords["lon"] <= 180.0):
+                raise ValueError("stored base coordinate is out of range")
+
+            if active_auto_base_task and not active_auto_base_task.done():
+                raise RuntimeError("an automatic base task is already running")
+            reference_check_cfg = {
+                "ip": str(payload.get("ip") or "").strip(),
+                "port": int(payload.get("port") or 0),
+                "user": str(payload.get("user") or ""),
+                "password": str(payload.get("password") or ""),
+                "mountpoint": str(payload.get("mountpoint") or "").strip(),
+                "timeout": int(payload.get("timeout") or 300),
+                "samples": int(payload.get("samples") or 60),
+                "reference_coords": reference,
+                "restore_coords": restore_coords,
+                "original_base_config": original_base_config,
+            }
+            if not reference_check_cfg["ip"] or not reference_check_cfg["mountpoint"] or not reference_check_cfg["user"] or not reference_check_cfg["password"]:
+                raise ValueError("NTRIP host, credentials, and mountpoint are required")
+            agent.config["pending_base_restore"] = {
+                "coords": restore_coords,
+                "base_config": original_base_config,
+            }
+            agent.save_config()
+            _set_auto_base_progress("reference_check_queued", step=0, total_steps=4)
+            await send_status(agent, mqtt_client)
+            active_auto_base_task = asyncio.create_task(
+                base_reference_check_state_machine(agent, gnss_reader, mqtt_client, reference_check_cfg)
+            )
 
         elif command == "STOP_AUTO_BASE":
             logging.info("Received STOP_AUTO_BASE command")
@@ -5036,14 +4882,7 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
         
         elif command == "DEPLOY_SERVICE_CONFIG":
             agent.update_service_config(payload)
-            # Confirm the durable config before restarting workers. A restart
-            # may spend several seconds joining NTRIP threads; the dashboard
-            # should not remain falsely out-of-sync during that transition.
-            current_state = "CONFIGURING"
-            await send_status(agent, mqtt_client)
-            # restart_services performs blocking thread joins. Keep them away
-            # from the asyncio loop so status/ACK traffic remains responsive.
-            await asyncio.to_thread(agent.restart_services)
+            agent.restart_services()
             current_state = "ONLINE"
             await send_status(agent, mqtt_client)
 
@@ -5496,6 +5335,136 @@ async def _apply_base_mode_to_chip(chip_type: str, port: str, lat: float, lon: f
             await asyncio.sleep(2.0)
             gnss_reader.resume()
 
+async def _apply_rover_mode_to_chip(chip_type: str, port: str, gnss_reader: GNSSReader):
+    if not port:
+        raise RuntimeError("No GNSS port")
+    if chip_type != "Ublox":
+        raise RuntimeError(f"Unsupported chip type: {chip_type}")
+    if gnss_reader:
+        gnss_reader.pause()
+        await asyncio.sleep(1.0)
+    try:
+        baud = _runtime_serial_baud(gnss_reader=gnss_reader)
+        with serial_port_lock, serial.Serial(port, baud, timeout=2) as ser:
+            msg = bytearray(b'\xb5\x62\x06\x71\x28\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')
+            ck_a = ck_b = 0
+            for index in range(2, 46):
+                ck_a = (ck_a + msg[index]) & 0xFF
+                ck_b = (ck_b + ck_a) & 0xFF
+            msg[46], msg[47] = ck_a, ck_b
+            ser.write(msg)
+            ser.write(b'\xb5\x62\x06\x09\x0d\x00\x00\x00\x00\x00\xff\xff\x00\x00\x00\x00\x00\x00\x03\x1d\xab')
+            ser.flush()
+    finally:
+        if gnss_reader:
+            await asyncio.sleep(2.0)
+            gnss_reader.resume()
+
+async def base_reference_check_state_machine(agent: AgentManager, gnss_reader: GNSSReader, mqtt_client: mqtt.Client, cfg: dict):
+    global current_state, active_auto_base_client, rtcm_stream_active_flag
+    reference = cfg["reference_coords"]
+    restore = cfg["restore_coords"]
+    port = agent.detected_chip.get("port")
+    temp_client = None
+    saved_rtcm_flag = rtcm_stream_active_flag
+    result = None
+    failure = None
+    try:
+        current_state = "REFERENCE_CHECK_ROVER"
+        _set_auto_base_progress("reference_check_set_rover", step=1, total_steps=4)
+        await send_status(agent, mqtt_client)
+        await _apply_rover_mode_to_chip("Ublox", port, gnss_reader)
+        temp_client = NTRIPClientWorker({
+            "rtcmserver1": cfg["ip"], "rtcmport1": str(cfg["port"]),
+            "rtcmusername1": cfg["user"], "rtcmpassword1": cfg["password"],
+            "rtcmmountpoint1": cfg["mountpoint"], "reconnectioninterval": 5,
+        }, agent.log)
+        active_auto_base_client = temp_client
+        rtcm_stream_active_flag = True
+        if gnss_reader:
+            with subscriber_lock:
+                if gnss_reader.rtcm_inject_queue not in rtcm_subscribers:
+                    rtcm_subscribers.append(gnss_reader.rtcm_inject_queue)
+        temp_client.start()
+        current_state = "REFERENCE_CHECK_WAIT_FIX"
+        deadline = time.time() + cfg["timeout"]
+        while globals().get("LAST_GGA_FIX_STATUS") != "RTK_FIXED":
+            if time.time() >= deadline:
+                raise TimeoutError("RTK FIX timeout")
+            _set_auto_base_progress("reference_check_wait_fix", step=2, total_steps=4, fix_status=globals().get("LAST_GGA_FIX_STATUS"))
+            await asyncio.sleep(1)
+        current_state = "REFERENCE_CHECK_AVERAGING"
+        coords = []
+        while len(coords) < cfg["samples"]:
+            await asyncio.sleep(1)
+            coord = globals().get("LAST_GGA_COORD")
+            if globals().get("LAST_GGA_FIX_STATUS") == "RTK_FIXED" and coord and len(coord) >= 3:
+                coords.append(tuple(float(value) for value in coord[:3]))
+            _set_auto_base_progress("reference_check_averaging", step=3, total_steps=4, samples_collected=len(coords), samples_target=cfg["samples"])
+        measured = {"lat": _plain_mean([value[0] for value in coords]), "lon": _plain_mean([value[1] for value in coords]), "alt": _plain_mean([value[2] for value in coords])}
+        mean_lat = math.radians((measured["lat"] + reference["lat"]) / 2.0)
+        result = {
+            "reference_coord": reference,
+            "measured_coord": measured,
+            "delta_n_m": math.radians(measured["lat"] - reference["lat"]) * 6378137.0,
+            "delta_e_m": math.radians(measured["lon"] - reference["lon"]) * 6378137.0 * math.cos(mean_lat),
+            "delta_u_m": measured["alt"] - reference["alt"],
+            "sample_count": len(coords),
+        }
+    except asyncio.CancelledError:
+        failure = "cancelled by user"
+        raise
+    except Exception as exc:
+        failure = str(exc)
+        logging.exception("Base reference check failed")
+    finally:
+        if temp_client:
+            temp_client.stop()
+            temp_client.join(timeout=5)
+        active_auto_base_client = None
+        _cleanup_inject_queue(gnss_reader)
+        rtcm_stream_active_flag = saved_rtcm_flag
+        restore_error = None
+        try:
+            current_state = "REFERENCE_CHECK_RESTORE_BASE"
+            _set_auto_base_progress("reference_check_restore_base", step=4, total_steps=4, result=result, failure=failure)
+            await _apply_base_mode_to_chip("Ublox", port, restore["lat"], restore["lon"], restore["alt"], gnss_reader)
+            agent.config["base_config"] = cfg["original_base_config"]
+            agent.config.pop("pending_base_restore", None)
+            agent.save_config()
+        except Exception as exc:
+            restore_error = str(exc)
+            logging.exception("Base reference check could not restore base mode")
+        current_state = "ONLINE"
+        _set_auto_base_progress(
+            "reference_check_completed" if result and not restore_error else "reference_check_failed",
+            step=4,
+            total_steps=4,
+            result=result,
+            failure=failure or restore_error,
+            base_restored=restore_error is None,
+        )
+        await send_status(agent, mqtt_client)
+
+async def restore_pending_base_if_needed(agent: AgentManager, gnss_reader: GNSSReader):
+    pending = agent.config.get("pending_base_restore")
+    if not isinstance(pending, dict):
+        return
+    coords = pending.get("coords") or {}
+    try:
+        lat, lon, alt = float(coords["lat"]), float(coords["lon"]), float(coords["alt"])
+    except (KeyError, TypeError, ValueError):
+        logging.error("Pending base restore has invalid coordinates; leaving recovery marker in place")
+        return
+    try:
+        await _apply_base_mode_to_chip("Ublox", agent.detected_chip.get("port"), lat, lon, alt, gnss_reader)
+        agent.config["base_config"] = pending.get("base_config") or agent.get_base_config()
+        agent.config.pop("pending_base_restore", None)
+        agent.save_config()
+        logging.warning("Recovered pending base mode from interrupted reference check")
+    except Exception:
+        logging.exception("Could not recover pending base mode; will retry after next restart")
+
 async def auto_base_state_machine(agent: AgentManager, gnss_reader: GNSSReader, mqtt_client: mqtt.Client):
     global current_state, LAST_GGA_COORD
     
@@ -5569,11 +5538,11 @@ async def auto_base_state_machine(agent: AgentManager, gnss_reader: GNSSReader, 
             gnss_reader.resume()
             
     # Start temporary NTRIP client to get RTCM
-    ntrip_host = cfg.get("ip", "14.238.1.125")
-    ntrip_port = str(cfg.get("port", "2101"))
-    ntrip_user = cfg.get("user", "")
-    ntrip_pass = cfg.get("password", "")
-    ntrip_mount = cfg.get("mountpoint", "VRS.105M3")
+    ntrip_host = str(cfg.get("ip") or "").strip()
+    ntrip_port = str(cfg.get("port") or "")
+    ntrip_user = str(cfg.get("user") or "").strip()
+    ntrip_pass = str(cfg.get("password") or "")
+    ntrip_mount = str(cfg.get("mountpoint") or "").strip()
     
     temp_cfg = {
         'rtcmserver1': ntrip_host,
@@ -5981,6 +5950,7 @@ async def main():
     else:
         logging.error("No valid GNSS port detected - reader not started")
     mqtt_client = setup_mqtt_client(loop, agent, gnss_reader)
+    await restore_pending_base_if_needed(agent, gnss_reader)
     
     agent.nmea_publisher = NMEAPublisher(mqtt_client, MACHINE_SERIAL, loop)
     agent.nmea_publisher.start()
