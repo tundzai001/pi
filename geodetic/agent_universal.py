@@ -1,5 +1,5 @@
 #agent_universal.py
-AGENT_VERSION = "V2.2.3"
+AGENT_VERSION = "V2.2.4"
 
 import asyncio
 import copy
@@ -335,6 +335,7 @@ active_websocket_connection = None
 control_plane_fail_open_event = threading.Event()
 is_remotely_locked = False 
 initialization_complete = asyncio.Event()
+remote_unlock_event = asyncio.Event()
 last_command_result = {}
 transport_status = {
     "mqtt_connected": False,
@@ -4794,13 +4795,16 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
         return
     
     if command == "UNLOCK_DEVICE":
-        if remove_remote_lock():
+        unlocked = remove_remote_lock()
+        if unlocked:
             logging.info(" DEVICE UNLOCKED")
             _record_command_result(command, source, "success", "device unlocked", command_id)
         else:
             logging.error("!!! Failed to remove remote lock file.")
             _record_command_result(command, source, "error", "failed to remove remote lock", command_id)
         await send_status(agent, mqtt_client)
+        if unlocked and current_state == "LOCKED":
+            remote_unlock_event.set()
         return
     
     if is_remote_locked():
@@ -6065,7 +6069,7 @@ async def auto_base_state_machine(agent: AgentManager, gnss_reader: GNSSReader, 
 # === MAIN FUNCTION                                                         ===
 # ==============================================================================
 async def main():
-    global current_state, agent
+    global current_state, agent, MACHINE_SERIAL
     logging.info(f"Agent script path: {os.path.abspath(__file__)}")
     logging.info(f"Parser debug default: enabled={PARSER_DEBUG_ENABLED} interval={PARSER_DEBUG_INTERVAL_SECONDS}s")
     
@@ -6085,21 +6089,34 @@ async def main():
     if is_remote_locked():
         current_state = "LOCKED"
         logging.warning("Device is remotely locked. Running in restricted mode.")
-        
-        agent = AgentManager(get_machine_serial())
+        MACHINE_SERIAL = get_machine_serial()
+        remote_unlock_event.clear()
+
+        agent = AgentManager(MACHINE_SERIAL)
         mqtt_client = setup_mqtt_client(loop, agent, None)
         
         initialization_complete.set()
-        
+
+        status_task = asyncio.create_task(status_publisher_task(agent, mqtt_client))
+        ws_task = asyncio.create_task(websocket_task(agent, None, mqtt_client))
+        unlock_task = asyncio.create_task(remote_unlock_event.wait())
         try:
-            await asyncio.gather(
-                status_publisher_task(agent, mqtt_client),
-                websocket_task(agent, None, mqtt_client)
+            done, _ = await asyncio.wait(
+                {status_task, ws_task, unlock_task},
+                return_when=asyncio.FIRST_COMPLETED,
             )
+            for task in done - {unlock_task}:
+                task.result()
+            if unlock_task not in done:
+                raise RuntimeError("Restricted agent control task stopped before unlock")
         finally:
-            if mqtt_client: mqtt_client.loop_stop(); mqtt_client.disconnect()
-            remove_lock_file()
-        return
+            for task in (status_task, ws_task, unlock_task):
+                task.cancel()
+            await asyncio.gather(status_task, ws_task, unlock_task, return_exceptions=True)
+            if mqtt_client:
+                mqtt_client.loop_stop()
+                mqtt_client.disconnect()
+        logging.info("Remote lock cleared. Continuing normal agent startup.")
     
     # ========== License Check ==========
     if not license_is_valid():
