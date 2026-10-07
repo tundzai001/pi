@@ -1,14 +1,16 @@
 #agent_universal.py
-AGENT_VERSION = "V2.2.4"
+AGENT_VERSION = "V2.2.5"
 
 import asyncio
 import copy
 import gc
 import base64
+from collections import OrderedDict
 import hashlib
 import json
 import logging
 import os
+import re
 import socket
 import sys
 import threading
@@ -304,6 +306,10 @@ DEFAULT_MQTT_USERNAME = "mqttUser"
 DEFAULT_MQTT_PASSWORD = "MqttPassword123$%^"
 
 BACKEND_HOST = DEFAULT_BACKEND_HOST
+BACKEND_WS_HOST = os.getenv("BACKEND_WS_HOST", "cors.aitogy.com").strip()
+BACKEND_WS_SCHEME = os.getenv("BACKEND_WS_SCHEME", "wss").strip().lower()
+BACKEND_WS_PORT = int(os.getenv("BACKEND_WS_PORT", "443" if BACKEND_WS_SCHEME == "wss" else "8000"))
+ALLOW_INSECURE_AGENT_WS = os.getenv("ALLOW_INSECURE_AGENT_WS", "false").strip().lower() in {"1", "true", "yes"}
 MQTT_BROKER = DEFAULT_MQTT_BROKER
 MQTT_PORT = DEFAULT_MQTT_PORT
 MQTT_USERNAME = DEFAULT_MQTT_USERNAME
@@ -337,6 +343,7 @@ is_remotely_locked = False
 initialization_complete = asyncio.Event()
 remote_unlock_event = asyncio.Event()
 last_command_result = {}
+seen_command_ids = OrderedDict()
 transport_status = {
     "mqtt_connected": False,
     "websocket_connected": False,
@@ -1055,6 +1062,14 @@ def get_machine_serial():
 
     return final_serial
 
+def is_valid_license_key(key: str, serial: str) -> bool:
+    if re.fullmatch(r"dt_[A-Za-z0-9_-]{40,64}", key):
+        return True
+    # Keep existing serial-bound licenses valid during a mixed-version rollout.
+    expected = get_license_code_from_string(generate_pi_license_base(serial))
+    return bool(key and key.isascii() and key.isdecimal() and key == expected)
+
+
 def license_is_valid():
     global MACHINE_SERIAL
     MACHINE_SERIAL = get_machine_serial()
@@ -1065,9 +1080,7 @@ def license_is_valid():
             saved_key = f.read().strip()
     except Exception:
         return False
-    expected_base = generate_pi_license_base(MACHINE_SERIAL)
-    expected_key = get_license_code_from_string(expected_base)
-    return saved_key == expected_key
+    return is_valid_license_key(saved_key, MACHINE_SERIAL)
 
 def cleanup_lock_file():
     if not os.path.exists(LOCK_FILE_PATH): return True
@@ -1218,6 +1231,21 @@ def get_license_fingerprint() -> str | None:
         return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
     except Exception:
         return None
+
+
+def _status_safe_config(value):
+    """Remove reusable credentials from retained/live status telemetry."""
+    if isinstance(value, dict):
+        safe = {}
+        for key, item in value.items():
+            normalized = str(key).strip().lower().replace("-", "_")
+            if any(marker in normalized for marker in ("password", "passwd", "secret", "token")) or normalized.endswith(("_pass", "pass")):
+                continue
+            safe[key] = _status_safe_config(item)
+        return safe
+    if isinstance(value, list):
+        return [_status_safe_config(item) for item in value]
+    return value
     
 def parse_gga_data(gga_sentence: str) -> tuple:
     """
@@ -3319,12 +3347,23 @@ class NTRIPClientWorker(threading.Thread):
                 
                 client_socket.sendall(headers.encode('ascii'))
                 
-                response_header = b""
+                response_header = bytearray()
+                header_deadline = time.monotonic() + 15.0
                 while b"\r\n\r\n" not in response_header:
-                    response_header += client_socket.recv(1)
+                    if len(response_header) >= 16 * 1024:
+                        raise ConnectionError("Caster response headers exceed the 16 KiB limit")
+                    remaining = header_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("Caster response headers timed out")
+                    client_socket.settimeout(min(remaining, 2.0))
+                    byte = client_socket.recv(1)
+                    if not byte:
+                        raise ConnectionError("Caster closed connection before response headers completed")
+                    response_header.extend(byte)
                 
                 if not (b"ICY 200 OK" in response_header or b"HTTP/1.1 200 OK" in response_header):
-                    raise ConnectionError(f"Caster rejected: {response_header.decode(errors='ignore')}")
+                    status_line = bytes(response_header).split(b"\r\n", 1)[0].decode(errors="ignore")[:200]
+                    raise ConnectionError(f"Caster rejected request: {status_line}")
 
                 self.log("INFO", "[RTCM Client] Authenticated. Receiving correction data.")
                 
@@ -4325,7 +4364,7 @@ class AgentManager:
             "detected_chip_baud": self.detected_chip.get("baud"),
             "is_provisioned": self.config.get('is_provisioned', False),
             "base_config": self.get_base_config(),
-            "service_config": self.get_service_config(),
+            "service_config": _status_safe_config(self.get_service_config()),
             "auto_base_progress": globals().get("AUTO_BASE_PROGRESS", {}),
             "is_locked": is_remote_locked(),
             "is_synced": True
@@ -4653,7 +4692,7 @@ async def send_status(agent: AgentManager, mqtt_client: mqtt.Client):
         system_info = get_cached_system_info()
         if system_info:
             status_payload['system_info'] = system_info
-            logging.debug(f"System info collected: CPU={system_info.get('cpu', {}).get('usage_percent')}%, Temp={system_info.get('temperature', {}).get('celsius')}°C")
+            logging.debug(f"System info collected: CPU={system_info.get('cpu', {}).get('usage_percent')}%, Temp={system_info.get('temperature', {}).get('celsius')} C")
     except Exception as e:
         logging.error(f"Failed to collect system info: {e}")
 
@@ -4687,9 +4726,21 @@ async def send_status(agent: AgentManager, mqtt_client: mqtt.Client):
     if mqtt_client and mqtt_client.is_connected():
         try:
             topic = f"pi/devices/{MACHINE_SERIAL}/status"
-            mqtt_client.publish(topic, json_payload, qos=1, retain=True)
+            publish_info = mqtt_client.publish(topic, json_payload, qos=1, retain=True)
+            if publish_info.rc != mqtt.MQTT_ERR_SUCCESS:
+                raise RuntimeError(f"MQTT status publish returned rc={publish_info.rc}")
+            await asyncio.to_thread(publish_info.wait_for_publish, timeout=3.0)
+            if not publish_info.is_published():
+                raise TimeoutError("MQTT status publish not acknowledged within 3s")
+            now_monotonic = time.monotonic()
+            if now_monotonic - getattr(agent, '_last_status_publish_log', float('-inf')) >= 60:
+                logging.info(
+                    "MQTT status acknowledged: topic=%s status=%s sequence=%s boot=%s broker=%s",
+                    topic, status_payload.get('status'), status_payload['status_sequence'],
+                    STATUS_BOOT_ID, transport_status.get('mqtt_broker'),
+                )
+                agent._last_status_publish_log = now_monotonic
         except Exception as e:
-            _set_transport_state("mqtt", False)
             logging.warning(f"MQTT publish failed: {e}")
 
 # ==============================================================================
@@ -4773,7 +4824,42 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
     payload = data.get("payload", {})
     if payload is None:
         payload = {}
-    command_id = data.get("command_id") or (payload.get("command_id") if isinstance(payload, dict) else None) or str(uuid.uuid4())
+    if not isinstance(payload, dict):
+        _record_command_result(str(command or "UNKNOWN"), source, "rejected", "command payload must be an object")
+        await send_status(agent, mqtt_client)
+        return
+    command_id = str(data.get("command_id") or "")
+    now = int(time.time())
+    try:
+        issued_at = int(data.get("issued_at"))
+        expires_at = int(data.get("expires_at"))
+    except (TypeError, ValueError):
+        issued_at = expires_at = 0
+    if (
+        not re.fullmatch(r"[A-Za-z0-9_-]{16,100}", command_id)
+        or issued_at > now + 60
+        or issued_at < now - 300
+        or expires_at < now
+        or expires_at > issued_at + 300
+    ):
+        _record_command_result(command, source, "rejected", "missing or expired command envelope", command_id or None)
+        logging.warning(
+            "Rejected command freshness from %s: id_valid=%s issued_at=%s expires_at=%s now=%s",
+            source.upper(), bool(re.fullmatch(r"[A-Za-z0-9_-]{16,100}", command_id)),
+            issued_at, expires_at, now,
+        )
+        await send_status(agent, mqtt_client)
+        return
+    if command_id in seen_command_ids:
+        _record_command_result(command, source, "rejected", "replayed command id", command_id)
+        await send_status(agent, mqtt_client)
+        return
+    seen_command_ids[command_id] = expires_at
+    while len(seen_command_ids) > 2048:
+        seen_command_ids.popitem(last=False)
+    for old_id, old_expiry in list(seen_command_ids.items()):
+        if old_expiry < now:
+            seen_command_ids.pop(old_id, None)
     logging.info(f"Received command '{command}' from {source.upper()}")
 
     is_valid, validation_error = _validate_command_payload(command, payload, data, agent, gnss_reader)
@@ -4836,13 +4922,18 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
     try:
         if command == "PROVISION_DEVICE":
             if agent.update_name(payload.get("name")):
-                current_state = "ONLINE"
-                agent.restart_services()
+                current_state = "ONLINE" if license_is_valid() else "AWAITING_LICENSE"
+                if current_state == "ONLINE":
+                    agent.restart_services()
         
         elif command == "DEPLOY_LICENSE":
             if payload.get("license_key"):
-                with open(LICENSE_PATH, "w") as f:
-                    f.write(payload["license_key"])
+                license_key = str(payload["license_key"]).strip()
+                if not is_valid_license_key(license_key, MACHINE_SERIAL):
+                    raise ValueError("Invalid device token format")
+                fd = os.open(LICENSE_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w") as f:
+                    f.write(license_key)
                 current_state = "REBOOTING"
                 _record_command_result(command, source, "success", "license deployed; rebooting", command_id)
                 await send_status(agent, mqtt_client)
@@ -5083,7 +5174,7 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
                         await asyncio.sleep(2.0)  # Wait for chip to stabilize
                         gnss_reader.resume()
                     current_state = "ONLINE"
-                    logging.info("✓ Base config applied successfully")
+                    logging.info("Base config applied successfully")
 
                     await send_status(agent, mqtt_client)
         
@@ -5155,7 +5246,7 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
             remove_lock_file()
             
             # Restart tiến trình (process) thay vì khởi động lại OS
-            logging.info("[REBOOT] Đang khởi động lại tiến trình Agent...")
+            logging.info("[REBOOT] Restarting Agent process...")
             sys.exit(0)
             
         elif command == "DELETE_DEVICE":
@@ -5180,7 +5271,7 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
             await asyncio.sleep(2)
             remove_lock_file()
             
-            logging.info("[REBOOT_FOR_RESET] Đang khởi động lại tiến trình Agent...")
+            logging.info("[REBOOT_FOR_RESET] Restarting Agent process...")
             sys.exit(0)
         
         elif command == "CHECK_BASE_STATUS":
@@ -5274,6 +5365,8 @@ def setup_mqtt_client(loop: asyncio.AbstractEventLoop, agent: AgentManager, gnss
                     retained=bool(getattr(msg, "retain", False)),
                 )
                 return
+            if msg.topic not in command_topics or bool(getattr(msg, "retain", False)):
+                return
             logging.info(f"MQTT command received topic='{msg.topic}' bytes={len(msg.payload)}")
             future = asyncio.run_coroutine_threadsafe(
                 process_command('mqtt', data, userdata["agent"], userdata["gnss_reader"], c),
@@ -5326,10 +5419,15 @@ async def websocket_task(agent: AgentManager, gnss_reader: GNSSReader, mqtt_clie
         except Exception as e:
             logging.error(f"Error reading license key: {e}")
             
-    if auth_token:
-        ws_uri = f"ws://{BACKEND_HOST}:8000/ws/pi/{MACHINE_SERIAL}?token={urllib.parse.quote(auth_token, safe='')}"
-    else:
-        ws_uri = f"ws://{BACKEND_HOST}:8000/ws/pi/{MACHINE_SERIAL}"
+    if BACKEND_WS_SCHEME not in {"ws", "wss"}:
+        raise ValueError("BACKEND_WS_SCHEME must be ws or wss")
+    if BACKEND_WS_SCHEME == "ws" and not ALLOW_INSECURE_AGENT_WS:
+        raise ValueError("Plaintext device WebSocket requires ALLOW_INSECURE_AGENT_WS=true")
+    safe_uri = (
+        f"{BACKEND_WS_SCHEME}://{BACKEND_WS_HOST}:{BACKEND_WS_PORT}"
+        f"/ws/pi/{urllib.parse.quote(MACHINE_SERIAL, safe='')}"
+    )
+    ws_uri = f"{safe_uri}?token={urllib.parse.quote(auth_token, safe='')}" if auth_token else safe_uri
     
     while True:
         try:
@@ -5340,7 +5438,7 @@ async def websocket_task(agent: AgentManager, gnss_reader: GNSSReader, mqtt_clie
                 close_timeout=10,
                 open_timeout=30  
             ) as websocket:
-                logging.info(f"Secondary channel (WebSocket) connected: {ws_uri}")
+                logging.info(f"Secondary channel (WebSocket) connected: {safe_uri}")
                 active_websocket_connection = websocket
                 _set_transport_state("websocket", True)
                 
@@ -5361,13 +5459,19 @@ async def websocket_task(agent: AgentManager, gnss_reader: GNSSReader, mqtt_clie
             logging.warning("WebSocket connection timeout. Retrying in 10s...")
         except websockets.exceptions.WebSocketException as e:
             _telemetry_inc("reconnect", "websocket")
-            logging.warning(f"WebSocket error: {e}. Retrying in 10s...")
+            logging.warning("WebSocket error (%s). Retrying in 10s...", type(e).__name__)
         except Exception as e:
             _telemetry_inc("reconnect", "websocket")
+            if type(e).__name__ == "SSLCertVerificationError":
+                logging.warning(
+                    "WebSocket certificate verification failed: host=%s code=%s reason=%s",
+                    globals().get('BACKEND_WS_HOST', BACKEND_HOST), getattr(e, 'verify_code', None),
+                    str(getattr(e, 'verify_message', 'unknown')).encode('ascii', 'backslashreplace').decode('ascii'),
+                )
             if mqtt_client and mqtt_client.is_connected():
-                logging.info(f"Secondary channel (WebSocket) failed. Main MQTT OK. Retry in 10s. Error: {e}")
+                logging.info("Secondary WebSocket failed (%s). Main MQTT OK; retrying in 10s.", type(e).__name__)
             else:
-                logging.warning(f"WARNING: Both MQTT and WebSocket failed. Retry in 10s. Error: {e}")
+                logging.warning("Both MQTT and WebSocket failed (%s); retrying in 10s.", type(e).__name__)
         finally:
             active_websocket_connection = None
             _set_transport_state("websocket", False)
