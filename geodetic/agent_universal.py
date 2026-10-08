@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import socket
+import select
 import sys
 import threading
 import time
@@ -3140,6 +3141,15 @@ class NTRIPServerWorker(threading.Thread):
             if self.queue in rtcm_subscribers:
                 rtcm_subscribers.remove(self.queue)
     
+    def _can_push_rtcm(self):
+        switches = _get_server_stream_switches(self.config, self.server_id, apply_fail_open=True)
+        selected = str(self.config.get('active_mountpoint') or '').strip().lower()
+        own_mountpoint = str(self.config.get(f'mountpoint{self.server_id}') or '').strip().lower()
+        return switches['can_push'] and (
+            not switches['on_demand'] or control_plane_fail_open_event.is_set()
+            or not selected or selected == own_mountpoint
+        )
+
     def run(self):
         host = self.config.get(f'serverhost{self.server_id}')
         p_str = self.config.get(f'port{self.server_id}')
@@ -3173,7 +3183,7 @@ class NTRIPServerWorker(threading.Thread):
                 self.server_id,
                 apply_fail_open=True,
             )
-            if not server_switches['can_push']:
+            if not server_switches['enabled']:
                 with self.stats_lock:
                     self.connection_status[f'server{self.server_id}'] = False
                 try:
@@ -3188,6 +3198,7 @@ class NTRIPServerWorker(threading.Thread):
             try:
                 self.log("INFO", f"S{self.server_id}: Connecting to ntrip://{host}:{port}/{mp} (v{version}.0)...")
                 client_socket = socket.create_connection((host, port), timeout=10)
+                client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 
                 auth_str = f"{user}:{pw or ''}"
                 auth = base64.b64encode(auth_str.encode('ascii')).decode('ascii')
@@ -3227,7 +3238,7 @@ class NTRIPServerWorker(threading.Thread):
                 with self.stats_lock:
                     self.connection_status[f'server{self.server_id}'] = True
                 
-                self.log("SUCCESS", f"S{self.server_id}: Authenticated. Pushing RTCM data.")
+                self.log("SUCCESS", f"S{self.server_id}: Authenticated. Caster connection ready.")
                 self.last_stat_update = time.time()
                 self.bytes_sent = 0
                 standby_logged = False
@@ -3243,19 +3254,33 @@ class NTRIPServerWorker(threading.Thread):
                             self.server_id,
                             apply_fail_open=True,
                         )
-                        if not server_switches['can_push']:
+                        if not server_switches['enabled']:
+                            break
+                        # TCP/authentication stays alive in standby; only RTCM is gated.
+                        readable, _, _ = select.select([client_socket], [], [], 0)
+                        if readable and not client_socket.recv(4096):
+                            raise ConnectionError("Caster closed the connection")
+                        if not self._can_push_rtcm():
                             if not standby_logged:
-                                self.log("INFO", f"S{self.server_id}: RTCM stream inactive for this server, disconnecting to enter standby.")
+                                self.log("INFO", f"S{self.server_id}: RTCM paused; keeping authenticated caster connection.")
                                 standby_logged = True
-                            
                             with self.stats_lock:
                                 self.stats[f'server{self.server_id}_bps'] = 0
-                                self.connection_status[f'server{self.server_id}'] = False
-                                
-                            break  # Break inner loop to close socket and drop to outer standby gate
+                            self.bytes_sent = 0
+                            self.last_stat_update = time.time()
+                            try:
+                                while True:
+                                    self.queue.get_nowait()
+                            except Empty:
+                                pass
+                            self._stop_event.wait(0.25)
+                            continue
 
                         standby_logged = False
                         data_chunk = self.queue.get(timeout=1.0)
+                        # Sleep may arrive while queue.get is waiting for a packet.
+                        if not self._can_push_rtcm():
+                            continue
 
                         # Hard filter: never forward non-RTCM payloads to caster.
                         if not is_valid_rtcm3_packet(data_chunk):
@@ -3278,14 +3303,9 @@ class NTRIPServerWorker(threading.Thread):
                         self.bytes_sent += len(data_chunk)
 
                     except Empty:
-                        try: 
-                            if version == 2:
-                                # Keepalive chunk
-                                client_socket.sendall(b'0\r\n\r\n')
-                            else:
-                                client_socket.sendall(b'\r\n')
-                        except Exception: 
-                            break
+                        # TCP keepalive handles idle sessions. A zero HTTP chunk
+                        # would terminate an NTRIP v2 stream, not keep it alive.
+                        pass
 
                     now = time.time()
                     if now - self.last_stat_update >= 1.0:
@@ -3303,7 +3323,8 @@ class NTRIPServerWorker(threading.Thread):
                 self.log("WARNING", f"S{self.server_id}: Connection error: {e}.")
                 with self.stats_lock:
                     self.stats[f'server{self.server_id}_bps'] = 0
-                time.sleep(reconnect_interval) 
+                    self.connection_status[f'server{self.server_id}'] = False
+                self._stop_event.wait(reconnect_interval)
             
             finally:
                 with self.stats_lock:
@@ -4290,11 +4311,9 @@ class AgentManager:
         )
         rtcm_stream_active_flag = self.rtcm_stream_active  # Update global dispatch gate
         self.save_config()
-        if should_restart:
-            logging.info(f"[STREAM CONTROL] Restarting services to apply new configuration (active={self.rtcm_stream_active})")
-            self.restart_services()
-        else:
-            logging.debug("[STREAM CONTROL] Service state unchanged. Skipping restart.")
+        # Workers share the services dict and apply the gate on their next tick.
+        # Wake/sleep must not tear down an authenticated caster connection.
+        logging.debug("[STREAM CONTROL] Applied stream gate without restarting caster workers.")
     
     def get_base_config(self):
         return self.config.get('base_config', {})
@@ -4523,9 +4542,9 @@ class AgentManager:
             status["ntrip_stats"]["server2_bps"] = int(status["ntrip_stats"].get("server2_bps", synth_server2_bps))
 
             status["ntrip_connected"] = (
-                (can_push_server1 and bool(self.ntrip_connection_status.get('server1')))
+                bool(self.ntrip_connection_status.get('server1'))
                 or
-                (can_push_server2 and bool(self.ntrip_connection_status.get('server2')))
+                bool(self.ntrip_connection_status.get('server2'))
             )
             status["ntrip_status"] = self.ntrip_connection_status.copy()
             status["ntrip_stream_state"] = {
@@ -4635,36 +4654,10 @@ class AgentManager:
         rtcm_stream_active_flag = self.rtcm_stream_active
         selected_mountpoint = self._normalize_mountpoint(cfg.get('active_mountpoint'))
 
-        def _server_can_publish(server_id: int) -> bool:
-            server_switch = _get_server_stream_switches(cfg, server_id, apply_fail_open=True)
-            if not server_switch['enabled']:
-                return False
-
-            # During control-plane failure the runtime overlay deliberately
-            # ignores On-Demand active/mountpoint selectors for enabled outputs.
-            if control_plane_fail_open_event.is_set():
-                return True
-            
-            # Non-on-demand (Always-On) servers ALWAYS publish if enabled.
-            if not server_switch['on_demand']:
-                return True
-                
-            # On-demand servers must be in their 'active' state.
-            if not server_switch['active']:
-                return False
-            
-            # If a specific mountpoint is selected (steered), we only publish
-            # from on-demand servers that match that mountpoint.
-            if not selected_mountpoint:
-                return True
-
-            server_mp = self._normalize_mountpoint(cfg.get(f'mountpoint{server_id}'))
-            return server_mp == selected_mountpoint
-        
-        if _server_can_publish(1):
-            self.service_workers.append(NTRIPServerWorker(1, cfg, self.log, self.service_stats, self.stats_lock, self.ntrip_connection_status))
-        if _server_can_publish(2):
-            self.service_workers.append(NTRIPServerWorker(2, cfg, self.log, self.service_stats, self.stats_lock, self.ntrip_connection_status))
+        # Enabled outputs maintain authentication even when RTCM is paused.
+        for server_id in (1, 2):
+            if _get_server_stream_switches(cfg, server_id, apply_fail_open=True)['enabled']:
+                self.service_workers.append(NTRIPServerWorker(server_id, cfg, self.log, self.service_stats, self.stats_lock, self.ntrip_connection_status))
 
         if selected_mountpoint and not self.service_workers and self.rtcm_stream_active:
             self.log("WARNING", f"[RTCM] active_mountpoint='{cfg.get('active_mountpoint')}' does not match any enabled server mountpoint")
