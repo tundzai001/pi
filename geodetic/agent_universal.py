@@ -1,5 +1,5 @@
 #agent_universal.py
-AGENT_VERSION = "V2.2.5"
+AGENT_VERSION = "V2.2.6"
 
 import asyncio
 import copy
@@ -4136,6 +4136,15 @@ class AgentManager:
         return False
     
     def update_service_config(self, cfg: dict):
+        # Missing/redacted credentials mean keep the locally saved password.
+        current = self.config.get('services') or {}
+        cfg = {**current, **cfg}
+        for key in ('password1', 'password2', 'rtcmpassword1', 'command_pass'):
+            if cfg.get(key) in (None, ''):
+                if current.get(key) not in (None, ''):
+                    cfg[key] = current[key]
+                else:
+                    cfg.pop(key, None)
         # Respect user settings from dashboard deployment
         
         # Core logic: derive stream_active from stream_on_demand
