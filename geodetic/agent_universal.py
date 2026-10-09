@@ -1,5 +1,5 @@
 #agent_universal.py
-AGENT_VERSION = "V2.2.6"
+AGENT_VERSION = "V2.2.7"
 
 import asyncio
 import copy
@@ -673,7 +673,12 @@ def _get_server_stream_switches(cfg: dict, server_id: int, *, apply_fail_open: b
         fail_open=apply_fail_open and control_plane_fail_open_event.is_set(),
     )
 
+    locked = is_remote_locked(server_id)
+    if locked:
+        effective["can_push"] = False
+        effective["fail_open_forced"] = False
     return {
+        'locked': locked,
         'enabled': enabled,
         'on_demand': on_demand,
         'active': active,
@@ -1125,25 +1130,60 @@ def remove_lock_file():
         except:
             pass
 
-def is_remote_locked():
-    return os.path.exists(REMOTE_LOCK_PATH)
-
-def create_remote_lock():
+def read_remote_lock():
     try:
-        with open(REMOTE_LOCK_PATH, 'w') as f:
-            f.write(f"LOCKED_AT_{int(time.time())}")
+        with open(REMOTE_LOCK_PATH) as handle:
+            value = json.load(handle)
+        if isinstance(value, dict) and isinstance(value.get("locked_servers"), list):
+            ids = value["locked_servers"]
+            if all(type(sid) is int and sid in (1, 2) for sid in ids):
+                return {"locked_servers": sorted(set(ids))}
+        return {"all": True}
+    except FileNotFoundError:
+        return {"locked_servers": []}
+    except (ValueError, OSError):
+        # Preserve the old LOCKED_AT file and fail closed on corrupt locks.
+        return {"all": True}
+
+
+def is_remote_locked(server_id=None):
+    lock = read_remote_lock()
+    return bool(lock.get("all") or (server_id is not None and server_id in lock.get("locked_servers", [])))
+
+
+def get_device_lock_status():
+    lock = read_remote_lock()
+    return {"scoped": True, "locked_servers": [1, 2] if lock.get("all") else lock["locked_servers"], "all": bool(lock.get("all"))}
+
+
+def create_remote_lock(locked_servers=None):
+    try:
+        if locked_servers is not None:
+            if not isinstance(locked_servers, list) or any(type(sid) is not int or sid not in (1, 2) for sid in locked_servers):
+                return False
+            if not locked_servers:
+                return remove_remote_lock()
+        temporary = REMOTE_LOCK_PATH + ".tmp"
+        with open(temporary, 'w') as handle:
+            if locked_servers is None:
+                handle.write(f"LOCKED_AT_{int(time.time())}")
+            else:
+                json.dump({"locked_servers": sorted(set(locked_servers))}, handle)
+        os.replace(temporary, REMOTE_LOCK_PATH)
         return True
-    except:
+    except OSError:
         return False
 
+
 def remove_remote_lock():
-    if os.path.exists(REMOTE_LOCK_PATH):
-        try:
-            os.remove(REMOTE_LOCK_PATH)
-            return True
-        except:
-            return False
-    return False
+    try:
+        os.remove(REMOTE_LOCK_PATH)
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
 
 def get_system_info() -> dict:
     try:
@@ -3172,7 +3212,7 @@ class NTRIPServerWorker(threading.Thread):
         reconnect_interval = int(self.config.get('reconnectioninterval', 15))
         
         while not self._stop_event.is_set():
-            if is_remote_locked():
+            if is_remote_locked(self.server_id):
                 with self.stats_lock:
                     self.connection_status[f'server{self.server_id}'] = False
                 time.sleep(2)
@@ -3246,7 +3286,7 @@ class NTRIPServerWorker(threading.Thread):
                 non_rtcm_last_log_ts = 0.0
 
                 # ========== DATA STREAMING LOOP ==========
-                while not self._stop_event.is_set() and not is_remote_locked():
+                while not self._stop_event.is_set() and not is_remote_locked(self.server_id):
                     try:
                         # Per-server gate: each server can be configured independently.
                         server_switches = _get_server_stream_switches(
@@ -4541,6 +4581,11 @@ class AgentManager:
             status["ntrip_stats"]["server1_bps"] = int(status["ntrip_stats"].get("server1_bps", synth_server1_bps))
             status["ntrip_stats"]["server2_bps"] = int(status["ntrip_stats"].get("server2_bps", synth_server2_bps))
 
+            for sid, switch in ((1, server1_switch), (2, server2_switch)):
+                if switch["locked"]:
+                    status["ntrip_stats"][f"server{sid}_bps"] = 0
+                    self.ntrip_connection_status[f"server{sid}"] = False
+
             status["ntrip_connected"] = (
                 bool(self.ntrip_connection_status.get('server1'))
                 or
@@ -4693,10 +4738,12 @@ async def send_status(agent: AgentManager, mqtt_client: mqtt.Client):
     try:
         system_info = get_cached_system_info()
         if system_info:
-            status_payload['system_info'] = system_info
+            status_payload['system_info'] = dict(system_info)
             logging.debug(f"System info collected: CPU={system_info.get('cpu', {}).get('usage_percent')}%, Temp={system_info.get('temperature', {}).get('celsius')} C")
     except Exception as e:
         logging.error(f"Failed to collect system info: {e}")
+
+    status_payload.setdefault("system_info", {})["device_lock"] = get_device_lock_status()
 
     # Đếm byte của JSON payload cho telemetry (Mạng nhẹ)
     json_payload = json.dumps(status_payload)
@@ -4873,8 +4920,11 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
     _record_command_result(command, source, "running", "", command_id)
     
     if command == "LOCK_DEVICE":
-        if create_remote_lock():
-            logging.warning("DEVICE LOCKED REMOTELY")
+        if create_remote_lock(payload.get("locked_servers") if "locked_servers" in payload else None):
+            # Scoped locks do not restart services or interrupt the other host.
+            if not is_remote_locked() and current_state == "LOCKED":
+                remote_unlock_event.set()
+            logging.warning("DEVICE LOCK UPDATED: %s", get_device_lock_status())
             _record_command_result(command, source, "success", "device locked", command_id)
         else:
             logging.error("!!! Failed to create remote lock file.")
