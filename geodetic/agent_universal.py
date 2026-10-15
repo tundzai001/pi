@@ -1,5 +1,5 @@
 #agent_universal.py
-AGENT_VERSION = "V2.2.7"
+AGENT_VERSION = "V2.2.8"
 
 import asyncio
 import copy
@@ -1029,7 +1029,9 @@ def get_machine_serial():
         try:
             with open(SERIAL_FILE_PATH, 'r') as f:
                 saved_serial = f.read().strip()
-                if saved_serial.startswith("LP_") and len(saved_serial) > 10:
+                if (saved_serial.startswith("LP_") and len(saved_serial) > 10) or re.fullmatch(
+                    r'(?:PI_[0-9a-f]{12}|[0-9a-f]{16})', saved_serial, re.IGNORECASE
+                ):
                     return saved_serial
         except Exception:
             pass
@@ -2596,8 +2598,13 @@ class RTCMSignalDecoder:
         if not nav_system or not sats_in:
             return None
         
-        system_map = {"GPS": "G", "GLONASS": "R", "Galileo": "E", "BeiDou": "C"}
-        sys_code = system_map.get(nav_system)
+        system_map = {
+            "gps": "G", "us": "G", "g": "G",
+            "glonass": "R", "ru": "R", "r": "R",
+            "galileo": "E", "eu": "E", "e": "E",
+            "beidou": "C", "cn": "C", "c": "C",
+        }
+        sys_code = system_map.get(str(nav_system or "").strip().lower())
         if not sys_code:
             return None
             
