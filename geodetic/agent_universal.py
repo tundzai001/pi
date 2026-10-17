@@ -5216,6 +5216,8 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
                 agent.config['auto_base_setup'] = {"enabled": False}
                 agent.config['base_config'] = data["original_config"]["params"]
                 agent.save_config()
+                globals()['AUTO_BASE_PROGRESS'] = {}
+                globals()['LAST_RAW_GGA'] = None
                 agent.restart_services()
             
             commands_b64 = payload.get("commands_b64", [])
