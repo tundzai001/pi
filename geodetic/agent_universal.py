@@ -1,5 +1,5 @@
 #agent_universal.py
-AGENT_VERSION = "V2.3.1"
+AGENT_VERSION = "V2.2.9"
 
 import asyncio
 import copy
@@ -1405,14 +1405,14 @@ def _is_rtk_usable_status(status: str) -> bool:
     # Accept both RTK fixed and float to avoid long stalls when fix quality oscillates.
     return status in ("RTK_FIXED", "RTK_FLOAT")
 
-def _get_fresh_outbound_gga(max_age_seconds: float = 10.0) -> str | None:
+def _get_fresh_outbound_gga(max_age_seconds: float = 3.0) -> str | None:
     raw_gga = globals().get('LAST_RAW_GGA')
     gga_ts = float(globals().get('LAST_RAW_GGA_TS') or 0.0)
     if not raw_gga or gga_ts <= 0.0:
         return None
     if (time.time() - gga_ts) > max_age_seconds:
         return None
-    return raw_gga.strip()
+    return _normalize_gga_for_ntrip(raw_gga)
 
 def _mark_gnss_data_stale():
     globals()['LAST_RAW_GGA'] = None
@@ -2044,13 +2044,6 @@ def dispatch_nmea_data(data):
                 ag = globals().get('agent')
                 if ag and hasattr(ag, 'last_gga_fix_status'):
                     ag.last_gga_fix_status = new_status
-                now_ts = time.time()
-                if now_ts - getattr(dispatch_nmea_data, '_last_gga_log_ts', 0) >= 2.0:
-                    dispatch_nmea_data._last_gga_log_ts = now_ts
-                    lat_str = f"{lat:.8f}" if lat is not None else "None"
-                    lon_str = f"{lon:.8f}" if lon is not None else "None"
-                    alt_str = f"{alt:.3f}m" if alt is not None else "None"
-                    logging.info(f"[GNSS NMEA] Rx GGA: {raw_line} | Fix={new_status} | Lat={lat_str} Lon={lon_str} Alt={alt_str}")
             except Exception:
                 pass
     except Exception:
@@ -3444,63 +3437,44 @@ class NTRIPClientWorker(threading.Thread):
                 self.log("INFO", "[RTCM Client] Authenticated. Receiving correction data.")
                 
                 # Send GGA immediately after auth for VRS
-                self.last_sent_gga = None
-                self.last_sent_gga_time = 0.0
-                self.total_rtcm_bytes = 0
-                self.total_rtcm_pkts = 0
-                total_rtcm_bytes = 0
-                total_rtcm_pkts = 0
-
-                out_gga = _get_fresh_outbound_gga(10.0)
+                out_gga = _get_fresh_outbound_gga(3.0)
                 if out_gga:
                     try:
                         gga_bytes = (out_gga + '\r\n').encode('ascii')
                         client_socket.sendall(gga_bytes)
-                        self.last_sent_gga = out_gga
-                        self.last_sent_gga_time = time.time()
-                        self.log("INFO", f"[RTCM Client] >>> SENT INITIAL GGA: {out_gga}")
+                        self.log("INFO", f"[RTCM Client] >>> SENT INITIAL GGA to caster: {out_gga}")
                     except Exception as e:
                         self.log("WARNING", f"[RTCM Client] Failed to send initial GGA: {e}")
                 else:
-                    raw_gga = globals().get('LAST_RAW_GGA')
-                    if raw_gga:
-                        age = time.time() - float(globals().get('LAST_RAW_GGA_TS') or 0.0)
-                        self.log("WARNING", f"[RTCM Client] Last GGA is {age:.1f}s old: {raw_gga}")
-                    else:
-                        self.log("WARNING", "[RTCM Client] Waiting for rover chip to output first GGA sentence...")
+                    self.log("WARNING", "[RTCM Client] No fresh GGA available yet")
                 
                 last_gga_send_time = time.time()
                 gga_send_interval = 5  # Send GGA every 5 seconds for VRS
                 client_socket.settimeout(5.0)
+                total_rtcm_bytes = 0
+                total_rtcm_pkts = 0
                 
                 while not self._stop_event.is_set() and not is_remote_locked():
                     # Send GGA to caster periodically (required for VRS)
                     now = time.time()
                     if now - last_gga_send_time >= gga_send_interval:
-                        out_gga = _get_fresh_outbound_gga(10.0)
+                        out_gga = _get_fresh_outbound_gga(3.0)
                         if out_gga:
                             try:
                                 gga_bytes = (out_gga + '\r\n').encode('ascii')
                                 client_socket.sendall(gga_bytes)
-                                self.last_sent_gga = out_gga
-                                self.last_sent_gga_time = now
-                                self.log("INFO", f"[RTCM Client] >>> GGA sent: {out_gga}")
+                                self.log("INFO", f"[RTCM Client] >>> GGA sent ({len(gga_bytes)}B): {out_gga}")
                             except Exception as e:
                                 self.log("WARNING", f"[RTCM Client] Failed to send GGA: {e}")
                                 break
                         else:
-                            raw_gga = globals().get('LAST_RAW_GGA')
-                            if raw_gga:
-                                age = now - float(globals().get('LAST_RAW_GGA_TS') or 0.0)
-                                self.log("WARNING", f"[RTCM Client] GGA is stale ({age:.1f}s old): {raw_gga}")
-                            else:
-                                self.log("WARNING", "[RTCM Client] No GGA received from rover chip yet")
+                            self.log("WARNING", "[RTCM Client] No fresh GGA to send (waiting for GNSS data)")
                         last_gga_send_time = now
                     
                     try:
                         rtcm_data = client_socket.recv(4096)
                     except socket.timeout:
-                        self.log("INFO", f"[RTCM Client] recv timeout (5s), total RTCM: {total_rtcm_bytes}B / {total_rtcm_pkts} pkts | Last GGA: {getattr(self, 'last_sent_gga', 'None')}")
+                        self.log("INFO", f"[RTCM Client] recv timeout (5s), total RTCM so far: {total_rtcm_bytes}B / {total_rtcm_pkts} pkts")
                         continue  # No data yet, loop back to check GGA send
                     
                     if not rtcm_data:
@@ -4460,9 +4434,6 @@ class AgentManager:
             "agent_token_fingerprint": get_license_fingerprint(),
             "timestamp": round(time.time(), 3),
             "rtk_fix_status": getattr(self, 'last_gga_fix_status', globals().get('LAST_GGA_FIX_STATUS', 'NO_FIX')),
-            "last_gga_fix_status": getattr(self, 'last_gga_fix_status', globals().get('LAST_GGA_FIX_STATUS', 'NO_FIX')),
-            "last_raw_gga": globals().get('LAST_RAW_GGA'),
-            "last_raw_gga_age": round(time.time() - float(globals().get('LAST_RAW_GGA_TS') or 0.0), 1) if (float(globals().get('LAST_RAW_GGA_TS') or 0.0) > 0 and globals().get('LAST_RAW_GGA')) else None,
             "base_mode_active": bool(self.get_base_config()),
             "detected_chip_type": self.detected_chip.get("type", "UNKNOWN"),
             "detected_chip_port": self.detected_chip.get("port"),
@@ -5216,8 +5187,6 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
                 agent.config['auto_base_setup'] = {"enabled": False}
                 agent.config['base_config'] = data["original_config"]["params"]
                 agent.save_config()
-                globals()['AUTO_BASE_PROGRESS'] = {}
-                globals()['LAST_RAW_GGA'] = None
                 agent.restart_services()
             
             commands_b64 = payload.get("commands_b64", [])
@@ -5634,25 +5603,7 @@ def _cleanup_inject_queue(gnss_reader):
 
 def _set_auto_base_progress(phase: str, **extra):
     global AUTO_BASE_PROGRESS
-    now = time.time()
-    raw_gga = globals().get('LAST_RAW_GGA')
-    gga_ts = float(globals().get('LAST_RAW_GGA_TS') or 0.0)
-    gga_age = round(now - gga_ts, 1) if gga_ts > 0 else None
-    fix_status = globals().get('LAST_GGA_FIX_STATUS') or "NO_FIX"
-    coord = globals().get('LAST_GGA_COORD')
-    
-    progress = {
-        "phase": phase,
-        "updated_at": int(now),
-        "last_raw_gga": raw_gga,
-        "gga_age_seconds": gga_age,
-        "gga_fix_status": fix_status,
-        "current_coord": {
-            "lat": f"{coord[0]:.10f}" if coord and coord[0] is not None else None,
-            "lon": f"{coord[1]:.10f}" if coord and coord[1] is not None else None,
-            "alt": f"{coord[2]:.4f}" if coord and coord[2] is not None else None,
-        } if coord else None,
-    }
+    progress = {"phase": phase, "updated_at": int(time.time())}
     progress.update(extra)
     AUTO_BASE_PROGRESS = progress
 
@@ -5758,90 +5709,23 @@ async def _apply_base_mode_to_chip(chip_type: str, port: str, lat: float, lon: f
 async def _apply_rover_mode_to_chip(chip_type: str, port: str, gnss_reader: GNSSReader):
     if not port:
         raise RuntimeError("No GNSS port")
+    if chip_type != "Ublox":
+        raise RuntimeError(f"Unsupported chip type: {chip_type}")
     if gnss_reader:
         gnss_reader.pause()
         await asyncio.sleep(1.0)
     try:
         baud = _runtime_serial_baud(gnss_reader=gnss_reader)
         with serial_port_lock, serial.Serial(port, baud, timeout=2) as ser:
-            if chip_type == "Ublox":
-                # Helper for UBX-CFG-VALSET (Generation 9 - F9P / F9H)
-                def send_valset_u1(key_id, val):
-                    v_msg = bytearray(b'\xb5\x62\x06\x8a\x09\x00\x00\x07\x00\x00')
-                    v_msg.extend(key_id.to_bytes(4, 'little'))
-                    v_msg.append(val & 0xFF)
-                    v_msg.extend([0, 0])
-                    v_a = v_b = 0
-                    for j in range(2, 15):
-                        v_a = (v_a + v_msg[j]) & 0xFF
-                        v_b = (v_b + v_a) & 0xFF
-                    v_msg[15], v_msg[16] = v_a, v_b
-                    ser.write(v_msg)
-
-                # Set TMODE to 0 (Disabled / Rover) via VALSET
-                send_valset_u1(0x20110001, 0)
-                # Output NMEA GGA on USB and UART1 at 1Hz via VALSET
-                send_valset_u1(0x209100bb, 1) # CFG-MSGOUT-NMEA_ID_GGA_USB
-                send_valset_u1(0x209100ba, 1) # CFG-MSGOUT-NMEA_ID_GGA_UART1
-                send_valset_u1(0x20910036, 1) # CFG-MSGOUT-UBX_NAV_HPPOSLLH_USB
-                send_valset_u1(0x20910035, 1) # CFG-MSGOUT-UBX_NAV_HPPOSLLH_UART1
-                send_valset_u1(0x20910009, 1) # CFG-MSGOUT-UBX_NAV_PVT_USB
-                # Disable RTCM 1005 output
-                send_valset_u1(0x209102bf, 0) # CFG-MSGOUT-RTCM3X_1005_USB
-                send_valset_u1(0x209102be, 0) # CFG-MSGOUT-RTCM3X_1005_UART1
-
-                # Legacy UBX-CFG-TMODE3 (turn off base mode)
-                msg = bytearray(b'\xb5\x62\x06\x71\x28\x00' + b'\x00' * 42)
-                ck_a = ck_b = 0
-                for index in range(2, 46):
-                    ck_a = (ck_a + msg[index]) & 0xFF
-                    ck_b = (ck_b + ck_a) & 0xFF
-                msg[46], msg[47] = ck_a, ck_b
-                ser.write(msg)
-                
-                # Legacy UBX-CFG-MSG Enable NMEA-GGA (0xF0 0x00) rate 1 on all ports
-                gga_msg = bytearray(b'\xb5\x62\x06\x01\x08\x00\xf0\x00\x01\x01\x01\x01\x01\x00\x00\x00')
-                ck_a = ck_b = 0
-                for index in range(2, 14):
-                    ck_a = (ck_a + gga_msg[index]) & 0xFF
-                    ck_b = (ck_b + ck_a) & 0xFF
-                gga_msg[14], gga_msg[15] = ck_a, ck_b
-                ser.write(gga_msg)
-                
-                # Disable RTCM 1005 output
-                rtcm_off = bytearray(b'\xb5\x62\x06\x01\x08\x00\xd5\x05\x00\x00\x00\x00\x00\x00\x00\x00')
-                ck_a = ck_b = 0
-                for index in range(2, 14):
-                    ck_a = (ck_a + rtcm_off[index]) & 0xFF
-                    ck_b = (ck_b + ck_a) & 0xFF
-                rtcm_off[14], rtcm_off[15] = ck_a, ck_b
-                ser.write(rtcm_off)
-                
-                # Save configuration
-                ser.write(b'\xb5\x62\x06\x09\x0d\x00\x00\x00\x00\x00\xff\xff\x00\x00\x00\x00\x00\x00\x03\x1d\xab')
-                ser.flush()
-                
-                # Fallback: Also send Unicorecomm command in case the chip was manually selected as Ublox but is Unicore
-                ser.write(b'UNLOGALL\r\nMODE ROVER\r\nLOG GNGGA ONTIME 1\r\nLOG GPRMC ONTIME 1\r\nSAVECONFIG\r\n')
-                ser.flush()
-                logging.info("AutoBase: _apply_rover_mode_to_chip Ublox ROVER mode set (VALSET + TMODE3 + NMEA GGA enabled)")
-            elif chip_type in ("Unicorecomm", "RTCM3_Source"):
-                ser.write(b'UNLOGALL\r\n')
-                ser.flush()
-                await asyncio.sleep(0.3)
-                ser.write(b'MODE ROVER\r\n')
-                ser.flush()
-                await asyncio.sleep(0.3)
-                ser.write(b'LOG GNGGA ONTIME 1\r\n')
-                ser.write(b'LOG GPRMC ONTIME 1\r\n')
-                ser.flush()
-                await asyncio.sleep(0.3)
-                ser.write(b'SAVECONFIG\r\n')
-                ser.flush()
-                logging.info(f"AutoBase: _apply_rover_mode_to_chip {chip_type} ROVER mode set (UNLOGALL + MODE ROVER + LOG GNGGA ONTIME 1)")
-            else:
-                ser.write(b'UNLOGALL\r\nMODE ROVER\r\nLOG GNGGA ONTIME 1\r\nSAVECONFIG\r\n')
-                ser.flush()
+            msg = bytearray(b'\xb5\x62\x06\x71\x28\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')
+            ck_a = ck_b = 0
+            for index in range(2, 46):
+                ck_a = (ck_a + msg[index]) & 0xFF
+                ck_b = (ck_b + ck_a) & 0xFF
+            msg[46], msg[47] = ck_a, ck_b
+            ser.write(msg)
+            ser.write(b'\xb5\x62\x06\x09\x0d\x00\x00\x00\x00\x00\xff\xff\x00\x00\x00\x00\x00\x00\x03\x1d\xab')
+            ser.flush()
     finally:
         if gnss_reader:
             await asyncio.sleep(2.0)
@@ -5988,18 +5872,41 @@ async def auto_base_state_machine(agent: AgentManager, gnss_reader: GNSSReader, 
         await asyncio.sleep(1.0)
         
     try:
-        await _apply_rover_mode_to_chip(chip_type, port, gnss_reader)
-        logging.info(f"AutoBase: {chip_type} successfully configured to ROVER mode")
+        baud = _runtime_serial_baud(gnss_reader=gnss_reader)
+        logging.info(f"Opening GNSS rover-mode port {port} @ {baud} baud")
+        with serial_port_lock, serial.Serial(port, baud, timeout=2) as ser:
+            if chip_type == "Ublox":
+                msg = bytearray(b'\xb5\x62\x06\x71\x28\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')
+                CK_A, CK_B = 0, 0
+                for i in range (2, 46):
+                    CK_A = (CK_A + msg[i]) & 0xFF
+                    CK_B = (CK_B + CK_A) & 0xFF
+                msg[46] = CK_A
+                msg[47] = CK_B
+                ser.write(msg)
+                ser.write(b'\xb5\x62\x06\x09\x0d\x00\x00\x00\x00\x00\xff\xff\x00\x00\x00\x00\x00\x00\x03\x1d\xab')
+                ser.flush()
+                logging.info("AutoBase: Ublox ROVER mode set")
+            elif chip_type in ("Unicorecomm", "RTCM3_Source"):
+                ser.write(b'MODE ROVER\r\n')
+                ser.flush()
+                await asyncio.sleep(0.5)
+                ser.write(b'SAVECONFIG\r\n')
+                ser.flush()
+                logging.info(f"AutoBase: {chip_type} ROVER mode set (MODE ROVER + SAVECONFIG)")
+            else:
+                logging.warning(f"AutoBase: Unknown chip type '{chip_type}', trying Unicorecomm commands...")
+                ser.write(b'MODE ROVER\r\n')
+                ser.flush()
+                await asyncio.sleep(0.5)
+                ser.write(b'SAVECONFIG\r\n')
+                ser.flush()
     except Exception as e:
         logging.error(f"AutoBase: Failed to set ROVER mode: {e}")
-
-    # Wait up to 5 seconds for initial NMEA GGA from rover chip before connecting to NTRIP
-    logging.info("AutoBase: Waiting for rover chip to output NMEA GGA...")
-    for _ in range(10):
-        if globals().get('LAST_RAW_GGA'):
-            logging.info(f"AutoBase: Initial NMEA GGA from chip: {globals().get('LAST_RAW_GGA')}")
-            break
-        await asyncio.sleep(0.5)
+    finally:
+        if gnss_reader:
+            await asyncio.sleep(2.0)
+            gnss_reader.resume()
             
     # Start temporary NTRIP client to get RTCM
     ntrip_host = str(cfg.get("ip") or "").strip()
@@ -6051,8 +5958,6 @@ async def auto_base_state_machine(agent: AgentManager, gnss_reader: GNSSReader, 
         fix_status=globals().get('LAST_GGA_FIX_STATUS'),
         fixed_streak=0,
         fixed_streak_required=fixed_streak_required,
-        rtcm_bytes=0,
-        rtcm_pkts=0,
     )
     await send_status(agent, mqtt_client)
     
@@ -6088,12 +5993,7 @@ async def auto_base_state_machine(agent: AgentManager, gnss_reader: GNSSReader, 
             fix_status=globals().get('LAST_GGA_FIX_STATUS'),
             fixed_streak=fixed_streak,
             fixed_streak_required=fixed_streak_required,
-            rtcm_bytes=getattr(temp_client, 'total_rtcm_bytes', 0),
-            rtcm_pkts=getattr(temp_client, 'total_rtcm_pkts', 0),
-            last_sent_gga=getattr(temp_client, 'last_sent_gga', None),
         )
-        if elapsed % 2 == 0:
-            await send_status(agent, mqtt_client)
         await asyncio.sleep(1)
         
     # State 3: Average Position
@@ -6177,11 +6077,11 @@ async def auto_base_state_machine(agent: AgentManager, gnss_reader: GNSSReader, 
         await send_status(agent, mqtt_client)
         return
         
-    avg_lat = round(_plain_mean([float(c[0]) for c in coords]), 10)
-    avg_lon = round(_plain_mean([float(c[1]) for c in coords]), 10)
-    avg_alt = round(_plain_mean([float(c[2]) for c in coords]), 4)
+    avg_lat = _plain_mean([float(c[0]) for c in coords])
+    avg_lon = _plain_mean([float(c[1]) for c in coords])
+    avg_alt = _plain_mean([float(c[2]) for c in coords])
     
-    logging.info(f"AutoBase: Averaged Pos -> Lat: {avg_lat:.10f}, Lon: {avg_lon:.10f}, Alt: {avg_alt:.4f}")
+    logging.info(f"AutoBase: Averaged Pos -> Lat: {avg_lat:.8f}, Lon: {avg_lon:.8f}, Alt: {avg_alt:.3f}")
 
     transform_applied = False
     vn2000_neh = None
@@ -6231,15 +6131,13 @@ async def auto_base_state_machine(agent: AgentManager, gnss_reader: GNSSReader, 
                     and -1000.0 <= local_alt <= 100000.0
                 ):
                     vn2000_neh = {"north": n_vn, "east": e_vn, "h": h_vn2000}
-                    avg_lat = round(local_lat, 10)
-                    avg_lon = round(local_lon, 10)
-                    avg_alt = round(local_alt, 4)
                     logging.info(
                         "AutoBase: ITRF->VN2000 transform applied "
                         f"(L0={math.degrees(datum_snapshot.l0):.6f}, k0={datum_snapshot.k0:.6f}, source={projection_source}) "
-                        f"-> Lat: {avg_lat:.10f}, Lon: {avg_lon:.10f}, Alt: {avg_alt:.4f}, "
+                        f"-> Lat: {local_lat:.8f}, Lon: {local_lon:.8f}, Alt: {local_alt:.3f}, "
                         f"N: {n_vn:.4f}, E: {e_vn:.4f}, H: {h_vn2000:.4f}"
                     )
+                    avg_lat, avg_lon, avg_alt = local_lat, local_lon, local_alt
                     transform_applied = True
                 else:
                     logging.warning(
@@ -6260,7 +6158,7 @@ async def auto_base_state_machine(agent: AgentManager, gnss_reader: GNSSReader, 
         "set_base",
         step=4,
         total_steps=4,
-        averaged_coord={"lat": f"{avg_lat:.10f}", "lon": f"{avg_lon:.10f}", "alt": f"{avg_alt:.4f}"},
+        averaged_coord={"lat": avg_lat, "lon": avg_lon, "alt": avg_alt},
         sample_count=len(coords),
         transform_applied=transform_applied,
         datum_status={
@@ -6285,9 +6183,9 @@ async def auto_base_state_machine(agent: AgentManager, gnss_reader: GNSSReader, 
     # Save base config in agent
     agent.config['base_config'] = {
         'coords': {
-            'lat': f"{avg_lat:.10f}",
-            'lon': f"{avg_lon:.10f}",
-            'alt': f"{avg_alt:.4f}"
+            'lat': avg_lat,
+            'lon': avg_lon,
+            'alt': avg_alt
         },
         'altitude_reference': 'ELLIPSOID',
         'base_setup_method': 'AUTO_CORS',
@@ -6304,9 +6202,9 @@ async def auto_base_state_machine(agent: AgentManager, gnss_reader: GNSSReader, 
         'province_hint': province_hint,
         'vn2000_neh': vn2000_neh,
         'auto_base_raw_itrf_llh': {
-            'lat': f"{round(_plain_mean([float(c[0]) for c in coords]), 10):.10f}",
-            'lon': f"{round(_plain_mean([float(c[1]) for c in coords]), 10):.10f}",
-            'alt': f"{round(_plain_mean([float(c[2]) for c in coords]), 4):.4f}",
+            'lat': _plain_mean([float(c[0]) for c in coords]),
+            'lon': _plain_mean([float(c[1]) for c in coords]),
+            'alt': _plain_mean([float(c[2]) for c in coords]),
         },
         'samples_collected': len(coords),
         'timestamp': int(time.time())
@@ -6324,7 +6222,7 @@ async def auto_base_state_machine(agent: AgentManager, gnss_reader: GNSSReader, 
         "completed",
         step=4,
         total_steps=4,
-        averaged_coord={"lat": f"{avg_lat:.10f}", "lon": f"{avg_lon:.10f}", "alt": f"{avg_alt:.4f}"},
+        averaged_coord={"lat": avg_lat, "lon": avg_lon, "alt": avg_alt},
         sample_count=len(coords),
         transform_applied=transform_applied
     )
