@@ -1,5 +1,5 @@
 #agent_universal.py
-AGENT_VERSION = "V2.3.1"
+AGENT_VERSION = "V2.3.2"
 
 import asyncio
 import copy
@@ -647,6 +647,19 @@ def _normalize_mountpoint_value(value):
     return cleaned.lower() if cleaned else None
 
 
+def _get_ntrip_server_ids(cfg: dict) -> list[int]:
+    """Keep the two legacy slots and discover additional numbered outputs."""
+    ids = {1, 2}
+    for key in cfg:
+        if key.startswith('server') and key.endswith('_enabled'):
+            suffix = key[6:-8]
+            if suffix.isdigit() and int(suffix) > 0:
+                ids.add(int(suffix))
+        elif key.startswith('serverhost') and key[10:].isdigit() and int(key[10:]) > 0:
+            ids.add(int(key[10:]))
+    return sorted(ids)
+
+
 def _get_server_stream_switches(cfg: dict, server_id: int, *, apply_fail_open: bool = False) -> dict:
     global_on_demand = _to_bool(cfg.get('stream_on_demand', False), False)
     global_active = _to_bool(cfg.get('stream_active', False), False)
@@ -688,7 +701,7 @@ def _get_server_stream_switches(cfg: dict, server_id: int, *, apply_fail_open: b
 
 
 def _compute_any_server_can_push(cfg: dict, *, apply_fail_open: bool = False) -> bool:
-    for server_id in (1, 2):
+    for server_id in _get_ntrip_server_ids(cfg):
         if _get_server_stream_switches(
             cfg,
             server_id,
@@ -704,7 +717,7 @@ def _resolve_preferred_server_for_mountpoint(cfg: dict, mountpoint: str | None) 
         return None
 
     candidates = []
-    for sid in (1, 2):
+    for sid in _get_ntrip_server_ids(cfg):
         server_mp = _normalize_mountpoint_value(cfg.get(f'mountpoint{sid}'))
         enabled = _to_bool(cfg.get(f'server{sid}_enabled'), False)
         if enabled and server_mp and server_mp == target_mp:
@@ -4180,7 +4193,7 @@ class AgentManager:
             services['stream_active'] = False
             services.pop('active_mountpoint', None)
             
-        for sid in (1, 2):
+        for sid in _get_ntrip_server_ids(services):
             if _to_bool(services.get(f'server{sid}_stream_on_demand', global_on_demand), global_on_demand):
                 services[f'server{sid}_stream_active'] = False
             else:
@@ -4246,7 +4259,7 @@ class AgentManager:
         # Missing/redacted credentials mean keep the locally saved password.
         current = self.config.get('services') or {}
         cfg = {**current, **cfg}
-        for key in ('password1', 'password2', 'rtcmpassword1', 'command_pass'):
+        for key in [*(f'password{sid}' for sid in _get_ntrip_server_ids(cfg)), 'rtcmpassword1', 'command_pass']:
             if cfg.get(key) in (None, ''):
                 if current.get(key) not in (None, ''):
                     cfg[key] = current[key]
@@ -4267,7 +4280,7 @@ class AgentManager:
                 cfg['stream_active'] = False
 
         # Per-server stream controls with backward-compatible fallback to global flags.
-        for server_id in (1, 2):
+        for server_id in _get_ntrip_server_ids(cfg):
             on_demand_key = f'server{server_id}_stream_on_demand'
             active_key = f'server{server_id}_stream_active'
 
@@ -4306,14 +4319,14 @@ class AgentManager:
         if address and not server_id:
             # Match server by address/host
             normalized_addr = str(address).strip().lower()
-            for sid in (1, 2):
+            for sid in _get_ntrip_server_ids(services):
                 sid_host = str(services.get(f'server{sid}_host', services.get(f'serverhost{sid}', '')) or '').strip().lower()
-                if normalized_addr in sid_host or sid_host in normalized_addr:
+                if sid_host and (normalized_addr in sid_host or sid_host in normalized_addr):
                     server_id = sid
                     logging.info(f"[STREAM CONTROL] Matched address '{address}' to server {sid} (host: {sid_host})")
                     break
 
-        if server_id in (1, 2):
+        if server_id in _get_ntrip_server_ids(services):
             prev_switch = _get_server_stream_switches(services, server_id)
             prev_mountpoint = self._normalize_mountpoint(services.get('active_mountpoint'))
 
@@ -4341,14 +4354,14 @@ class AgentManager:
             # Identify which servers to apply the command to
             target_sids = []
             if server_id is not None:
-                if server_id in (1, 2):
+                if server_id in _get_ntrip_server_ids(services):
                     target_sids = [server_id]
             else:
                 if not bool(active):
                     # Shut down ALL on-demand servers matching the target mountpoint
                     # or ALL on-demand servers if no mountpoint provided.
                     match_mp = target_mp or self._normalize_mountpoint(services.get('active_mountpoint'))
-                    for sid in (1, 2):
+                    for sid in _get_ntrip_server_ids(services):
                         sw = _get_server_stream_switches(services, sid)
                         sid_mp = self._normalize_mountpoint(services.get(f'mountpoint{sid}'))
                         if sw['enabled'] and sw['on_demand']:
@@ -4596,81 +4609,35 @@ class AgentManager:
                 ingress_bps = rtcm_input_bps
                 status["ntrip_stats"]["rtcm_input_bps"] = ingress_bps
 
-            # Backward-compatible UI keys: keep server1_bps/server2_bps present even in standby mode.
             cfg = self.get_service_config() or {}
-            server1_switch = _get_server_stream_switches(cfg, 1, apply_fail_open=True)
-            server2_switch = _get_server_stream_switches(cfg, 2, apply_fail_open=True)
-            can_push_server1 = server1_switch['can_push']
-            can_push_server2 = server2_switch['can_push']
             selected_mountpoint = self._normalize_mountpoint(cfg.get('active_mountpoint'))
-            server1_mp = self._normalize_mountpoint(cfg.get('mountpoint1'))
-            server2_mp = self._normalize_mountpoint(cfg.get('mountpoint2'))
-            server1_connected = bool(self.ntrip_connection_status.get('server1'))
-            server2_connected = bool(self.ntrip_connection_status.get('server2'))
+            stream_state = {"selected_mountpoint": cfg.get("active_mountpoint")}
+            for sid in _get_ntrip_server_ids(cfg):
+                key = f"server{sid}"
+                switch = _get_server_stream_switches(cfg, sid, apply_fail_open=True)
+                if switch['locked']:
+                    self.ntrip_connection_status[key] = False
+                connected = bool(self.ntrip_connection_status.get(key))
+                mountpoint = self._normalize_mountpoint(cfg.get(f'mountpoint{sid}'))
+                can_forward = switch['can_push'] and (
+                    not switch['on_demand'] or control_plane_fail_open_event.is_set()
+                    or not selected_mountpoint or selected_mountpoint == mountpoint
+                )
+                fallback_bps = ingress_bps if connected and can_forward else 0
+                bps = int(status['ntrip_stats'].get(f'{key}_bps', fallback_bps)) if connected and can_forward else 0
+                status['ntrip_stats'][f'{key}_bps'] = bps
+                stream_state[key] = {
+                    **{name: bool(switch[name]) for name in ('enabled', 'on_demand', 'active', 'can_push', 'configured_can_push', 'fail_open_forced')},
+                    'effective_can_push': bool(switch['can_push']),
+                    'sleep': bool(switch['enabled'] and switch['on_demand'] and not switch['active']),
+                    'connected': connected,
+                    'bps': bps,
+                    'mountpoint': cfg.get(f'mountpoint{sid}'),
+                }
+            status['ntrip_connected'] = any(self.ntrip_connection_status.get(f'server{sid}') for sid in _get_ntrip_server_ids(cfg))
+            status['ntrip_status'] = self.ntrip_connection_status.copy()
+            status['ntrip_stream_state'] = stream_state
 
-            synth_server1_bps = 0
-            synth_server2_bps = 0
-
-            # Only synthesize per-server egress bitrate when that server is truly connected to caster.
-            if (can_push_server1 and server1_connected) or (can_push_server2 and server2_connected):
-                if selected_mountpoint:
-                    if selected_mountpoint == server1_mp and can_push_server1 and server1_connected:
-                        synth_server1_bps = ingress_bps
-                    elif selected_mountpoint == server2_mp and can_push_server2 and server2_connected:
-                        synth_server2_bps = ingress_bps
-                elif can_push_server1 and server1_connected and not (can_push_server2 and server2_connected):
-                    synth_server1_bps = ingress_bps
-                elif can_push_server2 and server2_connected and not (can_push_server1 and server1_connected):
-                    synth_server2_bps = ingress_bps
-                elif can_push_server1 and server1_connected and can_push_server2 and server2_connected:
-                    # No mountpoint selected: duplicate ingress for compatibility dashboards.
-                    synth_server1_bps = ingress_bps
-                    synth_server2_bps = ingress_bps
-
-            status["ntrip_stats"]["server1_bps"] = int(status["ntrip_stats"].get("server1_bps", synth_server1_bps))
-            status["ntrip_stats"]["server2_bps"] = int(status["ntrip_stats"].get("server2_bps", synth_server2_bps))
-
-            for sid, switch in ((1, server1_switch), (2, server2_switch)):
-                if switch["locked"]:
-                    status["ntrip_stats"][f"server{sid}_bps"] = 0
-                    self.ntrip_connection_status[f"server{sid}"] = False
-
-            status["ntrip_connected"] = (
-                bool(self.ntrip_connection_status.get('server1'))
-                or
-                bool(self.ntrip_connection_status.get('server2'))
-            )
-            status["ntrip_status"] = self.ntrip_connection_status.copy()
-            status["ntrip_stream_state"] = {
-                "selected_mountpoint": cfg.get("active_mountpoint"),
-                "server1": {
-                    "enabled": bool(server1_switch['enabled']),
-                    "on_demand": bool(server1_switch['on_demand']),
-                    "active": bool(server1_switch['active']),
-                    "can_push": bool(server1_switch['can_push']),
-                    "configured_can_push": bool(server1_switch['configured_can_push']),
-                    "effective_can_push": bool(server1_switch['can_push']),
-                    "fail_open_forced": bool(server1_switch['fail_open_forced']),
-                    "sleep": bool(server1_switch['enabled'] and server1_switch['on_demand'] and not server1_switch['active']),
-                    "connected": server1_connected,
-                    "bps": int(status["ntrip_stats"].get("server1_bps", 0)),
-                    "mountpoint": cfg.get("mountpoint1"),
-                },
-                "server2": {
-                    "enabled": bool(server2_switch['enabled']),
-                    "on_demand": bool(server2_switch['on_demand']),
-                    "active": bool(server2_switch['active']),
-                    "can_push": bool(server2_switch['can_push']),
-                    "configured_can_push": bool(server2_switch['configured_can_push']),
-                    "effective_can_push": bool(server2_switch['can_push']),
-                    "fail_open_forced": bool(server2_switch['fail_open_forced']),
-                    "sleep": bool(server2_switch['enabled'] and server2_switch['on_demand'] and not server2_switch['active']),
-                    "connected": server2_connected,
-                    "bps": int(status["ntrip_stats"].get("server2_bps", 0)),
-                    "mountpoint": cfg.get("mountpoint2"),
-                },
-            }
-            
             for key, bps in self.service_stats.items():
                 if 'bps' in key and bps > 0 and bps < 100:
                     status["warning"] = f"Low data rate detected on {key}: {bps} bps"
@@ -4749,7 +4716,7 @@ class AgentManager:
         selected_mountpoint = self._normalize_mountpoint(cfg.get('active_mountpoint'))
 
         # Enabled outputs maintain authentication even when RTCM is paused.
-        for server_id in (1, 2):
+        for server_id in _get_ntrip_server_ids(cfg):
             if _get_server_stream_switches(cfg, server_id, apply_fail_open=True)['enabled']:
                 self.service_workers.append(NTRIPServerWorker(server_id, cfg, self.log, self.service_stats, self.stats_lock, self.ntrip_connection_status))
 
@@ -5272,7 +5239,7 @@ async def _process_command(source: str, data: dict, agent: AgentManager, gnss_re
             try:
                 if raw_server_id is not None:
                     parsed_server_id = int(raw_server_id)
-                    if parsed_server_id in (1, 2):
+                    if parsed_server_id in _get_ntrip_server_ids(agent.get_service_config() or {}):
                         server_id = parsed_server_id
             except (TypeError, ValueError):
                 server_id = None
@@ -5810,6 +5777,10 @@ async def _apply_base_mode_to_chip(chip_type: str, port: str, lat: float, lon: f
             elif chip_type in ("Unicorecomm", "RTCM3_Source"):
                 # Use higher precision for command string to avoid rounding
                 base_cmd = f"MODE BASE {lat:.10f} {lon:.10f} {alt:.3f}\r\n".encode("ascii")
+                # Auto Base supplies ellipsoidal h; Unicore's default is geoid-based altitude.
+                ser.write(b"CONFIG UNDULATION 0.0\r\n")
+                ser.flush()
+                await asyncio.sleep(0.2)
                 ser.write(base_cmd)
                 ser.flush()
                 await asyncio.sleep(0.5)
