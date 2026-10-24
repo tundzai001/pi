@@ -1,5 +1,5 @@
 #agent_universal.py
-AGENT_VERSION = "V2.3.2"
+AGENT_VERSION = "V2.3.5"
 
 import asyncio
 import copy
@@ -307,7 +307,7 @@ DEFAULT_MQTT_USERNAME = "mqttUser"
 DEFAULT_MQTT_PASSWORD = "MqttPassword123$%^"
 
 BACKEND_HOST = DEFAULT_BACKEND_HOST
-BACKEND_WS_HOST = os.getenv("BACKEND_WS_HOST", "cors.aitogy.com").strip()
+BACKEND_WS_HOST = os.getenv("BACKEND_WS_HOST", "base.aitogy.com").strip()
 BACKEND_WS_SCHEME = os.getenv("BACKEND_WS_SCHEME", "wss").strip().lower()
 BACKEND_WS_PORT = int(os.getenv("BACKEND_WS_PORT", "443" if BACKEND_WS_SCHEME == "wss" else "8000"))
 ALLOW_INSECURE_AGENT_WS = os.getenv("ALLOW_INSECURE_AGENT_WS", "false").strip().lower() in {"1", "true", "yes"}
@@ -4259,6 +4259,11 @@ class AgentManager:
         # Missing/redacted credentials mean keep the locally saved password.
         current = self.config.get('services') or {}
         cfg = {**current, **cfg}
+        removed_servers = set(cfg.pop('removed_servers', []))
+        for key in list(cfg):
+            match = re.fullmatch(r'server(\d+)_\w+|(?:ntrip_version|username|serverhost|port|mountpoint|password)(\d+)', key)
+            if match and int(match.group(1) or match.group(2)) >= 3 and int(match.group(1) or match.group(2)) in removed_servers:
+                cfg.pop(key)
         for key in [*(f'password{sid}' for sid in _get_ntrip_server_ids(cfg)), 'rtcmpassword1', 'command_pass']:
             if cfg.get(key) in (None, ''):
                 if current.get(key) not in (None, ''):
@@ -5824,7 +5829,7 @@ async def _apply_rover_mode_to_chip(chip_type: str, port: str, gnss_reader: GNSS
                     send_valset_u1(output_prefix | 0x02, 1)  # NMEA GGA output
 
                 # Set TMODE to 0 (Disabled / Rover) via VALSET
-                send_valset_u1(0x20110001, 0)
+                send_valset_u1(0x20030001, 0)
                 # Output NMEA GGA on USB and UART1 at 1Hz via VALSET
                 send_valset_u1(0x209100bd, 1) # CFG-MSGOUT-NMEA_ID_GGA_USB
                 send_valset_u1(0x209100bb, 1) # CFG-MSGOUT-NMEA_ID_GGA_UART1
@@ -6345,6 +6350,7 @@ async def _run_auto_base_setup(agent: AgentManager, gnss_reader: GNSSReader, mqt
         'altitude_reference': 'ELLIPSOID',
         'base_setup_method': 'AUTO_CORS',
         'auto_configured': True,
+        'fixed_samples_only': True,
         'itrf_vn2000_transform_applied': transform_applied,
         'datum_1021_updated': datum_snapshot.rtcm1021_update,
         'datum_1023_updated': datum_snapshot.rtcm1023_update,
@@ -6378,6 +6384,7 @@ async def _run_auto_base_setup(agent: AgentManager, gnss_reader: GNSSReader, mqt
         total_steps=4,
         averaged_coord={"lat": f"{avg_lat:.10f}", "lon": f"{avg_lon:.10f}", "alt": f"{avg_alt:.4f}"},
         sample_count=len(coords),
+        fixed_samples_only=True,
         transform_applied=transform_applied
     )
     logging.info("=== AUTO BASE SETUP COMPLETE ===")
