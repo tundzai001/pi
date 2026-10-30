@@ -1,5 +1,5 @@
 #agent_universal.py
-AGENT_VERSION = "V2.3.5"
+AGENT_VERSION = "V2.3.6"
 
 import asyncio
 import copy
@@ -3569,6 +3569,8 @@ class GNSSReader(threading.Thread):
         self.baudrate = baudrate
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
+        self._base_queries = Queue(maxsize=1)
+        self._base_query = None
         self.daemon = True
         self.name = "GNSSReaderThread"
         
@@ -3618,6 +3620,56 @@ class GNSSReader(threading.Thread):
         self._pause_event.clear()
         self.log("INFO", "GNSSReader resumed")
     
+    async def query_base(self, wire, key):
+        """Ask the owning UART thread; never open a second serial reader."""
+        if not self.is_alive() or self._pause_event.is_set():
+            raise RuntimeError("GNSS reader is not available")
+        request = dict(wire=wire, key=key, deadline=time.monotonic() + 4.0,
+                       reply=None, cancelled=False)
+        try:
+            self._base_queries.put_nowait(request)
+        except Full:
+            raise RuntimeError("GNSS readback queue is busy")
+        try:
+            while request['reply'] is None:
+                if time.monotonic() >= request['deadline'] or self._stop_event.is_set():
+                    raise TimeoutError(f"Receiver readback timeout: {key}")
+                await asyncio.sleep(0.02)
+            if request.get('error'):
+                raise RuntimeError(request['error'])
+            return request['reply']
+        finally:
+            request['cancelled'] = True
+
+    def _service_base_query(self, ser):
+        request = self._base_query
+        if request and (request['cancelled'] or time.monotonic() >= request['deadline']):
+            self._base_query = None
+        if self._base_query is not None:
+            return
+        try:
+            request = self._base_queries.get_nowait()
+        except Empty:
+            return
+        if request['cancelled'] or time.monotonic() >= request['deadline']:
+            return
+        self._base_query = request
+        try:
+            if ser.write(request['wire']) != len(request['wire']):
+                raise IOError("Incomplete GNSS readback query write")
+            ser.flush()
+        except Exception as error:
+            request['error'] = str(error)
+            request['reply'] = b''
+            self._base_query = None
+
+    def _deliver_base_reply(self, key, packet):
+        request = getattr(self, '_base_query', None)
+        if (request and request['key'] == key and not request['cancelled']
+                and time.monotonic() < request['deadline']):
+            request['reply'] = packet
+            self._base_query = None
+
     def inject_rtcm(self, data: bytes):
         """Queue incoming corrections independently of outbound caster sleep gates."""
         _update_datum_from_rtcm_packet(data)
@@ -3698,6 +3750,8 @@ class GNSSReader(threading.Thread):
     def _parse_buffer(self, buffer: bytearray) -> bytearray:
         while len(buffer) > 0:
             processed = False
+            if len(buffer) == 1 and buffer[0] == 0xB5:
+                break  # UBX sync can straddle serial reads.
             
             # ==================== RTCM3 DETECTION ====================
             if buffer[0] == 0xD3:
@@ -3767,6 +3821,7 @@ class GNSSReader(threading.Thread):
                 # Extract UBX packet (we don't dispatch it, just discard or log)
                 packet = bytes(buffer[:packet_len])
                 
+                self._deliver_base_reply((packet[2], packet[3]), packet)
                 ubx_class = buffer[2]
                 ubx_id = buffer[3]
 
@@ -3816,6 +3871,21 @@ class GNSSReader(threading.Thread):
                 processed = True
                 continue
             
+            # Read-only Unicore replies share the RTCM stream, not the NMEA channel.
+            elif buffer[0] == ord('#'):
+                end = buffer.find(b'\n')
+                if end < 0:
+                    if len(buffer) <= 2048:
+                        break
+                    buffer.pop(0)
+                    self.parse_errors += 1
+                    continue
+                packet = bytes(buffer[:end + 1]).strip()
+                key = packet.split(b',', 1)[0]
+                self._deliver_base_reply(key, packet)
+                buffer = buffer[end + 1:]
+                continue
+
             # ==================== NMEA DETECTION (IMPROVED) ====================
             elif buffer[0] == ord('$'):
                 line_end = buffer.find(b'\n')
@@ -3998,6 +4068,7 @@ class GNSSReader(threading.Thread):
                                 break
                             
                             try:
+                                self._service_base_query(ser)
                                 # === INJECT RTCM CORRECTIONS TO CHIP ===
                                 inject_count = 0
                                 inject_bytes = 0
@@ -4155,6 +4226,174 @@ class GNSSReader(threading.Thread):
         # ==================== CLEANUP ====================
         self.log("INFO", f"GNSSReader thread stopped. Final statistics: {self.get_statistics()}")
 
+def _base_ubx_payload(packet, key):
+    if (len(packet) < 8 or packet[:2] != b'\xb5\x62' or tuple(packet[2:4]) != key
+            or len(packet) != int.from_bytes(packet[4:6], 'little') + 8
+            or _ubx_packet(*key, packet[6:-2]) != packet):
+        raise ValueError("Invalid UBX readback checksum or frame")
+    payload = packet[6:-2]
+    if len(payload) != 40 or payload[0] != 0:
+        raise ValueError("Unsupported UBX base status payload")
+    return payload
+
+
+def _base_ecef_position(x, y, z):
+    if not 5000000 <= math.sqrt(x*x + y*y + z*z) <= 8000000:
+        raise ValueError("Receiver base ECEF coordinates are invalid")
+    lat, lon, height = _ecef_to_llh_rad(x, y, z, 6378137.0, 6356752.314245179)
+    return math.degrees(lat), math.degrees(lon), height
+
+
+def _base_ubx_position(payload, *, survey=False, ready=False):
+    start, hp_start = (12, 24) if survey else (4, 16)
+    whole = struct.unpack_from('<iii', payload, start)
+    hp = struct.unpack_from('<bbb', payload, hp_start)
+    if any(abs(value) > 99 for value in hp):
+        raise ValueError("Invalid UBX high precision coordinates")
+    if not survey and payload[3] & 1:
+        lat = whole[0] * 1e-7 + hp[0] * 1e-9
+        lon = whole[1] * 1e-7 + hp[1] * 1e-9
+        height = whole[2] * 0.01 + hp[2] * 0.0001
+    else:
+        lat, lon, height = _base_ecef_position(*(a * 0.01 + b * 0.0001 for a, b in zip(whole, hp)))
+    if not all(math.isfinite(value) for value in (lat, lon, height)) or abs(lat) > 90 or abs(lon) > 180:
+        raise ValueError("Invalid UBX base coordinates")
+    return dict(state='ok', message='UBX', position_type='FIXEDPOS' if ready else 'SURVEY-IN-ESTIMATE',
+                datum='WGS84', altitude_reference='ELLIPSOID',
+                lat=f'{lat:.11f}', lon=f'{lon:.11f}', alt=f'{height:.4f}')
+
+
+def _base_unicore_fields(packet):
+    text = packet.decode('ascii').strip()
+    body, checksum = text.rsplit('*', 1)
+    if not text.startswith('#') or len(checksum) not in (2, 8) or not re.fullmatch(r'[0-9a-fA-F]+', checksum):
+        raise ValueError("Invalid Unicore readback checksum format")
+    crc = 0
+    for value in (body if len(checksum) == 2 else body[1:]).encode('ascii'):
+        crc ^= value
+        if len(checksum) == 8:
+            for _ in range(8):
+                crc = (crc >> 1) ^ (0xedb88320 if crc & 1 else 0)
+    if crc != int(checksum, 16):
+        raise ValueError("Unicore readback checksum mismatch")
+    return text, body.split(';', 1)[1].strip().rstrip(',')
+
+
+async def refresh_receiver_base_status(agent, reader):
+    """Read configuration and position without changing mode or enabling NMEA."""
+    previous = getattr(agent, 'receiver_base_readback', {})
+    chip = agent.detected_chip.get('type')
+    result = dict(chip=chip, revision=int(previous.get('revision', 0)) + 1, state='error',
+                  mode_kind='unknown')
+    try:
+        if chip not in ('Ublox', 'Unicorecomm') or reader is None:
+            raise RuntimeError("Base readback requires a supported GNSS reader")
+        if chip == 'Ublox':
+            result['query'] = 'CFG-TMODE3 / NAV-SVIN'
+            mode = _base_ubx_payload(await reader.query_base(_ubx_packet(6, 0x71), (6, 0x71)), (6, 0x71))
+            flags = int.from_bytes(mode[2:4], 'little')
+            kind = flags & 0xff
+            if kind not in (0, 1, 2):
+                raise ValueError("Unsupported u-blox receiver mode")
+            result.update(state='ok', mode_kind=('rover', 'survey_in', 'base')[kind],
+                          mode_raw=('Rover (CFG-TMODE3)', 'Survey-In (NAV-SVIN)', 'Fixed LLA (CFG-TMODE3)')[kind])
+            if kind == 2:
+                result['bestpos'] = _base_ubx_position(mode, ready=True)
+            elif kind == 1:
+                svin = _base_ubx_payload(await reader.query_base(_ubx_packet(1, 0x3b), (1, 0x3b)), (1, 0x3b))
+                if svin[36] > 1 or svin[37] > 1:
+                    raise ValueError("Invalid NAV-SVIN status flags")
+                ready = bool(svin[36] and not svin[37])
+                result.update(target_seconds=struct.unpack_from('<I', mode, 24)[0],
+                              accuracy_limit_m=struct.unpack_from('<I', mode, 28)[0] * 0.0001,
+                              elapsed_seconds=struct.unpack_from('<I', svin, 8)[0],
+                              observations=struct.unpack_from('<I', svin, 32)[0],
+                              mean_accuracy_m=struct.unpack_from('<I', svin, 28)[0] * 0.0001,
+                              active=bool(svin[37]), valid=bool(svin[36]))
+                if svin[36] or svin[37]:
+                    result['bestpos'] = _base_ubx_position(svin, survey=True, ready=ready)
+        else:
+            result['query'] = 'MODE / BESTNAVA'
+            _, mode = _base_unicore_fields(await reader.query_base(b'\r\nMODE\r\n', b'#MODE'))
+            mode = mode.upper()
+            if not mode.startswith(('MODE BASE', 'MODE ROVER')):
+                raise ValueError("Unsupported Unicore operating mode")
+            kind = 'survey_in' if mode.startswith('MODE BASE TIME') else 'base' if mode.startswith('MODE BASE') else 'rover'
+            result.update(state='ok', mode_kind=kind, mode_raw=mode)
+            if kind == 'survey_in':
+                result['target_seconds'] = int(mode.split()[3])
+            # Keep a successful MODE read visible even if position cannot be read.
+            try:
+                raw, payload = _base_unicore_fields(await reader.query_base(b'\r\nBESTNAVA\r\n', b'#BESTNAVA'))
+                fields = payload.split(',')
+                if len(fields) < 7 or fields[0] != 'SOL_COMPUTED' or fields[6] != 'WGS84':
+                    raise ValueError("Unicore BESTNAV has no computed WGS84 position")
+                lat, lon, height, undulation = map(float, fields[2:6])
+                if not all(math.isfinite(v) for v in (lat, lon, height, undulation)) or abs(lat) > 90 or abs(lon) > 180:
+                    raise ValueError("Invalid Unicore BESTNAV coordinates")
+                result['bestpos'] = dict(state='ok', message='BESTNAV', raw=raw,
+                                         solution_status=fields[0], position_type=fields[1],
+                                         latitude=lat, longitude=lon, height_msl=height)
+            except Exception as error:
+                result['bestpos'] = dict(state='unavailable', error=str(error))
+                raise
+    except Exception as error:
+        result['error'] = str(error)
+        logging.warning('[GNSS][READBACK] %s: %s', chip, error)
+        raise
+    finally:
+        agent.receiver_base_readback = result
+        agent.receiver_base_readback_at = time.monotonic()
+    position = result.get('bestpos', {})
+    logging.info('[GNSS][READBACK] %s mode=%s position=%s revision=%s', chip,
+                 result.get('mode_raw'), position.get('position_type', 'unavailable'), result['revision'])
+    if (result.get('mode_kind') == 'survey_in' and position.get('position_type') == 'FIXEDPOS'
+            and position.get('state') == 'ok'):
+        saved = dict(chip=chip, bestpos=position, mode_raw=result['mode_raw'], recorded_at=int(time.time()))
+        previous_saved = agent.config.get('survey_in_result') or {}
+        previous_position = previous_saved.get('bestpos') or {}
+        if ({k: v for k, v in previous_position.items() if k != 'raw'}
+                != {k: v for k, v in position.items() if k != 'raw'}
+                or previous_saved.get('mode_raw') != saved['mode_raw']):
+            agent.config['survey_in_result'] = saved
+            agent.save_config()
+    return result
+
+
+def receiver_base_system_info(agent):
+    result = copy.deepcopy(getattr(agent, 'receiver_base_readback', {}))
+    checked_at = getattr(agent, 'receiver_base_readback_at', None)
+    age = max(0, time.monotonic() - checked_at) if checked_at is not None else None
+    system = {}
+    if result:
+        result['age_seconds'] = int(age) if age is not None else 0xffffffff
+        system['receiver_base_readback'] = result
+    if agent.config.get('survey_in_result'):
+        system['survey_in_result'] = copy.deepcopy(agent.config['survey_in_result'])
+    monitoring = result.get('mode_kind') == 'survey_in'
+    position = result.get('bestpos', {})
+    ready = position.get('state') == 'ok' and position.get('position_type') == 'FIXEDPOS'
+    fresh = age is not None and age <= 45 and result.get('state') == 'ok'
+    survey = dict(state='not_monitoring')
+    if monitoring:
+        survey.update(state=('base_ready' if ready else 'waiting_base')
+                      if fresh and position.get('state') == 'ok' else 'awaiting_readback',
+                      source='NAV-SVIN' if result['chip'] == 'Ublox' else 'BESTNAV',
+                      target_seconds=result.get('target_seconds', 0),
+                      readback_age_seconds=result['age_seconds'], fix_status='FIXEDPOS' if ready and fresh else 'UNVERIFIED',
+                      elapsed_since_ack_seconds=None)
+        started = getattr(agent, 'survey_in_started_at', None)
+        if started is not None:
+            survey['elapsed_since_ack_seconds'] = int(max(0, time.monotonic() - started))
+        for key in ('elapsed_seconds', 'observations', 'mean_accuracy_m', 'active'):
+            if key in result:
+                survey[key] = result[key]
+    elif agent.get_base_config().get('base_setup_method') == 'SURVEY_IN' and (not result or result.get('error')):
+        survey['state'] = 'awaiting_readback'
+    system['survey_in_status'] = survey
+    return system
+
+
 class AgentManager:
     def __init__(self, serial_number):
         control_plane_fail_open_event.clear()
@@ -4164,6 +4403,9 @@ class AgentManager:
         self.service_workers = []
         self.nmea_publisher = None
         self.gnss_reader = None
+        self.receiver_base_readback = {}
+        self.receiver_base_readback_at = None
+        self.survey_in_started_at = None
         self.service_stats = {}
         self.ntrip_connection_status = {} 
         self.stats_lock = threading.Lock()
@@ -4764,7 +5006,8 @@ async def send_status(agent: AgentManager, mqtt_client: mqtt.Client):
     except Exception as e:
         logging.error(f"Failed to collect system info: {e}")
 
-    status_payload.setdefault("system_info", {})["device_lock"] = get_device_lock_status()
+    status_payload.setdefault("system_info", {}).update(receiver_base_system_info(agent))
+    status_payload["system_info"]["device_lock"] = get_device_lock_status()
 
     # Đếm byte của JSON payload cho telemetry (Mạng nhẹ)
     json_payload = json.dumps(status_payload)
@@ -5203,6 +5446,13 @@ async def _process_command(source: str, data: dict, agent: AgentManager, gnss_re
                     if configuring_base:
                         agent.config['base_config'] = copy.deepcopy(original_config['params'])
                         agent.config['gnss_config_pending'] = False
+                        agent.receiver_base_readback = {}
+                        agent.receiver_base_readback_at = None
+                        if agent.config['base_config'].get('base_setup_method') == 'SURVEY_IN':
+                            agent.survey_in_started_at = time.monotonic()
+                            agent.config.pop('survey_in_result', None)
+                        else:
+                            agent.survey_in_started_at = None
                         agent.save_config()
                     current_state = "ONLINE"
                     logging.info("All base station commands executed successfully")
@@ -5318,33 +5568,7 @@ async def _process_command(source: str, data: dict, agent: AgentManager, gnss_re
             sys.exit(0)
         
         elif command == "CHECK_BASE_STATUS":
-            port = agent.detected_chip.get("port")
-            if port and agent.detected_chip.get("type") == "Unicorecomm":
-                try:
-                    baud = _runtime_serial_baud(agent, gnss_reader)
-                    with serial_port_lock, serial.Serial(port, baud, timeout=2) as ser:
-                        # Get base station status
-                        logging.info("Checking UM982 base mode status...")
-                        ser.write(b'mode\r\n')
-                        ser.flush()
-                        await asyncio.sleep(1)
-                        
-                        mode_response = ser.read(ser.in_waiting).decode('ascii', errors='ignore')
-                        logging.info(f"Base Mode Status:\n{mode_response}")
-                        
-                        # Get RTCM output status
-                        logging.info("Checking RTCM log status...")
-                        ser.write(b'log\r\n')
-                        ser.flush()
-                        await asyncio.sleep(1)
-                        
-                        log_response = ser.read(ser.in_waiting).decode('ascii', errors='ignore')
-                        logging.info(f"RTCM Log Status:\n{log_response}")
-                        
-                except Exception as e:
-                    logging.error(f"Status check failed: {e}")
-            else:
-                logging.warning(f"CHECK_BASE_STATUS only works for Unicorecomm chips")
+            await refresh_receiver_base_status(agent, gnss_reader)
 
         _record_command_result(command, source, "success", "", command_id)
     except Exception as e:
@@ -5547,9 +5771,21 @@ async def memory_guard_task():
 
 
 async def status_publisher_task(agent: AgentManager, mqtt_client: mqtt.Client):
+    last_base_poll = -30.0
     try:
         while True:
             await asyncio.sleep(max(1, STATUS_PUBLISH_INTERVAL_SECONDS))
+            reader = getattr(agent, 'gnss_reader', None)
+            if (reader and agent.detected_chip.get('type') in ('Ublox', 'Unicorecomm')
+                    and not is_remote_locked() and not command_execution_lock.locked()
+                    and not (active_auto_base_task and not active_auto_base_task.done())
+                    and time.monotonic() - last_base_poll >= 30):
+                async with command_execution_lock:
+                    last_base_poll = time.monotonic()
+                    try:
+                        await refresh_receiver_base_status(agent, reader)
+                    except Exception as error:
+                        logging.warning("[GNSS][READBACK] %s", error)
             await send_status(agent, mqtt_client)
     except asyncio.CancelledError:
         logging.info("status_publisher_task cancelled")
