@@ -1615,7 +1615,7 @@ def _decode_type1025(buff: bytes, datum: RTCMDatum):
         f"FE={datum.false_easting:.3f}, FN={datum.false_northing:.3f}"
     )
 
-def _update_datum_from_rtcm_packet(packet: bytes):
+def _update_datum_from_rtcm_packet(packet: bytes, datum=None):
     if len(packet) < 6 or packet[0] != 0xD3:
         return
     try:
@@ -1623,17 +1623,31 @@ def _update_datum_from_rtcm_packet(packet: bytes):
     except Exception:
         return
 
-    if msg not in (1021, 1023):
+    if msg not in (1021, 1023, 1025):
         return
 
     try:
         with DATUM_LOCK:
+            target = AUTO_BASE_DATUM if datum is None else datum
             if msg == 1021:
-                _decode_type1021(packet, AUTO_BASE_DATUM)
+                _decode_type1021(packet, target)
             elif msg == 1023:
-                _decode_type1023(packet, AUTO_BASE_DATUM)
+                _decode_type1023(packet, target)
+            elif msg == 1025:
+                _decode_type1025(packet, target)
     except Exception as e:
         logging.debug(f"RTCM datum decode failed (msg={msg}): {e}")
+
+def _receive_auto_base_correction(packet, reader, datum, counts):
+    """Only this CORS session may supply the transformation parameters for its result."""
+    if not is_valid_rtcm3_packet(packet):
+        return
+    message = str(_rtcm_getbitu(packet, 24, 12))
+    with DATUM_LOCK:
+        counts[message] = counts.get(message, 0) + 1
+    _update_datum_from_rtcm_packet(packet, datum)
+    reader.inject_rtcm(packet)
+
 
 def _datum_snapshot() -> RTCMDatum:
     with DATUM_LOCK:
@@ -1842,124 +1856,18 @@ def _is_valid_vn2000_projection_params(datum: RTCMDatum) -> bool:
         return False
     return True
 
-# Practical VN2000 central meridians in Vietnam (degrees), aligned with provincial table usage.
-VN2000_L0_CANDIDATES_DEG = (
-    103.0,
-    104.0, 104.5, 104.75,
-    105.0, 105.5, 105.75,
-    106.0, 106.5,
-    107.0, 107.25, 107.75,
-    108.0, 108.25, 108.5,
-)
-
-def _infer_vn2000_l0_from_lon(lon_deg: float):
-    if not math.isfinite(lon_deg):
-        return None
-    return min(VN2000_L0_CANDIDATES_DEG, key=lambda l0: abs(l0 - lon_deg))
-
-VN2000_PROVINCE_TABLE = [
-    {"code": "AG_KG", "name": "An Giang + Kiên Giang", "l0_deg": 104.75, "k0": 0.9999, "aliases": ["an giang", "kien giang"]},
-    {"code": "BN_BG", "name": "Bắc Ninh + Bắc Giang", "l0_deg": 107.0, "k0": 0.9999, "aliases": ["bac ninh", "bac giang"]},
-    {"code": "CM_BL", "name": "Cà Mau + Bạc Liêu", "l0_deg": 104.5, "k0": 0.9999, "aliases": ["ca mau", "bac lieu"]},
-    {"code": "CAO_BANG", "name": "Cao Bằng", "l0_deg": 105.75, "k0": 0.9999, "aliases": ["cao bang"]},
-    {"code": "DAKLAK_PY", "name": "Đắk Lắk + Phú Yên", "l0_deg": 108.5, "k0": 0.9999, "aliases": ["dak lak", "phu yen"]},
-    {"code": "DIEN_BIEN", "name": "Điện Biên", "l0_deg": 103.0, "k0": 0.9999, "aliases": ["dien bien"]},
-    {"code": "DNAI_BPHUOC", "name": "Đồng Nai + Bình Phước", "l0_deg": 107.75, "k0": 0.9999, "aliases": ["dong nai", "binh phuoc"]},
-    {"code": "DTHAP_TGIANG", "name": "Đồng Tháp + Tiền Giang", "l0_deg": 105.0, "k0": 0.9999, "aliases": ["dong thap", "tien giang"]},
-    {"code": "GLAI_BDINH", "name": "Gia Lai + Bình Định", "l0_deg": 108.25, "k0": 0.9999, "aliases": ["gia lai", "binh dinh"]},
-    {"code": "HA_TINH", "name": "Hà Tĩnh", "l0_deg": 105.5, "k0": 0.9999, "aliases": ["ha tinh"]},
-    {"code": "HYEN_TBINH", "name": "Hưng Yên + Thái Bình", "l0_deg": 105.5, "k0": 0.9999, "aliases": ["hung yen", "thai binh"]},
-    {"code": "KH_HOA_NTHUAN", "name": "Khánh Hòa + Ninh Thuận", "l0_deg": 108.25, "k0": 0.9999, "aliases": ["khanh hoa", "ninh thuan"]},
-    {"code": "LAI_CHAU", "name": "Lai Châu", "l0_deg": 104.75, "k0": 0.9999, "aliases": ["lai chau"]},
-    {"code": "LANG_SON", "name": "Lạng Sơn", "l0_deg": 107.25, "k0": 0.9999, "aliases": ["lang son"]},
-    {"code": "LCAI_YBAI", "name": "Lào Cai + Yên Bái", "l0_deg": 104.75, "k0": 0.9999, "aliases": ["lao cai", "yen bai"]},
-    {"code": "LDONG_DNONG_BTHUAN", "name": "Lâm Đồng + Đắk Nông + Bình Thuận", "l0_deg": 107.75, "k0": 0.9999, "aliases": ["lam dong", "dak nong", "binh thuan"]},
-    {"code": "NGHE_AN", "name": "Nghệ An", "l0_deg": 104.75, "k0": 0.9999, "aliases": ["nghe an"]},
-    {"code": "NBINH_HNAM_NDINH", "name": "Ninh Bình + Hà Nam + Nam Định", "l0_deg": 105.0, "k0": 0.9999, "aliases": ["ninh binh", "ha nam", "nam dinh"]},
-    {"code": "PHU_THO_VPHUC_HBINH", "name": "Phú Thọ + Vĩnh Phúc + Hòa Bình", "l0_deg": 104.75, "k0": 0.9999, "aliases": ["phu tho", "vinh phuc", "hoa binh"]},
-    {"code": "QNGAI_KTUM", "name": "Quảng Ngãi + Kon Tum", "l0_deg": 108.0, "k0": 0.9999, "aliases": ["quang ngai", "kon tum"]},
-    {"code": "QNINH", "name": "Quảng Ninh", "l0_deg": 107.75, "k0": 0.9999, "aliases": ["quang ninh"]},
-    {"code": "QTRI_QBINH", "name": "Quảng Trị + Quảng Bình", "l0_deg": 106.0, "k0": 0.9999, "aliases": ["quang tri", "quang binh"]},
-    {"code": "SON_LA", "name": "Sơn La", "l0_deg": 104.0, "k0": 0.9999, "aliases": ["son la"]},
-    {"code": "TNINH_LONGAN", "name": "Tây Ninh + Long An", "l0_deg": 105.75, "k0": 0.9999, "aliases": ["tay ninh", "long an"]},
-    {"code": "TNGUYEN_BKAN", "name": "Thái Nguyên + Bắc Kạn", "l0_deg": 106.5, "k0": 0.9999, "aliases": ["thai nguyen", "bac kan"]},
-    {"code": "THANH_HOA", "name": "Thanh Hóa", "l0_deg": 105.0, "k0": 0.9999, "aliases": ["thanh hoa"]},
-    {"code": "CTHO_STRANG_HGIANG", "name": "Thành phố Cần Thơ + Sóc Trăng + Hậu Giang", "l0_deg": 105.0, "k0": 0.9999, "aliases": ["can tho", "soc trang", "hau giang"]},
-    {"code": "DANANG_QNAM", "name": "Thành phố Đà Nẵng + Quảng Nam", "l0_deg": 107.75, "k0": 0.9999, "aliases": ["da nang", "quang nam"]},
-    {"code": "HA_NOI", "name": "Thành phố Hà Nội", "l0_deg": 105.0, "k0": 0.9999, "aliases": ["ha noi", "hanoi"]},
-    {"code": "HPHONG_HDUONG", "name": "Thành phố Hải Phòng + Hải Dương", "l0_deg": 105.75, "k0": 0.9999, "aliases": ["hai phong", "hai duong"]},
-    {"code": "HCM_BRVT_BDUONG", "name": "Thành phố Hồ Chí Minh + Bà Rịa - Vũng Tàu + Bình Dương", "l0_deg": 105.75, "k0": 0.9999, "aliases": ["ho chi minh", "hcm", "ba ria", "vung tau", "binh duong"]},
-    {"code": "HUE", "name": "Thành phố Huế", "l0_deg": 107.0, "k0": 0.9999, "aliases": ["hue", "thua thien hue"]},
-    {"code": "TQUANG_HGIANG", "name": "Tuyên Quang + Hà Giang", "l0_deg": 106.0, "k0": 0.9999, "aliases": ["tuyen quang", "ha giang"]},
-    {"code": "VLONG_BTRE_TVINH", "name": "Vĩnh Long + Bến Tre + Trà Vinh", "l0_deg": 105.5, "k0": 0.9999, "aliases": ["vinh long", "ben tre", "tra vinh"]},
-]
-
-def _vn_normalize_text(value: str) -> str:
-    text = str(value or "").strip().lower()
-    text = unicodedata.normalize("NFD", text)
-    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
-    text = text.replace("đ", "d")
-    return " ".join(text.split())
-
-def _reverse_geocode_province_name(lat: float, lon: float):
-    try:
-        query = urllib.parse.urlencode({
-            "format": "jsonv2",
-            "lat": f"{lat:.8f}",
-            "lon": f"{lon:.8f}",
-            "zoom": 10,
-            "addressdetails": 1,
-            "accept-language": "vi",
-        })
-        url = f"https://nominatim.openstreetmap.org/reverse?{query}"
-        req = urllib.request.Request(url, headers={"User-Agent": "cors-geodetic-agent/1.0"})
-        with urllib.request.urlopen(req, timeout=2.5) as resp:
-            payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
-        address = payload.get("address") or {}
-        for key in ("state", "province", "city", "county", "region"):
-            value = address.get(key)
-            if value:
-                return str(value)
-    except Exception:
-        return None
-    return None
-
-def _infer_vn2000_projection(lat_deg: float, lon_deg: float):
-    province_hint = _reverse_geocode_province_name(lat_deg, lon_deg)
-    province_hint_norm = _vn_normalize_text(province_hint) if province_hint else ""
-
-    if province_hint_norm:
-        for row in VN2000_PROVINCE_TABLE:
-            for alias in row["aliases"]:
-                alias_norm = _vn_normalize_text(alias)
-                if alias_norm and alias_norm in province_hint_norm:
-                    return {
-                        "province_code": row["code"],
-                        "province_name": row["name"],
-                        "l0_deg": float(row["l0_deg"]),
-                        "k0": float(row["k0"]),
-                        "source": "reverse_geocode",
-                        "province_hint": province_hint,
-                    }
-
-    fallback_l0 = _infer_vn2000_l0_from_lon(lon_deg)
-    return {
-        "province_code": "UNKNOWN",
-        "province_name": "Không xác định (fallback theo kinh độ)",
-        "l0_deg": float(fallback_l0 if fallback_l0 is not None else 105.0),
-        "k0": 0.9999,
-        "source": "lon_fallback",
-        "province_hint": province_hint,
-    }
-
-def _get_vn2000_province_by_code(code: str):
-    code_norm = str(code or "").strip().upper()
-    if not code_norm:
-        return None
-    for row in VN2000_PROVINCE_TABLE:
-        if str(row.get("code", "")).upper() == code_norm:
-            return row
-    return None
+def _resolve_auto_base_location(lat, lon, alt):
+    # Province boundaries and projection regions belong to the server catalog.
+    scheme = 'https' if BACKEND_WS_SCHEME == 'wss' else 'http'
+    url = f'{scheme}://{BACKEND_WS_HOST}:{BACKEND_WS_PORT}/api/coordinates/auto-base-location'
+    coord = dict(lat=lat, lon=lon, alt=alt)
+    request = urllib.request.Request(url, data=json.dumps(coord).encode('utf-8'),
+                                    headers={'Content-Type': 'application/json'}, method='POST')
+    with urllib.request.urlopen(request, timeout=15) as response:
+        result = json.loads(response.read(65536))
+    if result.get('input_coord') != coord:
+        raise ValueError('Server location response does not match sampled LLH')
+    return result
 
 def is_valid_nmea_checksum(sentence) -> bool:
     try:
@@ -4742,7 +4650,7 @@ class AgentManager:
             "is_provisioned": self.config.get('is_provisioned', False),
             "base_config": self.get_base_config(),
             "service_config": _status_safe_config(self.get_service_config()),
-            "auto_base_progress": globals().get("AUTO_BASE_PROGRESS", {}),
+            "auto_base_progress": globals().get("AUTO_BASE_PROGRESS") or ({"phase": "ready_for_review", **self.config["auto_base_candidate"]} if self.config.get("auto_base_candidate") else {}),
             "is_locked": is_remote_locked(),
             "is_synced": not self.config.get("gnss_config_pending", False)
         }
@@ -5008,6 +4916,7 @@ async def send_status(agent: AgentManager, mqtt_client: mqtt.Client):
 
     status_payload.setdefault("system_info", {}).update(receiver_base_system_info(agent))
     status_payload["system_info"]["device_lock"] = get_device_lock_status()
+    status_payload["system_info"]["auto_base_review_supported"] = True
 
     # Đếm byte của JSON payload cho telemetry (Mạng nhẹ)
     json_payload = json.dumps(status_payload)
@@ -5078,6 +4987,8 @@ def _validate_command_payload(command: str, payload: dict, data: dict, agent: Ag
     if command == "APPLY_VN2000_PROVINCE" and not str(payload.get("province_code") or "").strip():
         return False, "missing payload.province_code"
     if command == "TRIGGER_AUTO_BASE":
+        if 'enable_itrf_vn2000_transform' in payload and not isinstance(payload['enable_itrf_vn2000_transform'], bool):
+            return False, "enable_itrf_vn2000_transform must be a boolean"
         required_fields = ("ip", "port", "user", "password", "mountpoint")
         if any(not str(payload.get(key) or "").strip() for key in required_fields if key != "password"):
             return False, "missing CORS connection fields"
@@ -5277,7 +5188,8 @@ async def _process_command(source: str, data: dict, agent: AgentManager, gnss_re
                 "timeout": auto_setup_metadata.get("timeout", 3600),
                 "samples": auto_setup_metadata.get("samples", 60),
                 "sensor_type": auto_setup_metadata.get("sensor_type"),
-                "enable_itrf_vn2000_transform": auto_setup_metadata.get("enable_itrf_vn2000_transform", True),
+                "review_only": True,
+                "enable_itrf_vn2000_transform": auto_setup_metadata.get("enable_itrf_vn2000_transform", False),
                 "l0_deg": auto_setup_metadata.get("l0_deg"),
                 "k0": auto_setup_metadata.get("k0")
             }
@@ -5349,55 +5261,8 @@ async def _process_command(source: str, data: dict, agent: AgentManager, gnss_re
             await send_status(agent, mqtt_client)
 
         elif command == "APPLY_VN2000_PROVINCE":
-            province_code = str(payload.get("province_code") or "").strip().upper()
-            province_row = _get_vn2000_province_by_code(province_code)
-            if not province_row:
-                raise ValueError(f"Invalid province_code: {province_code}")
+            raise ValueError('Province overrides no longer write the receiver. Review Auto Base results and apply Fixed LLA.')
 
-            base_cfg = agent.get_base_config() or {}
-            raw_llh = base_cfg.get("auto_base_raw_itrf_llh") or {}
-            raw_lat = float(raw_llh.get("lat"))
-            raw_lon = float(raw_llh.get("lon"))
-            raw_alt = float(raw_llh.get("alt"))
-
-            datum_snapshot = _datum_snapshot()
-
-            datum_snapshot.l0 = math.radians(float(province_row["l0_deg"]))
-            datum_snapshot.k0 = float(province_row.get("k0", 0.9999))
-
-            local_lat, local_lon, local_alt = _transform_itrf_to_vn2000_llh(raw_lat, raw_lon, raw_alt, datum_snapshot)
-            if not (
-                math.isfinite(local_lat) and math.isfinite(local_lon) and math.isfinite(local_alt)
-                and -90.0 <= local_lat <= 90.0 and -180.0 <= local_lon <= 180.0
-            ):
-                raise ValueError("Transformed coordinate out of valid range")
-
-            port = agent.detected_chip.get("port")
-            chip_type = agent.detected_chip.get("type", "UNKNOWN")
-            await _apply_base_mode_to_chip(chip_type, port, local_lat, local_lon, local_alt, gnss_reader)
-
-            base_cfg["coords"] = {"lat": local_lat, "lon": local_lon, "alt": local_alt}
-            base_cfg["itrf_vn2000_transform_applied"] = True
-            base_cfg["central_meridian_deg"] = float(province_row["l0_deg"])
-            base_cfg["k0"] = float(province_row.get("k0", 0.9999))
-            base_cfg["projection_source"] = "manual_province_override"
-            base_cfg["province_code"] = province_row["code"]
-            base_cfg["province_name"] = province_row["name"]
-            base_cfg["timestamp"] = int(time.time())
-            agent.config["base_config"] = base_cfg
-            agent.save_config()
-
-            current_state = "ONLINE"
-            _set_auto_base_progress(
-                "reprojected",
-                step=4,
-                total_steps=4,
-                province_code=province_row["code"],
-                province_name=province_row["name"],
-                coord={"lat": local_lat, "lon": local_lon, "alt": local_alt},
-            )
-            await send_status(agent, mqtt_client)
-            
         elif command == "EXECUTE_RAW_COMMANDS":
             _remember_output_mode_from_original_config(data)
             original_config = data.get("original_config") or {}
@@ -5445,6 +5310,7 @@ async def _process_command(source: str, data: dict, agent: AgentManager, gnss_re
 
                     if configuring_base:
                         agent.config['base_config'] = copy.deepcopy(original_config['params'])
+                        agent.config.pop('auto_base_candidate', None)
                         agent.config['gnss_config_pending'] = False
                         agent.receiver_base_readback = {}
                         agent.receiver_base_readback_at = None
@@ -5926,6 +5792,13 @@ def _set_auto_base_progress(phase: str, **extra):
             "alt": f"{coord[2]:.4f}" if coord and coord[2] is not None else None,
         } if coord else None,
     }
+    client = globals().get('active_auto_base_client')
+    if client is not None and hasattr(client, 'datum_message_counts'):
+        with DATUM_LOCK:
+            progress['incoming_rtcm_messages'] = dict(client.datum_message_counts)
+        config = client.config
+        progress['cors_source'] = {"host": config.get('rtcmserver1'), "port": config.get('rtcmport1'),
+                                   "mountpoint": config.get('rtcmmountpoint1')}
     progress.update(extra)
     AUTO_BASE_PROGRESS = progress
 
@@ -6221,7 +6094,7 @@ async def restore_pending_base_if_needed(agent: AgentManager, gnss_reader: GNSSR
         logging.error("Pending base restore has invalid coordinates; leaving recovery marker in place")
         return
     try:
-        await _apply_base_mode_to_chip("Ublox", agent.detected_chip.get("port"), lat, lon, alt, gnss_reader)
+        await _apply_base_mode_to_chip(pending.get("chip_type") or "Ublox", agent.detected_chip.get("port"), lat, lon, alt, gnss_reader)
         agent.config["base_config"] = pending.get("base_config") or agent.get_base_config()
         agent.config.pop("pending_base_restore", None)
         agent.save_config()
@@ -6234,9 +6107,20 @@ async def auto_base_state_machine(agent: AgentManager, gnss_reader: GNSSReader, 
     if not agent.config.get("auto_base_setup", {}).get("enabled", False):
         return
     agent.config['gnss_config_pending'] = True
+    agent.config.pop('auto_base_candidate', None)
     agent.save_config()
+    candidate = None
+    original_base = copy.deepcopy(agent.config.get('base_config') or {})
+    restore = original_base.get('coords') or {}
+    # The sampling stage must never install its candidate without operator review.
+    if all(key in restore for key in ('lat', 'lon', 'alt')):
+        agent.config['pending_base_restore'] = {
+            'coords': restore, 'base_config': original_base,
+            'chip_type': agent.detected_chip.get('type'),
+        }
+        agent.save_config()
     try:
-        await _run_auto_base_setup(agent, gnss_reader, mqtt_client)
+        candidate = await _run_auto_base_setup(agent, gnss_reader, mqtt_client)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -6252,9 +6136,25 @@ async def auto_base_state_machine(agent: AgentManager, gnss_reader: GNSSReader, 
         active_auto_base_client = None
         _cleanup_inject_queue(gnss_reader)
         agent.config['auto_base_setup'] = {"enabled": False}
+        if agent.config.get('pending_base_restore'):
+            try:
+                await _apply_base_mode_to_chip(agent.detected_chip.get('type'), agent.detected_chip.get('port'),
+                    float(restore['lat']), float(restore['lon']), float(restore['alt']), gnss_reader)
+                agent.config.pop('pending_base_restore', None)
+            except Exception as exc:
+                candidate = None
+                _set_auto_base_progress('failed', reason=f'Không khôi phục được Base cũ: {exc}')
+                logging.exception('Auto Base could not restore previous base')
+        agent.config['gnss_config_pending'] = bool(agent.config.get('pending_base_restore'))
         agent.save_config()
         if gnss_reader:
             gnss_reader.resume()
+        current_state = 'ONLINE'
+        if candidate:
+            agent.config['auto_base_candidate'] = candidate
+            agent.save_config()
+            _set_auto_base_progress('ready_for_review', **candidate)
+        await send_status(agent, mqtt_client)
 
 
 async def _run_auto_base_setup(agent: AgentManager, gnss_reader: GNSSReader, mqtt_client: mqtt.Client):
@@ -6322,7 +6222,12 @@ async def _run_auto_base_setup(agent: AgentManager, gnss_reader: GNSSReader, mqt
         'reconnectioninterval': 5
     }
     
-    temp_client = NTRIPClientWorker(temp_cfg, agent.log, correction_sink=gnss_reader.inject_rtcm)
+    session_datum = RTCMDatum()
+    session_messages = {}
+    def receive_correction(packet):
+        _receive_auto_base_correction(packet, gnss_reader, session_datum, session_messages)
+    temp_client = NTRIPClientWorker(temp_cfg, agent.log, correction_sink=receive_correction)
+    temp_client.datum_message_counts = session_messages
     global active_auto_base_client
     active_auto_base_client = temp_client
     
@@ -6476,10 +6381,18 @@ async def _run_auto_base_setup(agent: AgentManager, gnss_reader: GNSSReader, mqt
     
     logging.info(f"AutoBase: Averaged Pos -> Lat: {avg_lat:.10f}, Lon: {avg_lon:.10f}, Alt: {avg_alt:.4f}")
 
+    raw_coord = {"lat": f"{avg_lat:.10f}", "lon": f"{avg_lon:.10f}", "alt": f"{avg_alt:.4f}"}
+    temp_client.stop()
+    temp_client.join(timeout=5)
+    _cleanup_inject_queue(gnss_reader)
+    logging.info("AutoBase: NTRIP client stopped, inject queue cleaned up")
     transform_applied = False
+    transform_reason = "disabled" if not cfg.get("enable_itrf_vn2000_transform", False) else "not_applied"
     vn2000_neh = None
-    datum_snapshot = _datum_snapshot()
-    projection_source = "vn2000_table"
+    with DATUM_LOCK:
+        datum_snapshot = copy.deepcopy(session_datum)
+        received_messages = dict(session_messages)
+    projection_source = "not_used"
     province_code = None
     province_name = None
     province_hint = None
@@ -6490,27 +6403,31 @@ async def _run_auto_base_setup(agent: AgentManager, gnss_reader: GNSSReader, mqt
         datum_snapshot.k0 = float(cfg.get("k0"))
         if projection_source != "manual":
             projection_source = "manual_k0"
-    # Do not use RTCM1025 for projection parameters.
-    # Always infer L0 from VN2000 central-meridian table (unless manual override is provided).
-    if cfg.get("l0_deg") is None:
-        projection = _infer_vn2000_projection(avg_lat, avg_lon)
-        inferred_l0_deg = float(projection.get("l0_deg", 105.0))
-        datum_snapshot.l0 = math.radians(inferred_l0_deg)
-        if cfg.get("k0") is None:
-            datum_snapshot.k0 = float(projection.get("k0", 0.9999))
-        projection_source = str(projection.get("source") or "vn2000_table")
-        province_code = projection.get("province_code")
-        province_name = projection.get("province_name")
-        province_hint = projection.get("province_hint")
-        logging.info(
-            "AutoBase: Using VN2000 auto projection "
-            f"(province={province_name}, code={province_code}, hint={province_hint}, "
-            f"L0={inferred_l0_deg:.2f}, k0={datum_snapshot.k0:.6f}, source={projection_source})"
-        )
+    _set_auto_base_progress('resolving_location', raw_coord=raw_coord, step=4, total_steps=4)
+    await send_status(agent, mqtt_client)
+    try:
+        location = await asyncio.to_thread(_resolve_auto_base_location, avg_lat, avg_lon, avg_alt)
+    except Exception as exc:
+        location = {'state': 'lookup_failed', 'reason': str(exc)}
+    province_code = location.get('province_code')
+    province_name = location.get('province_name')
+    if cfg.get('enable_itrf_vn2000_transform', False):
+        if not datum_snapshot.rtcm1021_update:
+            raise ValueError('Chưa nhận RTCM 1021 của phiên CORS này; không dùng 7 tham số mặc định.')
+        if cfg.get('l0_deg') is None:
+            if datum_snapshot.rtcm1025_update:
+                projection_source = 'rtcm1025'
+            elif location.get('l0_deg') is not None:
+                datum_snapshot.l0 = math.radians(float(location['l0_deg']))
+                datum_snapshot.k0 = float(location['k0'])
+                projection_source = 'server_catalog'
+            else:
+                raise ValueError('Chưa xác định được vùng kinh tuyến trục. Cần RTCM 1025 hoặc chọn vùng rõ ràng.')
 
-    if bool(cfg.get("enable_itrf_vn2000_transform", True)):
+    if bool(cfg.get("enable_itrf_vn2000_transform", False)):
         try:
             if not _is_valid_vn2000_projection_params(datum_snapshot):
+                transform_reason = "invalid_projection"
                 logging.warning(
                     "AutoBase: Skip ITRF->VN2000 transform due to invalid L0/k0 "
                     f"(L0={math.degrees(datum_snapshot.l0):.6f}, k0={datum_snapshot.k0:.6f})"
@@ -6534,97 +6451,56 @@ async def _run_auto_base_setup(agent: AgentManager, gnss_reader: GNSSReader, mqt
                         f"N: {n_vn:.4f}, E: {e_vn:.4f}, H: {h_vn2000:.4f}"
                     )
                     transform_applied = True
+                    transform_reason = "applied"
                 else:
+                    transform_reason = "invalid_output"
                     logging.warning(
                         "AutoBase: Skip transformed coordinate out of range, fallback to LLH "
                         f"(lat={local_lat}, lon={local_lon}, alt={local_alt})"
                     )
         except Exception as e:
+            transform_reason = "transform_error"
             logging.warning(f"AutoBase: ITRF->VN2000 transform failed, fallback to averaged LLH: {e}")
     
-    temp_client.stop()
-    temp_client.join(timeout=5)
-    _cleanup_inject_queue(gnss_reader)
-    logging.info("AutoBase: NTRIP client stopped, inject queue cleaned up")
     
-    # State 4: Set BASE Mode
-    current_state = "AUTO_SETUP_BASE"
-    _set_auto_base_progress(
-        "set_base",
-        step=4,
-        total_steps=4,
-        averaged_coord={"lat": f"{avg_lat:.10f}", "lon": f"{avg_lon:.10f}", "alt": f"{avg_alt:.4f}"},
-        sample_count=len(coords),
-        transform_applied=transform_applied,
-        datum_status={
-            "rtcm1021": datum_snapshot.rtcm1021_update,
-            "rtcm1023": datum_snapshot.rtcm1023_update,
-            "rtcm1025": datum_snapshot.rtcm1025_update,
-            "projection_source": projection_source,
-            "province_code": province_code,
-            "province_name": province_name,
-            "province_hint": province_hint,
-            "vn2000_neh": vn2000_neh,
-        }
-    )
-    logging.info("AutoBase: Setting chip to BASE mode...")
-    await send_status(agent, mqtt_client)
-    
-    try:
-        await _apply_base_mode_to_chip(chip_type, port, avg_lat, avg_lon, avg_alt, gnss_reader)
-    except Exception as e:
-        logging.error(f"AutoBase: Failed to set BASE mode: {e}")
-        raise
-             
-    # Save base config in agent
-    agent.config['base_config'] = {
-        'coords': {
-            'lat': f"{avg_lat:.10f}",
-            'lon': f"{avg_lon:.10f}",
-            'alt': f"{avg_alt:.4f}"
-        },
-        'altitude_reference': 'ELLIPSOID',
-        'base_setup_method': 'AUTO_CORS',
-        'auto_configured': True,
-        'fixed_samples_only': True,
-        'itrf_vn2000_transform_applied': transform_applied,
-        'datum_1021_updated': datum_snapshot.rtcm1021_update,
-        'datum_1023_updated': datum_snapshot.rtcm1023_update,
-        'datum_1025_updated': datum_snapshot.rtcm1025_update,
-        'central_meridian_deg': round(math.degrees(datum_snapshot.l0), 8),
-        'k0': datum_snapshot.k0,
-        'projection_source': projection_source,
-        'province_code': province_code,
-        'province_name': province_name,
-        'province_hint': province_hint,
-        'vn2000_neh': vn2000_neh,
-        'auto_base_raw_itrf_llh': {
-            'lat': f"{round(_plain_mean([float(c[0]) for c in coords]), 10):.10f}",
-            'lon': f"{round(_plain_mean([float(c[1]) for c in coords]), 10):.10f}",
-            'alt': f"{round(_plain_mean([float(c[2]) for c in coords]), 4):.4f}",
-        },
-        'samples_collected': len(coords),
-        'timestamp': int(time.time())
+    if cfg.get('enable_itrf_vn2000_transform', False) and not transform_applied:
+        raise ValueError(f'Không chuyển đổi được tọa độ: {transform_reason}; chưa tạo kết quả để áp dụng.')
+
+    conversion_report = {
+        "version": 1,
+        "source": {"host": ntrip_host, "port": int(ntrip_port), "mountpoint": ntrip_mount},
+        "input_coord": raw_coord,
+        "output_coord": {"lat": f"{avg_lat:.10f}", "lon": f"{avg_lon:.10f}", "alt": f"{avg_alt:.4f}"},
+        "input_reference": "receiver_reported",
+        "output_reference": "local_llh" if transform_applied else "receiver_reported",
+        "altitude_reference": "ELLIPSOID",
+        "transform_requested": bool(cfg.get("enable_itrf_vn2000_transform", False)),
+        "transform_applied": transform_applied,
+        "reason": transform_reason,
+        "receiver_write_completed": False,
+        "received_messages": received_messages,
+        "parameter_source": "rtcm1021" if datum_snapshot.rtcm1021_update else "not_used",
+        "residual_source": "rtcm1023" if datum_snapshot.rtcm1023_update else "none",
+        "rtcm1025_used": projection_source == "rtcm1025",
+        "location": location,
+        "projection_source": projection_source,
+        "province_code": province_code, "province_name": province_name, "province_hint": province_hint,
+        "central_meridian_deg": round(math.degrees(datum_snapshot.l0), 8), "k0": datum_snapshot.k0,
+        "projected_coord": vn2000_neh,
+        "parameters": {key: getattr(datum_snapshot, key) for key in
+                       ("dX", "dY", "dZ", "rX", "rY", "rZ", "kT", "resB", "resL", "resH")},
+        "sample_count": len(coords),
     }
-    agent.config['gnss_config_pending'] = False
-    agent.save_config()
-    
-    # Disable auto_base_setup so it doesn't restart on reboot
-    agent.config['auto_base_setup'] = {"enabled": False}
-    agent.save_config()
-    
-    current_state = "ONLINE"
-    _set_auto_base_progress(
-        "completed",
-        step=4,
-        total_steps=4,
-        averaged_coord={"lat": f"{avg_lat:.10f}", "lon": f"{avg_lon:.10f}", "alt": f"{avg_alt:.4f}"},
-        sample_count=len(coords),
-        fixed_samples_only=True,
-        transform_applied=transform_applied
-    )
-    logging.info("=== AUTO BASE SETUP COMPLETE ===")
-    await send_status(agent, mqtt_client)
+
+    return {
+        'averaged_coord': conversion_report['output_coord'],
+        'raw_coord': raw_coord,
+        'sample_count': len(coords), 'fixed_samples_only': True,
+        'transform_applied': transform_applied, 'conversion_report': conversion_report,
+        'receiver_write_completed': False,
+        'updated_at': int(time.time()),
+    }
+
 
 # ==============================================================================
 # === MAIN FUNCTION                                                         ===
