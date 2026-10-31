@@ -22,6 +22,7 @@ import signal
 import statistics
 import struct
 from dataclasses import dataclass, field
+from decimal import Decimal, ROUND_DOWN
 from queue import Queue, Empty, Full
 from pathlib import Path
 from typing import Callable, Mapping
@@ -1605,14 +1606,14 @@ def _decode_type1025(buff: bytes, datum: RTCMDatum):
         return
 
     datum.l0 = l0_norm
-    datum.k0 = round(k0, 6)
+    datum.k0 = k0
     datum.false_easting = float(fe) * 0.001
     datum.false_northing = float(fn) * 0.001
     datum.rtcm1025_update = True
     logging.info(
         "RTCM1025 datum updated: "
-        f"L0_deg={math.degrees(datum.l0):.6f}, k0={datum.k0:.6f}, "
-        f"FE={datum.false_easting:.3f}, FN={datum.false_northing:.3f}"
+        f"L0_deg={math.degrees(datum.l0)!r}, k0={datum.k0!r}, "
+        f"FE={datum.false_easting!r}, FN={datum.false_northing!r}"
     )
 
 def _update_datum_from_rtcm_packet(packet: bytes, datum=None):
@@ -1969,9 +1970,9 @@ def dispatch_nmea_data(data):
                 now_ts = time.time()
                 if now_ts - getattr(dispatch_nmea_data, '_last_gga_log_ts', 0) >= 2.0:
                     dispatch_nmea_data._last_gga_log_ts = now_ts
-                    lat_str = f"{lat:.8f}" if lat is not None else "None"
-                    lon_str = f"{lon:.8f}" if lon is not None else "None"
-                    alt_str = f"{alt:.3f}m" if alt is not None else "None"
+                    lat_str = repr(lat) if lat is not None else "None"
+                    lon_str = repr(lon) if lon is not None else "None"
+                    alt_str = f"{alt!r}m" if alt is not None else "None"
                     logging.info(f"[GNSS NMEA] Rx GGA: {raw_line} | Fix={new_status} | Lat={lat_str} Lon={lon_str} Alt={alt_str}")
             except Exception:
                 pass
@@ -4168,7 +4169,7 @@ def _base_ubx_position(payload, *, survey=False, ready=False):
         raise ValueError("Invalid UBX base coordinates")
     return dict(state='ok', message='UBX', position_type='FIXEDPOS' if ready else 'SURVEY-IN-ESTIMATE',
                 datum='WGS84', altitude_reference='ELLIPSOID',
-                lat=f'{lat:.11f}', lon=f'{lon:.11f}', alt=f'{height:.4f}')
+                lat=repr(lat), lon=repr(lon), alt=repr(height))
 
 
 def _base_unicore_fields(packet):
@@ -4689,7 +4690,7 @@ class AgentManager:
                 self.log("ERROR", f"[Antenna Quality] {antenna_message}")
                 self._last_antenna_fault_log_ts = now_ts
         with DATUM_LOCK:
-            datum_l0_deg = round(math.degrees(AUTO_BASE_DATUM.l0), 8)
+            datum_l0_deg = math.degrees(AUTO_BASE_DATUM.l0)
             datum_k0 = AUTO_BASE_DATUM.k0
             datum_1021 = AUTO_BASE_DATUM.rtcm1021_update
             datum_1023 = AUTO_BASE_DATUM.rtcm1023_update
@@ -5189,7 +5190,7 @@ async def _process_command(source: str, data: dict, agent: AgentManager, gnss_re
                 "samples": auto_setup_metadata.get("samples", 60),
                 "sensor_type": auto_setup_metadata.get("sensor_type"),
                 "review_only": True,
-                "enable_itrf_vn2000_transform": auto_setup_metadata.get("enable_itrf_vn2000_transform", False),
+                "enable_itrf_vn2000_transform": str(auto_setup_metadata.get("ip") or "").strip() == "14.238.1.125",
                 "l0_deg": auto_setup_metadata.get("l0_deg"),
                 "k0": auto_setup_metadata.get("k0")
             }
@@ -5787,9 +5788,9 @@ def _set_auto_base_progress(phase: str, **extra):
         "gga_age_seconds": gga_age,
         "gga_fix_status": fix_status,
         "current_coord": {
-            "lat": f"{coord[0]:.10f}" if coord and coord[0] is not None else None,
-            "lon": f"{coord[1]:.10f}" if coord and coord[1] is not None else None,
-            "alt": f"{coord[2]:.4f}" if coord and coord[2] is not None else None,
+            "lat": repr(coord[0]) if coord and coord[0] is not None else None,
+            "lon": repr(coord[1]) if coord and coord[1] is not None else None,
+            "alt": repr(coord[2]) if coord and coord[2] is not None else None,
         } if coord else None,
     }
     client = globals().get('active_auto_base_client')
@@ -5890,7 +5891,7 @@ async def _apply_base_mode_to_chip(chip_type: str, port: str, lat: float, lon: f
                 _verify_ublox_tmode(ser, msg)
             elif chip_type in ("Unicorecomm", "RTCM3_Source"):
                 # Use higher precision for command string to avoid rounding
-                base_cmd = f"MODE BASE {lat:.10f} {lon:.10f} {alt:.3f}\r\n".encode("ascii")
+                base_cmd = f"MODE BASE {Decimal(repr(lat)):f} {Decimal(repr(lon)):f} {Decimal(repr(alt)):f}\r\n".encode("ascii")
                 # Auto Base supplies ellipsoidal h; Unicore's default is geoid-based altitude.
                 ser.write(b"CONFIG UNDULATION 0.0\r\n")
                 ser.flush()
@@ -6161,6 +6162,7 @@ async def _run_auto_base_setup(agent: AgentManager, gnss_reader: GNSSReader, mqt
     global current_state, LAST_GGA_COORD
     
     cfg = agent.config.get("auto_base_setup", {})
+    enable_transform = str(cfg.get("ip") or "").strip() == "14.238.1.125"
     if not cfg:
         # Default disabled if not in config
         return
@@ -6375,19 +6377,19 @@ async def _run_auto_base_setup(agent: AgentManager, gnss_reader: GNSSReader, mqt
         await send_status(agent, mqtt_client)
         return
         
-    avg_lat = round(_plain_mean([float(c[0]) for c in coords]), 10)
-    avg_lon = round(_plain_mean([float(c[1]) for c in coords]), 10)
-    avg_alt = round(_plain_mean([float(c[2]) for c in coords]), 4)
+    avg_lat = _plain_mean([float(c[0]) for c in coords])
+    avg_lon = _plain_mean([float(c[1]) for c in coords])
+    avg_alt = _plain_mean([float(c[2]) for c in coords])
     
-    logging.info(f"AutoBase: Averaged Pos -> Lat: {avg_lat:.10f}, Lon: {avg_lon:.10f}, Alt: {avg_alt:.4f}")
+    logging.info(f"AutoBase: Averaged Pos -> Lat: {avg_lat!r}, Lon: {avg_lon!r}, Alt: {avg_alt!r}")
 
-    raw_coord = {"lat": f"{avg_lat:.10f}", "lon": f"{avg_lon:.10f}", "alt": f"{avg_alt:.4f}"}
+    raw_coord = {"lat": repr(avg_lat), "lon": repr(avg_lon), "alt": repr(avg_alt)}
     temp_client.stop()
     temp_client.join(timeout=5)
     _cleanup_inject_queue(gnss_reader)
     logging.info("AutoBase: NTRIP client stopped, inject queue cleaned up")
     transform_applied = False
-    transform_reason = "disabled" if not cfg.get("enable_itrf_vn2000_transform", False) else "not_applied"
+    transform_reason = "disabled" if not enable_transform else "not_applied"
     vn2000_neh = None
     with DATUM_LOCK:
         datum_snapshot = copy.deepcopy(session_datum)
@@ -6411,7 +6413,7 @@ async def _run_auto_base_setup(agent: AgentManager, gnss_reader: GNSSReader, mqt
         location = {'state': 'lookup_failed', 'reason': str(exc)}
     province_code = location.get('province_code')
     province_name = location.get('province_name')
-    if cfg.get('enable_itrf_vn2000_transform', False):
+    if enable_transform:
         if not datum_snapshot.rtcm1021_update:
             raise ValueError('Chưa nhận RTCM 1021 của phiên CORS này; không dùng 7 tham số mặc định.')
         if cfg.get('l0_deg') is None:
@@ -6424,13 +6426,16 @@ async def _run_auto_base_setup(agent: AgentManager, gnss_reader: GNSSReader, mqt
             else:
                 raise ValueError('Chưa xác định được vùng kinh tuyến trục. Cần RTCM 1025 hoặc chọn vùng rõ ràng.')
 
-    if bool(cfg.get("enable_itrf_vn2000_transform", False)):
+    if enable_transform and abs(datum_snapshot.k0 - 0.9996) > 1e-9:
+        raise ValueError('Yêu cầu múi 6 độ (k0=0.9996). Nguồn đang gửi múi khác; chọn mountpoint M6, không dùng M3.')
+
+    if bool(enable_transform):
         try:
             if not _is_valid_vn2000_projection_params(datum_snapshot):
                 transform_reason = "invalid_projection"
                 logging.warning(
                     "AutoBase: Skip ITRF->VN2000 transform due to invalid L0/k0 "
-                    f"(L0={math.degrees(datum_snapshot.l0):.6f}, k0={datum_snapshot.k0:.6f})"
+                    f"(L0={math.degrees(datum_snapshot.l0)!r}, k0={datum_snapshot.k0!r})"
                 )
             else:
                 n_vn, e_vn, h_vn2000, local_lat, local_lon, local_alt = _transform_itrf_to_vn2000_neh_and_llh(avg_lat, avg_lon, avg_alt, datum_snapshot)
@@ -6441,14 +6446,14 @@ async def _run_auto_base_setup(agent: AgentManager, gnss_reader: GNSSReader, mqt
                     and -1000.0 <= local_alt <= 100000.0
                 ):
                     vn2000_neh = {"north": n_vn, "east": e_vn, "h": h_vn2000}
-                    avg_lat = round(local_lat, 10)
-                    avg_lon = round(local_lon, 10)
-                    avg_alt = round(local_alt, 4)
+                    avg_lat = local_lat
+                    avg_lon = local_lon
+                    avg_alt = local_alt
                     logging.info(
                         "AutoBase: ITRF->VN2000 transform applied "
-                        f"(L0={math.degrees(datum_snapshot.l0):.6f}, k0={datum_snapshot.k0:.6f}, source={projection_source}) "
-                        f"-> Lat: {avg_lat:.10f}, Lon: {avg_lon:.10f}, Alt: {avg_alt:.4f}, "
-                        f"N: {n_vn:.4f}, E: {e_vn:.4f}, H: {h_vn2000:.4f}"
+                        f"(L0={math.degrees(datum_snapshot.l0)!r}, k0={datum_snapshot.k0!r}, source={projection_source}) "
+                        f"-> Lat: {avg_lat!r}, Lon: {avg_lon!r}, Alt: {avg_alt!r}, "
+                        f"N: {n_vn!r}, E: {e_vn!r}, H: {h_vn2000!r}"
                     )
                     transform_applied = True
                     transform_reason = "applied"
@@ -6463,18 +6468,27 @@ async def _run_auto_base_setup(agent: AgentManager, gnss_reader: GNSSReader, mqt
             logging.warning(f"AutoBase: ITRF->VN2000 transform failed, fallback to averaged LLH: {e}")
     
     
-    if cfg.get('enable_itrf_vn2000_transform', False) and not transform_applied:
+    if enable_transform and not transform_applied:
         raise ValueError(f'Không chuyển đổi được tọa độ: {transform_reason}; chưa tạo kết quả để áp dụng.')
+
+    calculated_coord = {"lat": repr(avg_lat), "lon": repr(avg_lon), "alt": repr(avg_alt)}
+    final_coord = dict(calculated_coord)
+    if chip_type == 'Ublox':
+        # Quantize only the receiver command, never the transformation inputs/report.
+        for key, digits in (('lat', 9), ('lon', 9), ('alt', 4)):
+            final_coord[key] = format(Decimal(calculated_coord[key]).quantize(
+                Decimal(1).scaleb(-digits), rounding=ROUND_DOWN), f'.{digits}f')
 
     conversion_report = {
         "version": 1,
         "source": {"host": ntrip_host, "port": int(ntrip_port), "mountpoint": ntrip_mount},
         "input_coord": raw_coord,
-        "output_coord": {"lat": f"{avg_lat:.10f}", "lon": f"{avg_lon:.10f}", "alt": f"{avg_alt:.4f}"},
+        "calculated_coord": calculated_coord,
+        "output_coord": final_coord,
         "input_reference": "receiver_reported",
         "output_reference": "local_llh" if transform_applied else "receiver_reported",
         "altitude_reference": "ELLIPSOID",
-        "transform_requested": bool(cfg.get("enable_itrf_vn2000_transform", False)),
+        "transform_requested": bool(enable_transform),
         "transform_applied": transform_applied,
         "reason": transform_reason,
         "receiver_write_completed": False,
@@ -6484,8 +6498,9 @@ async def _run_auto_base_setup(agent: AgentManager, gnss_reader: GNSSReader, mqt
         "rtcm1025_used": projection_source == "rtcm1025",
         "location": location,
         "projection_source": projection_source,
+        "zone_width_deg": 6 if transform_applied else None,
         "province_code": province_code, "province_name": province_name, "province_hint": province_hint,
-        "central_meridian_deg": round(math.degrees(datum_snapshot.l0), 8), "k0": datum_snapshot.k0,
+        "central_meridian_deg": math.degrees(datum_snapshot.l0), "k0": datum_snapshot.k0,
         "projected_coord": vn2000_neh,
         "parameters": {key: getattr(datum_snapshot, key) for key in
                        ("dX", "dY", "dZ", "rX", "rY", "rZ", "kT", "resB", "resL", "resH")},
@@ -6495,6 +6510,7 @@ async def _run_auto_base_setup(agent: AgentManager, gnss_reader: GNSSReader, mqt
     return {
         'averaged_coord': conversion_report['output_coord'],
         'raw_coord': raw_coord,
+        'calculated_coord': calculated_coord,
         'sample_count': len(coords), 'fixed_samples_only': True,
         'transform_applied': transform_applied, 'conversion_report': conversion_report,
         'receiver_write_completed': False,
