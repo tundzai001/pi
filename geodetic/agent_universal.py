@@ -4026,18 +4026,18 @@ class GNSSReader(threading.Thread):
             # Read-only Unicore replies share the RTCM stream, not the NMEA channel.
             elif buffer[0] == ord('#'):
                 if buffer.startswith(b'#UNILOGLIST,'):
-                    # UNILOGLIST is a multi-line ASCII log with one final CRC.
+                    # Firmware may end the list with CRC32 or a blank line.
                     request = getattr(self, '_base_query', None)
                     if request and request['key'] == b'#UNILOGLIST' and not request['cancelled']:
                         request['response_preview'] = bytes(buffer[:512])
-                    trailer = re.search(rb'\*[0-9a-fA-F]{8}\r?\n', buffer)
+                    trailer = re.search(rb'\*[0-9a-fA-F]{8}\r?\n|\r?\n\r?\n', buffer)
                     if trailer is None:
                         if len(buffer) <= 4096:
                             break
                         buffer.pop(0)
                         self.parse_errors += 1
                         continue
-                    packet = bytes(buffer[:trailer.end()]).strip()
+                    packet = bytes(buffer[:trailer.end()])
                     self._deliver_base_reply(b'#UNILOGLIST', packet)
                     buffer = buffer[trailer.end():]
                     continue
@@ -4573,9 +4573,20 @@ def _gnss_verification_expected(payload):
 
 
 def _parse_unicore_loglist(packet):
-    _, body = _base_unicore_fields(packet)
     if not packet.startswith(b'#UNILOGLIST,') or len(packet) > 4096:
         raise ValueError('Invalid UNILOGLIST header/size')
+    if b'*' in packet:
+        _, body = _base_unicore_fields(packet)
+    else:
+        # Some firmware returns a counted list and blank terminator without CRC.
+        if not packet.endswith((b'\r\n\r\n', b'\n\n')):
+            raise ValueError('Incomplete UNILOGLIST terminator')
+        text = packet.decode('ascii')
+        if any(ord(char) < 32 and char not in '\t\r\n' or ord(char) == 127 for char in text):
+            raise ValueError('Invalid UNILOGLIST characters')
+        body = text.split(';', 1)[1]
+        if any(not line.lstrip().startswith('<') for line in body.splitlines() if line.strip()):
+            raise ValueError('Invalid UNILOGLIST row prefix')
     lines = [line.strip().lstrip('<').strip() for line in body.splitlines() if line.strip()]
     if not lines or not re.fullmatch(r'\d+', lines[0]) or not 0 <= int(lines[0]) <= 64 or len(lines) != int(lines[0]) + 1:
         raise ValueError('Incomplete UNILOGLIST entries')
