@@ -4296,7 +4296,7 @@ def _gnss_verification_expected(payload):
     keys = set()
     for offset in range(0, len(output), 5):
         key, value = struct.unpack_from('<IB', output, offset)
-        if (key >> 16 not in (0x2091, 0x1074, 0x1076, 0x1078)
+        if (key not in (0x10510003, 0x10520005, 0x10530005, 0x10650001, 0x10640006) and key >> 16 not in (0x2091, 0x1072, 0x1074, 0x1076, 0x1078, 0x107a)
                 or key & 0xffff == 0xffff or value not in (0, 1) or key in keys):
             raise ValueError('Invalid or duplicate output verification key')
         keys.add(key)
@@ -4349,10 +4349,13 @@ async def _verify_unicore_configuration(agent, reader, payload, command_id):
             or any(not isinstance(name, str) or not re.fullmatch(r'[A-Z][A-Z0-9]{1,23}', name) for name in expected_logs)):
         raise ValueError('Invalid Unicore verification expectation')
     groups = {name: dict(checked=0, mismatched=0, unread=0) for name in ('fixed', 'diagnostics', 'rtcm')}
-    result = dict(command_id=command_id, groups=groups)
+    details = dict(kind='Unicorecomm', fixed={'expected': {'mode': 'Fixed', 'self_position': dict(zip(('lat', 'lon', 'alt'), wanted_position))}},
+                   logs=[], expected_logs=expected_logs, compare_ports=[payload.get('port')])
+    result = dict(command_id=command_id, groups=groups, details=details)
     try:
         _, mode = _base_unicore_fields(await reader.query_base(b'\r\nMODE\r\n', b'#MODE'))
         mode = mode.upper()
+        details['fixed']['actual'] = {'mode': mode}
         if not mode.startswith(('MODE BASE', 'MODE ROVER')):
             raise ValueError('Invalid Unicore MODE response')
         if not mode.startswith('MODE BASE') or mode.startswith('MODE BASE TIME'):
@@ -4367,6 +4370,8 @@ async def _verify_unicore_configuration(agent, reader, payload, command_id):
                 raise ValueError('Invalid Unicore fixed position')
             if payload.get('altitude_reference') == 'ELLIPSOID':
                 height += undulation
+            details['fixed']['actual'].update(self_position={'lat': latitude, 'lon': longitude, 'alt': height},
+                                                height_msl=float(fields[4]), undulation=undulation, datum=fields[6], position_type=fields[1])
             matches = all(abs(a - b) <= tolerance for a, b, tolerance in zip(
                 (latitude, longitude, height), wanted_position, (1e-9, 1e-9, 0.0001)))
             groups['fixed'].update(checked=1, mismatched=int(not matches))
@@ -4375,6 +4380,8 @@ async def _verify_unicore_configuration(agent, reader, payload, command_id):
         result['mode_error'] = str(error)[:200]
     try:
         logs = _parse_unicore_loglist(await reader.query_base(b'\r\nUNILOGLIST\r\n', b'#UNILOGLIST'))
+        details['logs'] = [dict(port=port, name=name, period=period) for (port, name), period in logs.items()]
+        details['logs_state'] = 'ok'
         port = payload.get('port')
         if port not in ('COM1', 'COM2', 'COM3'):
             raise ValueError('Unicore output port is not identified')
@@ -4386,6 +4393,7 @@ async def _verify_unicore_configuration(agent, reader, payload, command_id):
             groups[name]['mismatched'] = sum(key not in expected_logs or key not in active
                                             or abs(active[key] - 1) > 1e-6 for key in keys)
     except Exception as error:
+        details.setdefault('logs_state', 'unread')
         groups['diagnostics']['unread'] = groups['rtcm']['unread'] = 1
         result['output_error'] = str(error)[:200]
         result['note'] = 'Chưa đọc đủ danh sách bản tin và cổng đầu ra từ UM.'
@@ -4407,6 +4415,33 @@ async def verify_receiver_configuration(agent, reader, payload, command_id):
     groups = {name: dict(checked=0, mismatched=0, unread=0)
               for name in ('fixed', 'protocols', 'diagnostics', 'rtcm')}
     result = dict(command_id=command_id, groups=groups)
+    inspection = payload.get('readback')
+    details = None
+    if inspection:
+        fields = inspection.get('fields', [])
+        if not 3 <= len(fields) <= 40 or any(not isinstance(field, str) or len(field) > 32 for field in fields):
+            raise ValueError('Invalid readback field names')
+        if len(inspection.get('ports', [])) != 5:
+            raise ValueError('Expected five u-blox readback ports')
+        jobs = []
+        for port in inspection['ports']:
+            if port.get('name') not in ('I2C', 'UART1', 'UART2', 'USB', 'SPI') or any(name == port['name'] for name, _ in jobs):
+                raise ValueError('Invalid or duplicate readback port')
+            _, port_records = _gnss_verification_expected({**payload, 'output_b64': port.get('output_b64')})
+            if len(port_records) != len(fields):
+                raise ValueError('Readback field/key count mismatch')
+            jobs.append((port['name'], port_records))
+        details = dict(kind='Ublox', fields=fields, expected=inspection.get('expected', []),
+                       compare_ports=inspection.get('compare_ports', []), ports=[], fixed={})
+        result['details'] = details
+    else:
+        jobs = [(None, records[i:i + 40]) for i in range(0, len(records), 40)]
+    desired = dict(records)
+    if details is not None:
+        for port_name, chunk in jobs:
+            if port_name in details['compare_ports']:
+                for key, _ in chunk:
+                    if key in (0x10510003, 0x10520005, 0x10530005, 0x10650001, 0x10640006): desired[key] = 1
     try:
         actual = _base_ubx_payload(await reader.query_base(_ubx_packet(6, 0x71), (6, 0x71)), (6, 0x71))
         expected_position = [struct.unpack_from('<i', expected, 4 + i * 4)[0] * 100
@@ -4419,12 +4454,25 @@ async def verify_receiver_configuration(agent, reader, payload, command_id):
                    and all(abs(a - b) <= 1 for a, b in zip(actual_position, expected_position))
                    and abs(struct.unpack_from('<I', actual, 20)[0] - struct.unpack_from('<I', expected, 20)[0]) <= 1)
         groups['fixed'].update(checked=1, mismatched=int(not matches))
+        if details is not None:
+            def describe(mode):
+                state = dict(mode={0: 'Rover', 1: 'Survey-In', 2: 'Fixed'}.get(mode[2], 'Unknown'),
+                             coordinate_type='LLA' if mode[3] & 1 else 'ECEF',
+                             accuracy_m=struct.unpack_from('<I', mode, 20)[0] * 0.0001)
+                if mode[2] == 2:
+                    position = _base_ubx_position(mode, ready=True)
+                    if mode[3] & 1:
+                        units = [struct.unpack_from('<i', mode, 4 + i * 4)[0] * 100
+                                 + struct.unpack_from('<b', mode, 16 + i)[0] for i in range(3)]
+                        position.update(lat=f'{units[0] / 1e9:.9f}', lon=f'{units[1] / 1e9:.9f}', alt=f'{units[2] / 1e4:.4f}')
+                    state.update(self_position=position)
+                return state
+            details['fixed'] = dict(actual=describe(actual), expected=describe(expected))
     except Exception as error:
         groups['fixed']['unread'] = 1
         result['mode_error'] = str(error)[:200]
 
-    for offset in range(0, len(records), 40):
-        chunk = records[offset:offset + 40]
+    for port_name, chunk in jobs:
         values = None
         try:
             poll = b'\0\0\0\0' + b''.join(struct.pack('<I', key) for key, _ in chunk)
@@ -4440,7 +4488,28 @@ async def verify_receiver_configuration(agent, reader, payload, command_id):
         except Exception as error:
             values = None
             result['output_error'] = str(error)[:200]
-        for key, wanted in chunk:
+        if details is not None:
+            port = dict(name=port_name, state='ok' if values is not None else 'unread',
+                        values=[values[key] for key, _ in chunk] if values is not None else None)
+            if values is not None and 'PORT_ENABLED' in details['fields']:
+                port['enabled'] = port['values'][details['fields'].index('PORT_ENABLED')]
+            if values is None:
+                port['error'] = result.get('output_error', 'Readback unavailable')
+            if port_name in ('UART1', 'UART2'):
+                try:
+                    port_id = int(port_name[-1])
+                    reply = await reader.query_base(_ubx_packet(6, 0, bytes([port_id])), (6, 0))
+                    body = reply[6:-2]
+                    if len(body) != 20 or reply != _ubx_packet(6, 0, body) or body[0] != port_id:
+                        raise ValueError('Invalid CFG-PRT response')
+                    port['baud'] = struct.unpack_from('<I', body, 8)[0]
+                except Exception:
+                    port['baud'] = None
+            details['ports'].append(port)
+        for key, _ in chunk:
+            if key not in desired:
+                continue
+            wanted = desired[key]
             name = 'protocols' if key >> 28 == 1 else 'rtcm' if key >= 0x209102bd else 'diagnostics'
             group = groups[name]
             group['checked' if values is not None else 'unread'] += 1
@@ -4457,7 +4526,7 @@ def receiver_base_system_info(agent):
     result = copy.deepcopy(getattr(agent, 'receiver_base_readback', {}))
     checked_at = getattr(agent, 'receiver_base_readback_at', None)
     age = max(0, time.monotonic() - checked_at) if checked_at is not None else None
-    system = dict(gnss_verification_supported=True, gnss_verification_uart1=False,
+    system = dict(gnss_verification_supported=True, gnss_verification_details_supported=True, gnss_verification_uart1=False,
                   gnss_verification=None)
     verification = getattr(agent, 'gnss_verification', None)
     verified_at = getattr(agent, 'gnss_verification_at', None)
