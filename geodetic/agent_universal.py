@@ -20,6 +20,7 @@ import uuid
 import platform
 import signal
 import statistics
+import sqlite3
 import struct
 from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_DOWN
@@ -526,23 +527,58 @@ def _rf_monitor_decode(snapshot, source, limit):
 
 class GnssRfMonitor:
     """Ten minutes of distinct RF samples plus one matching satellite snapshot."""
-    def __init__(self):
+    def __init__(self, history_path=None):
         self.samples = deque(maxlen=120)
         self.previous_cno = {}
         self.previous_at = None
         self.source = None
         self.started_at = None
+        self.previous_epoch = None
+        self.history_path = history_path
+        self.history = None
+        self.history_error = None
+
+    def _archive(self, sample, now):
+        if not self.history_path:
+            return
+        connection = None
+        try:
+            connection = sqlite3.connect(self.history_path, timeout=1)
+            with connection:
+                connection.execute('CREATE TABLE IF NOT EXISTS rf_samples (at REAL PRIMARY KEY, source TEXT, severity INTEGER, delta REAL, matched INTEGER, changed INTEGER, minimum REAL, maximum REAL)')
+                if sample:
+                    connection.execute('INSERT OR IGNORE INTO rf_samples VALUES (?,?,?,?,?,?,?,?)',
+                        (sample['at'], self.source, sample['severity'], sample['cno_delta'], sample['matched'], sample['changed'], sample['minimum'], sample['maximum']))
+                connection.execute('DELETE FROM rf_samples WHERE at < ?', (now - 86400,))
+                connection.execute('DELETE FROM rf_samples WHERE at NOT IN (SELECT at FROM rf_samples ORDER BY at DESC LIMIT 20000)')
+                source = self.source
+                if source is None:
+                    row = connection.execute('SELECT source FROM rf_samples ORDER BY at DESC LIMIT 1').fetchone()
+                    source = row[0] if row else None
+                rows = connection.execute('SELECT CAST(at/3600 AS INTEGER)*3600, COUNT(*), SUM(severity>0), SUM(severity=2), COALESCE(SUM(severity>0 AND delta<=-3),0), COUNT(delta), MIN(delta) FROM rf_samples WHERE source=? GROUP BY 1 ORDER BY 1', (source,)).fetchall()
+                bounds = connection.execute('SELECT MIN(at),MAX(at) FROM rf_samples WHERE source=?', (source,)).fetchone()
+            self.history = {'source':source, 'hours':[list(row) for row in rows], 'first_sample_at':bounds[0], 'last_sample_at':bounds[1]} if rows else None
+            self.history_error = None
+        except (sqlite3.Error, OSError) as error:
+            self.history_error = 'Không ghi được lịch sử tại Pi.'
+            logging.warning('[GNSS][RF HISTORY] %s', error)
+        finally:
+            if connection is not None:
+                connection.close()
 
     def observe(self, payload, now):
         while self.samples and now - self.samples[0]['at'] > 600:
             self.samples.popleft()
         raw = payload.get('gnss_rf')
         age, severity = None, None
+        blocks = []
         source = raw.get('source') if isinstance(raw, dict) else None
         if payload.get('status') != 'offline' and source == 'ubx_mon_rf':
             data = _rf_monitor_decode(raw, source, 136)
             if data and len(data) >= 4 and data[0] == 0 and 1 <= data[1] <= 4 and len(data) == 4 + 24 * data[1]:
-                flags = [data[offset + 1] & 3 for offset in range(4, len(data), 24)]
+                blocks = [[data[o], data[o + 1] & 3, int.from_bytes(data[o+12:o+14], 'little'),
+                           int.from_bytes(data[o+14:o+16], 'little'), data[o+16]] for o in range(4, len(data), 24)]
+                flags = [block[1] for block in blocks]
                 # Any unknown block means coverage is incomplete, unless another warns.
                 severity = max(flags) if max(flags) >= 2 or 0 not in flags else None
                 if severity is not None:
@@ -565,15 +601,18 @@ class GnssRfMonitor:
             self.previous_at = None
             self.source = source
             self.started_at = None
+            self.previous_epoch = None
         sample_at = now - age if age is not None else None
         if severity is not None and (not self.samples or sample_at - self.samples[-1]['at'] >= 5):
             if self.started_at is None:
                 self.started_at = sample_at
             cno = {}
+            epoch = None
             satellites = payload.get('gnss_satellites')
             data = _rf_monitor_decode(satellites, 'ubx_nav_sat', 2060) if source == 'ubx_mon_rf' else None
             if (data and len(data) >= 8 and data[4] == 1 and data[5] <= 128
                     and len(data) == 8 + 12 * data[5] and abs(_rf_monitor_age(satellites) - age) <= 10):
+                epoch = int.from_bytes(data[:4], 'little')
                 for offset in range(8, len(data), 12):
                     gnss, sv, value = data[offset:offset + 3]
                     flags = int.from_bytes(data[offset + 8:offset + 12], 'little')
@@ -585,25 +624,41 @@ class GnssRfMonitor:
                         cno[key] = value
             common = cno.keys() & self.previous_cno.keys()
             delta = None
-            if len(common) >= 4 and self.previous_at is not None and 0 < sample_at - self.previous_at <= 45:
-                delta = round(statistics.median(cno[key] - self.previous_cno[key] for key in common), 1)
+            changes = []
+            if len(common) >= 4 and epoch != self.previous_epoch and self.previous_at is not None and 0 < sample_at - self.previous_at <= 45:
+                changes = [cno[key] - self.previous_cno[key] for key in common]
+                delta = round(statistics.median(changes), 1)
             self.samples.append({'at': sample_at, 'severity': severity, 'cno_delta': delta,
-                                 'matched': len(common) if delta is not None else 0})
-            self.previous_cno, self.previous_at = cno, sample_at
-        if not self.samples:
+                                 'rf_blocks': blocks, 'matched': len(changes), 'changed': sum(value != 0 for value in changes),
+                                 'minimum': min(changes) if changes else None, 'maximum': max(changes) if changes else None})
+            if epoch != self.previous_epoch:
+                self.previous_cno, self.previous_at, self.previous_epoch = cno, sample_at, epoch
+            self._archive(self.samples[-1], now)
+        elif self.history_path:
+            self._archive(None, now)
+        if not self.samples and not self.history:
             return None
         warnings = [sample for sample in self.samples if sample['severity'] > 0]
         episodes = sum(sample['severity'] > 0 and (index == 0 or self.samples[index - 1]['severity'] == 0
                        or sample['at'] - self.samples[index - 1]['at'] > 45)
                        for index, sample in enumerate(self.samples))
-        last = self.samples[-1]
-        return {'source': self.source, 'window_seconds': 600, 'sample_count': len(self.samples),
-                'observed_seconds': min(600, max(0, round(last['at'] - self.started_at, 1))),
-                'samples': [[round(last['at'] - sample['at'], 1), sample['severity'], sample['cno_delta']] for sample in self.samples],
+        block_ranges = []
+        for index in range(4):
+            readings = [sample['rf_blocks'][index] for sample in self.samples if len(sample['rf_blocks']) > index]
+            if readings:
+                # Preserve receiver order: old firmware can report duplicate block IDs.
+                block_ranges.append([index + 1, readings[-1][0], len(readings),
+                    sum(row[1] == 2 for row in readings), sum(row[1] == 3 for row in readings),
+                    *[value for column in (2, 3, 4) for value in (min(row[column] for row in readings), max(row[column] for row in readings))]])
+        last = self.samples[-1] if self.samples else {'at':self.history['last_sample_at'], 'cno_delta':None, 'matched':0}
+        return {'source': self.source or self.history['source'], 'window_seconds': 600, 'sample_count': len(self.samples),
+                'observed_seconds': min(600, max(0, round(last['at'] - self.started_at, 1))) if self.started_at is not None else 0,
+                'samples': [[round(last['at'] - sample['at'], 1), sample['severity'], sample['cno_delta'], sample['matched'], sample['changed'], sample['minimum'], sample['maximum']] for sample in self.samples],
+                'history_24h': self.history, 'history_error': self.history_error, 'block_ranges': block_ranges,
                 'warning_samples': len(warnings), 'critical_samples': sum(sample['severity'] == 2 for sample in self.samples),
                 'episodes': episodes, 'coincident_cno_drops': sum(sample['cno_delta'] is not None and sample['cno_delta'] <= -3 for sample in warnings),
                 'quality_comparisons': sum(sample['cno_delta'] is not None for sample in self.samples),
-                'first_sample_at': self.samples[0]['at'], 'last_sample_at': last['at'],
+                'first_sample_at': self.samples[0]['at'] if self.samples else last['at'], 'last_sample_at': last['at'],
                 'last_warning_at': warnings[-1]['at'] if warnings else None,
                 'current_severity': severity, 'cno_delta_dbhz': last['cno_delta'], 'matched_satellites': last['matched']}
 
@@ -659,7 +714,10 @@ def receiver_quality_status(now):
 
 
 def _update_automatic_rf_monitor():
-    monitor = globals().setdefault('AUTOMATIC_RF_MONITOR', GnssRfMonitor())
+    monitor = globals().get('AUTOMATIC_RF_MONITOR')
+    if monitor is None:
+        monitor = GnssRfMonitor(os.path.join(BASE_DIR, 'gnss_rf_history.sqlite3'))
+        globals()['AUTOMATIC_RF_MONITOR'] = monitor
     now = time.time()
     globals()['AUTOMATIC_RF_REPORT'] = monitor.observe(dict(receiver_quality_status(now), status='online'), now)
 
