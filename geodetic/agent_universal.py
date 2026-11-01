@@ -531,6 +531,7 @@ class GnssRfMonitor:
         self.previous_cno = {}
         self.previous_at = None
         self.source = None
+        self.started_at = None
 
     def observe(self, payload, now):
         while self.samples and now - self.samples[0]['at'] > 600:
@@ -563,8 +564,11 @@ class GnssRfMonitor:
             self.previous_cno = {}
             self.previous_at = None
             self.source = source
+            self.started_at = None
         sample_at = now - age if age is not None else None
         if severity is not None and (not self.samples or sample_at - self.samples[-1]['at'] >= 5):
+            if self.started_at is None:
+                self.started_at = sample_at
             cno = {}
             satellites = payload.get('gnss_satellites')
             data = _rf_monitor_decode(satellites, 'ubx_nav_sat', 2060) if source == 'ubx_mon_rf' else None
@@ -594,6 +598,8 @@ class GnssRfMonitor:
                        for index, sample in enumerate(self.samples))
         last = self.samples[-1]
         return {'source': self.source, 'window_seconds': 600, 'sample_count': len(self.samples),
+                'observed_seconds': min(600, max(0, round(last['at'] - self.started_at, 1))),
+                'samples': [[round(last['at'] - sample['at'], 1), sample['severity'], sample['cno_delta']] for sample in self.samples],
                 'warning_samples': len(warnings), 'critical_samples': sum(sample['severity'] == 2 for sample in self.samples),
                 'episodes': episodes, 'coincident_cno_drops': sum(sample['cno_delta'] is not None and sample['cno_delta'] <= -3 for sample in warnings),
                 'quality_comparisons': sum(sample['cno_delta'] is not None for sample in self.samples),
