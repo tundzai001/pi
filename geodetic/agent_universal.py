@@ -432,12 +432,10 @@ def _ubx_satellite_payload(payload):
 def _ubx_rf_payload(payload, message_id):
     size = {0x38: 24, 0x31: 272}.get(message_id)
     if size is None or len(payload) < 4 or payload[0] != 0 or not 1 <= payload[1] <= 4 or len(payload) != 4 + payload[1] * size:
-        raise ValueError('Invalid MON-RF/MON-SPAN payload')
-    if message_id == 0x38:
-        blocks = [payload[i] for i in range(4, len(payload), size)]
-        if len(set(blocks)) != len(blocks) or any(struct.unpack_from('<H', payload, i + 14)[0] > 8191 for i in range(4, len(payload), size)):
-            raise ValueError('Invalid RF block identifiers or AGC')
-    else:
+        raise ValueError(f'Invalid RF payload: id={message_id:02x} bytes={len(payload)} header={payload[:4].hex()}')
+    # Older F9P firmware repeats blockId=0 (HPG 1.30 release note).
+    # RF counts are raw U2 values; semantic warnings must not discard other flags.
+    if message_id == 0x31:
         for offset in range(4, len(payload), size):
             span, resolution, center = struct.unpack_from('<III', payload, offset + 256)
             if not span or not resolution or not center:
@@ -479,6 +477,13 @@ def receiver_quality_status(now):
         age = now - float(globals().get(key + '_TS') or 0)
         if reading and 0 <= age <= 45:
             status[field] = dict(reading, age_seconds=round(age, 1))
+    rf_error = globals().get('LAST_UBX_RF_ERROR')
+    error_age = now - float(globals().get('LAST_UBX_RF_ERROR_TS') or 0)
+    if rf_error and 0 <= error_age <= 45:
+        if status['gnss_rf']:
+            status['gnss_rf']['last_error'] = dict(rf_error, age_seconds=round(error_age, 1))
+        else:
+            status['gnss_rf'] = dict(rf_error, source='ubx_mon_rf', state='read_error', age_seconds=round(error_age, 1))
     unicore = dict(source='unicore_rf', agc=None, jamming=None)
     for field, key in [('agc', 'LAST_UNICORE_AGC'), ('jamming', 'LAST_UNICORE_JAM')]:
         reading = globals().get(key)
@@ -552,11 +557,20 @@ async def refresh_receiver_quality(agent, reader):
         logging.warning('[GNSS][NAV-SAT] %s', error)
 
     for message_id, key in [(0x38, 'LAST_UBX_RF'), (0x31, 'LAST_UBX_SPECTRUM')]:
+        packet = None
         try:
             packet = await reader.query_base(_ubx_packet(0x0a, message_id), (0x0a, message_id))
             globals()[key] = _ubx_rf_payload(_base_ubx_payload(packet, (0x0a, message_id)), message_id)
             globals()[key + '_TS'] = time.time()
+            if message_id == 0x38:
+                globals()['LAST_UBX_RF_ERROR'] = None
         except Exception as error:
+            if message_id == 0x38:
+                failure = dict(error=(str(error) or type(error).__name__)[:160], error_kind='timeout' if isinstance(error, TimeoutError) else 'invalid_response' if isinstance(error, ValueError) else 'query_failed')
+                if packet:
+                    failure['frame_b64'] = base64.b64encode(packet[:128]).decode('ascii')
+                globals()['LAST_UBX_RF_ERROR'] = failure
+                globals()['LAST_UBX_RF_ERROR_TS'] = time.time()
             logging.warning('[GNSS][RF %02X] %s', message_id, error)
 
 
