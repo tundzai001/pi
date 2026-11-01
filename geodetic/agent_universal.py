@@ -3758,6 +3758,9 @@ class GNSSReader(threading.Thread):
         try:
             while request['reply'] is None:
                 if time.monotonic() >= request['deadline'] or self._stop_event.is_set():
+                    if key == b'#UNILOGLIST':
+                        logging.warning("[GNSS][VERIFY][UNILOGLIST] timeout; partial=%r",
+                                        request.get('response_preview', b''))
                     raise TimeoutError(f"Receiver readback timeout: {key}")
                 await asyncio.sleep(0.02)
             if request.get('error'):
@@ -4024,6 +4027,9 @@ class GNSSReader(threading.Thread):
             elif buffer[0] == ord('#'):
                 if buffer.startswith(b'#UNILOGLIST,'):
                     # UNILOGLIST is a multi-line ASCII log with one final CRC.
+                    request = getattr(self, '_base_query', None)
+                    if request and request['key'] == b'#UNILOGLIST' and not request['cancelled']:
+                        request['response_preview'] = bytes(buffer[:512])
                     trailer = re.search(rb'\*[0-9a-fA-F]{8}\r?\n', buffer)
                     if trailer is None:
                         if len(buffer) <= 4096:
@@ -4640,8 +4646,10 @@ async def _verify_unicore_configuration(agent, reader, payload, command_id):
     except Exception as error:
         groups['fixed']['unread'] = 1
         result['mode_error'] = str(error)[:200]
+    log_packet = b''
     try:
-        logs = _parse_unicore_loglist(await reader.query_base(b'\r\nUNILOGLIST\r\n', b'#UNILOGLIST'))
+        log_packet = await reader.query_base(b'\r\nUNILOGLIST\r\n', b'#UNILOGLIST')
+        logs = _parse_unicore_loglist(log_packet)
         details['logs'] = [dict(port=port, name=name, period=period) for (port, name), period in logs.items()]
         details['logs_state'] = 'ok'
         port = payload.get('port')
@@ -4659,10 +4667,15 @@ async def _verify_unicore_configuration(agent, reader, payload, command_id):
         groups['diagnostics']['unread'] = groups['rtcm']['unread'] = 1
         result['output_error'] = str(error)[:200]
         result['note'] = 'Chưa đọc đủ danh sách bản tin và cổng đầu ra từ UM.'
+        logging.warning("[GNSS][VERIFY][UNILOGLIST] %s: %s; response=%r",
+                        type(error).__name__, result['output_error'], log_packet[:512])
     result['state'] = ('unread' if any(group['unread'] for group in groups.values())
                        else 'mismatch' if any(group['mismatched'] for group in groups.values()) else 'match')
     agent.gnss_verification = result
     agent.gnss_verification_at = time.monotonic()
+    logging.log(logging.INFO if result['state'] == 'match' else logging.WARNING,
+                "[GNSS][VERIFY] Unicorecomm command_id=%s state=%s groups=%s mode_error=%s output_error=%s",
+                command_id, result['state'], groups, result.get('mode_error', ''), result.get('output_error', ''))
     return result
 
 
