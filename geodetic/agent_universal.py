@@ -444,6 +444,44 @@ def _ubx_rf_payload(payload, message_id):
                 payload_b64=base64.b64encode(payload).decode('ascii'))
 
 
+def _ubx_version_payload(payload):
+    if not 40 <= len(payload) <= 520 or (len(payload) - 40) % 30:
+        raise ValueError('Invalid MON-VER payload')
+    fields = [payload[:30], payload[30:40]] + [payload[i:i+30] for i in range(40, len(payload), 30)]
+    if any(any(c < 32 or c > 126 for c in field.split(b'\0', 1)[0]) for field in fields) or not fields[0].split(b'\0', 1)[0]:
+        raise ValueError('Invalid MON-VER text')
+    return dict(source='ubx_mon_ver', payload_b64=base64.b64encode(payload).decode('ascii'))
+
+
+async def _refresh_ubx_receiver_info(reader):
+    info = dict(source='ubx_mon_ver', itfm_enabled=None)
+    try:
+        packet = await reader.query_base(_ubx_packet(0x0a, 4), (0x0a, 4))
+        info.update(_ubx_version_payload(_base_ubx_payload(packet, (0x0a, 4))))
+    except Exception as error:
+        info['error'] = (str(error) or type(error).__name__)[:160]
+    try:
+        poll = bytes(4) + struct.pack('<I', 0x1041000d)  # VALGET: running RAM layer, exact enable key.
+        packet = await reader.query_base(_ubx_packet(6, 0x8b, poll), (6, 0x8b))
+        body = _base_ubx_payload(packet, (6, 0x8b))
+        if len(body) != 9 or body[:4] != b'\x01\0\0\0' or struct.unpack_from('<I', body, 4)[0] != 0x1041000d or body[8] > 1:
+            raise ValueError('Invalid ITFM VALGET response')
+        info['itfm_enabled'] = bool(body[8])
+        info['itfm_source'] = 'ubx_cfg_valget'
+    except Exception:
+        try:
+            packet = await reader.query_base(_ubx_packet(6, 0x39), (6, 0x39))
+            body = _base_ubx_payload(packet, (6, 0x39))
+            if len(body) != 8:
+                raise ValueError('Invalid CFG-ITFM response')
+            info['itfm_enabled'] = bool(struct.unpack_from('<I', body)[0] & 0x80000000)
+            info['itfm_source'] = 'ubx_cfg_itfm'
+        except Exception as error:
+            info['itfm_error'] = (str(error) or type(error).__name__)[:160]
+    globals()['LAST_UBX_RECEIVER_INFO'] = info
+    globals()['LAST_UBX_RECEIVER_INFO_TS'] = time.time()
+
+
 def _unicore_rf_log(packet):
     if len(packet) > 383 or not re.search(rb'\*[0-9a-fA-F]{8}$', packet.strip()):
         raise ValueError('Invalid Unicore RF checksum format')
@@ -471,8 +509,8 @@ def _unicore_rf_log(packet):
 
 def receiver_quality_status(now):
     # Explicit null clears stale data; legacy hacc is always millimetres.
-    status = dict(hacc=None, gnss_quality=None, gnss_dop=None, gnss_satellites=None, gnss_rf=None, gnss_spectrum=None)
-    for field, key in [('gnss_rf', 'LAST_UBX_RF'), ('gnss_spectrum', 'LAST_UBX_SPECTRUM')]:
+    status = dict(hacc=None, gnss_quality=None, gnss_dop=None, gnss_satellites=None, gnss_rf=None, gnss_spectrum=None, gnss_receiver=None)
+    for field, key in [('gnss_receiver', 'LAST_UBX_RECEIVER_INFO'), ('gnss_rf', 'LAST_UBX_RF'), ('gnss_spectrum', 'LAST_UBX_SPECTRUM')]:
         reading = globals().get(key)
         age = now - float(globals().get(key + '_TS') or 0)
         if reading and 0 <= age <= 45:
@@ -572,6 +610,7 @@ async def refresh_receiver_quality(agent, reader):
                 globals()['LAST_UBX_RF_ERROR'] = failure
                 globals()['LAST_UBX_RF_ERROR_TS'] = time.time()
             logging.warning('[GNSS][RF %02X] %s', message_id, error)
+    await _refresh_ubx_receiver_info(reader)
 
 
 
@@ -4355,13 +4394,16 @@ def _base_ubx_payload(packet, key):
             or _ubx_packet(*key, packet[6:-2]) != packet):
         raise ValueError("Invalid UBX readback checksum or frame")
     payload = packet[6:-2]
+    if key == (0x0a, 4):
+        _ubx_version_payload(payload)
+        return payload
     if key in ((0x0a, 0x38), (0x0a, 0x31)):
         _ubx_rf_payload(payload, key[1])
         return payload
     if key == (1, 0x35):
         _ubx_satellite_payload(payload)
         return payload
-    size = {(1, 7): 92, (1, 4): 18}.get(key, 40)
+    size = {(1, 7): 92, (1, 4): 18, (6, 0x39): 8, (6, 0x8b): 9}.get(key, 40)
     if len(payload) != size or (size == 40 and payload[0] != 0):
         raise ValueError("Unsupported UBX readback payload")
     return payload
