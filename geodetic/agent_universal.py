@@ -1,11 +1,11 @@
 #agent_universal.py
-AGENT_VERSION = "V2.4.1"
+AGENT_VERSION = "V2.4.2"
 
 import asyncio
 import copy
 import gc
 import base64
-from collections import OrderedDict
+from collections import OrderedDict, deque
 import hashlib
 import json
 import logging
@@ -507,9 +507,106 @@ def _unicore_rf_log(packet):
                 ratios=ratios, flags=flags)
 
 
+def _rf_monitor_age(snapshot):
+    value = snapshot.get('age_seconds') if isinstance(snapshot, dict) else None
+    return value if type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 45 else None
+
+
+def _rf_monitor_decode(snapshot, source, limit):
+    if _rf_monitor_age(snapshot) is None or snapshot.get('source') != source:
+        return None
+    encoded = snapshot.get('payload_b64')
+    if not isinstance(encoded, str) or len(encoded) > limit:
+        return None
+    try:
+        return base64.b64decode(encoded, validate=True)
+    except ValueError:
+        return None
+
+
+class GnssRfMonitor:
+    """Ten minutes of distinct RF samples plus one matching satellite snapshot."""
+    def __init__(self):
+        self.samples = deque(maxlen=120)
+        self.previous_cno = {}
+        self.previous_at = None
+        self.source = None
+
+    def observe(self, payload, now):
+        while self.samples and now - self.samples[0]['at'] > 600:
+            self.samples.popleft()
+        raw = payload.get('gnss_rf')
+        age, severity = None, None
+        source = raw.get('source') if isinstance(raw, dict) else None
+        if payload.get('status') != 'offline' and source == 'ubx_mon_rf':
+            data = _rf_monitor_decode(raw, source, 136)
+            if data and len(data) >= 4 and data[0] == 0 and 1 <= data[1] <= 4 and len(data) == 4 + 24 * data[1]:
+                flags = [data[offset + 1] & 3 for offset in range(4, len(data), 24)]
+                # Any unknown block means coverage is incomplete, unless another warns.
+                severity = max(flags) if max(flags) >= 2 or 0 not in flags else None
+                if severity is not None:
+                    severity -= 1  # 0 clear, 1 warning, 2 critical.
+                age = _rf_monitor_age(raw)
+                receiver = payload.get('gnss_receiver')
+                if (_rf_monitor_age(receiver) is not None and receiver.get('itfm_enabled') is False) or raw.get('last_error'):
+                    severity = None
+        elif payload.get('status') != 'offline' and source == 'unicore_rf':
+            jam = raw.get('jamming')
+            age = _rf_monitor_age(jam)
+            count = {'unicore_freqjamstatusa': 3, 'unicore_jamstatusa': 1}.get(jam.get('source')) if isinstance(jam, dict) else None
+            flags = jam.get('flags') if isinstance(jam, dict) else None
+            if age is not None and count and isinstance(flags, list) and len(flags) == count and all(type(flag) is int and 0 <= flag <= 2 for flag in flags):
+                severity = max(flags)
+
+        if source != self.source and severity is not None:
+            self.samples.clear()
+            self.previous_cno = {}
+            self.previous_at = None
+            self.source = source
+        sample_at = now - age if age is not None else None
+        if severity is not None and (not self.samples or sample_at - self.samples[-1]['at'] >= 5):
+            cno = {}
+            satellites = payload.get('gnss_satellites')
+            data = _rf_monitor_decode(satellites, 'ubx_nav_sat', 2060) if source == 'ubx_mon_rf' else None
+            if (data and len(data) >= 8 and data[4] == 1 and data[5] <= 128
+                    and len(data) == 8 + 12 * data[5] and abs(_rf_monitor_age(satellites) - age) <= 10):
+                for offset in range(8, len(data), 12):
+                    gnss, sv, value = data[offset:offset + 3]
+                    flags = int.from_bytes(data[offset + 8:offset + 12], 'little')
+                    if gnss <= 7 and sv and value > 0 and (flags & 7) >= 4:
+                        key = (gnss, sv)
+                        if key in cno:
+                            cno = {}
+                            break
+                        cno[key] = value
+            common = cno.keys() & self.previous_cno.keys()
+            delta = None
+            if len(common) >= 4 and self.previous_at is not None and 0 < sample_at - self.previous_at <= 45:
+                delta = round(statistics.median(cno[key] - self.previous_cno[key] for key in common), 1)
+            self.samples.append({'at': sample_at, 'severity': severity, 'cno_delta': delta,
+                                 'matched': len(common) if delta is not None else 0})
+            self.previous_cno, self.previous_at = cno, sample_at
+        if not self.samples:
+            return None
+        warnings = [sample for sample in self.samples if sample['severity'] > 0]
+        episodes = sum(sample['severity'] > 0 and (index == 0 or self.samples[index - 1]['severity'] == 0
+                       or sample['at'] - self.samples[index - 1]['at'] > 45)
+                       for index, sample in enumerate(self.samples))
+        last = self.samples[-1]
+        return {'source': self.source, 'window_seconds': 600, 'sample_count': len(self.samples),
+                'warning_samples': len(warnings), 'critical_samples': sum(sample['severity'] == 2 for sample in self.samples),
+                'episodes': episodes, 'coincident_cno_drops': sum(sample['cno_delta'] is not None and sample['cno_delta'] <= -3 for sample in warnings),
+                'quality_comparisons': sum(sample['cno_delta'] is not None for sample in self.samples),
+                'first_sample_at': self.samples[0]['at'], 'last_sample_at': last['at'],
+                'last_warning_at': warnings[-1]['at'] if warnings else None,
+                'current_severity': severity, 'cno_delta_dbhz': last['cno_delta'], 'matched_satellites': last['matched']}
+
+
 def receiver_quality_status(now):
     # Explicit null clears stale data; legacy hacc is always millimetres.
     status = dict(hacc=None, gnss_quality=None, gnss_dop=None, gnss_satellites=None, gnss_rf=None, gnss_spectrum=None, gnss_receiver=None)
+    report = globals().get('AUTOMATIC_RF_REPORT')
+    status['gnss_rf_monitor'] = dict(report, age_seconds=max(0, round(now - report['last_sample_at'], 1))) if report else None
     for field, key in [('gnss_receiver', 'LAST_UBX_RECEIVER_INFO'), ('gnss_rf', 'LAST_UBX_RF'), ('gnss_spectrum', 'LAST_UBX_SPECTRUM')]:
         reading = globals().get(key)
         age = now - float(globals().get(key + '_TS') or 0)
@@ -555,6 +652,12 @@ def receiver_quality_status(now):
     return status
 
 
+def _update_automatic_rf_monitor():
+    monitor = globals().setdefault('AUTOMATIC_RF_MONITOR', GnssRfMonitor())
+    now = time.time()
+    globals()['AUTOMATIC_RF_REPORT'] = monitor.observe(dict(receiver_quality_status(now), status='online'), now)
+
+
 async def refresh_receiver_quality(agent, reader):
     if agent.detected_chip.get('type') == 'Unicorecomm':
         try:
@@ -571,6 +674,7 @@ async def refresh_receiver_quality(agent, reader):
                 break
             except Exception as error:
                 logging.warning('[GNSS][%s] %s', name.decode('ascii'), error)
+        _update_automatic_rf_monitor()
         return
     if agent.detected_chip.get('type') != 'Ublox':
         return
@@ -611,6 +715,7 @@ async def refresh_receiver_quality(agent, reader):
                 globals()['LAST_UBX_RF_ERROR_TS'] = time.time()
             logging.warning('[GNSS][RF %02X] %s', message_id, error)
     await _refresh_ubx_receiver_info(reader)
+    _update_automatic_rf_monitor()
 
 
 
