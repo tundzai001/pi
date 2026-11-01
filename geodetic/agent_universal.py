@@ -1,5 +1,5 @@
 #agent_universal.py
-AGENT_VERSION = "V2.3.6"
+AGENT_VERSION = "V2.4.1"
 
 import asyncio
 import copy
@@ -3782,6 +3782,19 @@ class GNSSReader(threading.Thread):
             
             # Read-only Unicore replies share the RTCM stream, not the NMEA channel.
             elif buffer[0] == ord('#'):
+                if buffer.startswith(b'#UNILOGLIST,'):
+                    # UNILOGLIST is a multi-line ASCII log with one final CRC.
+                    trailer = re.search(rb'\*[0-9a-fA-F]{8}\r?\n', buffer)
+                    if trailer is None:
+                        if len(buffer) <= 4096:
+                            break
+                        buffer.pop(0)
+                        self.parse_errors += 1
+                        continue
+                    packet = bytes(buffer[:trailer.end()]).strip()
+                    self._deliver_base_reply(b'#UNILOGLIST', packet)
+                    buffer = buffer[trailer.end():]
+                    continue
                 end = buffer.find(b'\n')
                 if end < 0:
                     if len(buffer) <= 2048:
@@ -4269,11 +4282,191 @@ async def refresh_receiver_base_status(agent, reader):
     return result
 
 
+def _gnss_verification_expected(payload):
+    """Accept bounded, exact output keys; these bytes are never sent as setters."""
+    mode_b64, output_b64 = payload.get('tmode_b64'), payload.get('output_b64')
+    if (not isinstance(mode_b64, str) or len(mode_b64) > 56
+            or not isinstance(output_b64, str) or len(output_b64) > 620):
+        raise ValueError('Invalid GNSS verification expectation')
+    mode = base64.b64decode(mode_b64, validate=True)
+    output = base64.b64decode(output_b64, validate=True)
+    if len(mode) != 40 or mode[:1] != b'\0' or mode[2:4] != b'\x02\x01' or not output or len(output) % 5:
+        raise ValueError('Invalid Fixed LLA/output verification expectation')
+    records = []
+    keys = set()
+    for offset in range(0, len(output), 5):
+        key, value = struct.unpack_from('<IB', output, offset)
+        if (key >> 16 not in (0x2091, 0x1074, 0x1076, 0x1078)
+                or key & 0xffff == 0xffff or value not in (0, 1) or key in keys):
+            raise ValueError('Invalid or duplicate output verification key')
+        keys.add(key)
+        records.append((key, value))
+    return mode, records
+
+
+def _parse_unicore_loglist(packet):
+    _, body = _base_unicore_fields(packet)
+    if not packet.startswith(b'#UNILOGLIST,') or len(packet) > 4096:
+        raise ValueError('Invalid UNILOGLIST header/size')
+    lines = [line.strip().lstrip('<').strip() for line in body.splitlines() if line.strip()]
+    if not lines or not re.fullmatch(r'\d+', lines[0]) or not 0 <= int(lines[0]) <= 64 or len(lines) != int(lines[0]) + 1:
+        raise ValueError('Incomplete UNILOGLIST entries')
+    logs = {}
+    for line in lines[1:]:
+        tokens = line.upper().split()
+        if tokens and tokens[0] == 'LOG':
+            tokens = tokens[1:]
+        if len(tokens) < 3:
+            raise ValueError('Invalid UNILOGLIST row')
+        name, port = (tokens[1], tokens[0]) if tokens[0].startswith('COM') else (tokens[0], tokens[1])
+        if not re.fullmatch(r'[A-Z][A-Z0-9]{1,23}', name) or port not in ('COM1', 'COM2', 'COM3'):
+            raise ValueError('Invalid UNILOGLIST message/port')
+        trigger = tokens[2:]
+        if trigger == ['ONCE']:
+            period = None
+        else:
+            if trigger[:1] == ['ONTIME']:
+                trigger = trigger[1:]
+            if len(trigger) != 1:
+                raise ValueError('Unsupported UNILOGLIST trigger')
+            period = float(trigger[0])
+            if not math.isfinite(period) or period <= 0:
+                raise ValueError('Invalid UNILOGLIST period')
+        if (port, name) in logs:
+            raise ValueError('Duplicate UNILOGLIST entry')
+        logs[(port, name)] = period
+    return logs
+
+
+async def _verify_unicore_configuration(agent, reader, payload, command_id):
+    coords = payload.get('coords') or {}
+    wanted_position = [float(coords[key]) for key in ('lat', 'lon', 'alt')]
+    expected_logs = payload.get('logs')
+    if (not all(math.isfinite(value) for value in wanted_position)
+            or not -90 <= wanted_position[0] <= 90 or not -180 <= wanted_position[1] <= 180
+            or not -12000 <= wanted_position[2] <= 100000 or not isinstance(expected_logs, list)
+            or not 1 <= len(expected_logs) <= 64
+            or any(not isinstance(name, str) or not re.fullmatch(r'[A-Z][A-Z0-9]{1,23}', name) for name in expected_logs)):
+        raise ValueError('Invalid Unicore verification expectation')
+    groups = {name: dict(checked=0, mismatched=0, unread=0) for name in ('fixed', 'diagnostics', 'rtcm')}
+    result = dict(command_id=command_id, groups=groups)
+    try:
+        _, mode = _base_unicore_fields(await reader.query_base(b'\r\nMODE\r\n', b'#MODE'))
+        mode = mode.upper()
+        if not mode.startswith(('MODE BASE', 'MODE ROVER')):
+            raise ValueError('Invalid Unicore MODE response')
+        if not mode.startswith('MODE BASE') or mode.startswith('MODE BASE TIME'):
+            groups['fixed'].update(checked=1, mismatched=1)
+        else:
+            _, body = _base_unicore_fields(await reader.query_base(b'\r\nBESTNAVA\r\n', b'#BESTNAVA'))
+            fields = body.split(',')
+            if len(fields) < 7 or fields[:2] != ['SOL_COMPUTED', 'FIXEDPOS'] or fields[6] != 'WGS84':
+                raise ValueError('Unicore has no confirmed fixed WGS84 position')
+            latitude, longitude, height, undulation = map(float, fields[2:6])
+            if not all(math.isfinite(value) for value in (latitude, longitude, height, undulation)):
+                raise ValueError('Invalid Unicore fixed position')
+            if payload.get('altitude_reference') == 'ELLIPSOID':
+                height += undulation
+            matches = all(abs(a - b) <= tolerance for a, b, tolerance in zip(
+                (latitude, longitude, height), wanted_position, (1e-9, 1e-9, 0.0001)))
+            groups['fixed'].update(checked=1, mismatched=int(not matches))
+    except Exception as error:
+        groups['fixed']['unread'] = 1
+        result['mode_error'] = str(error)[:200]
+    try:
+        logs = _parse_unicore_loglist(await reader.query_base(b'\r\nUNILOGLIST\r\n', b'#UNILOGLIST'))
+        port = payload.get('port')
+        if port not in ('COM1', 'COM2', 'COM3'):
+            raise ValueError('Unicore output port is not identified')
+        active = {name: period for (output_port, name), period in logs.items() if output_port == port and period is not None}
+        for name in ('diagnostics', 'rtcm'):
+            rtcm = name == 'rtcm'
+            keys = {key for key in set(expected_logs) | set(active) if key.startswith('RTCM') == rtcm}
+            groups[name]['checked'] = max(1, len(keys))
+            groups[name]['mismatched'] = sum(key not in expected_logs or key not in active
+                                            or abs(active[key] - 1) > 1e-6 for key in keys)
+    except Exception as error:
+        groups['diagnostics']['unread'] = groups['rtcm']['unread'] = 1
+        result['output_error'] = str(error)[:200]
+        result['note'] = 'Chưa đọc đủ danh sách bản tin và cổng đầu ra từ UM.'
+    result['state'] = ('unread' if any(group['unread'] for group in groups.values())
+                       else 'mismatch' if any(group['mismatched'] for group in groups.values()) else 'match')
+    agent.gnss_verification = result
+    agent.gnss_verification_at = time.monotonic()
+    return result
+
+
+async def verify_receiver_configuration(agent, reader, payload, command_id):
+    """Read the live receiver through its owning UART thread; never write config."""
+    agent.gnss_verification = None
+    if agent.detected_chip.get('type') not in ('Ublox', 'Unicorecomm') or reader is None:
+        raise RuntimeError('Configuration verification requires a supported GNSS reader')
+    if agent.detected_chip['type'] == 'Unicorecomm':
+        return await _verify_unicore_configuration(agent, reader, payload, command_id)
+    expected, records = _gnss_verification_expected(payload)
+    groups = {name: dict(checked=0, mismatched=0, unread=0)
+              for name in ('fixed', 'protocols', 'diagnostics', 'rtcm')}
+    result = dict(command_id=command_id, groups=groups)
+    try:
+        actual = _base_ubx_payload(await reader.query_base(_ubx_packet(6, 0x71), (6, 0x71)), (6, 0x71))
+        expected_position = [struct.unpack_from('<i', expected, 4 + i * 4)[0] * 100
+                             + struct.unpack_from('<b', expected, 16 + i)[0] for i in range(3)]
+        actual_position = [struct.unpack_from('<i', actual, 4 + i * 4)[0] * 100
+                           + struct.unpack_from('<b', actual, 16 + i)[0] for i in range(3)]
+        # Same quantization tolerance as the ESP32 verifier: 1e-9 degree / 0.1 mm.
+        matches = (actual[2:4] == b'\x02\x01'
+                   and all(abs(value) <= 99 for value in struct.unpack_from('<bbb', actual, 16))
+                   and all(abs(a - b) <= 1 for a, b in zip(actual_position, expected_position))
+                   and abs(struct.unpack_from('<I', actual, 20)[0] - struct.unpack_from('<I', expected, 20)[0]) <= 1)
+        groups['fixed'].update(checked=1, mismatched=int(not matches))
+    except Exception as error:
+        groups['fixed']['unread'] = 1
+        result['mode_error'] = str(error)[:200]
+
+    for offset in range(0, len(records), 40):
+        chunk = records[offset:offset + 40]
+        values = None
+        try:
+            poll = b'\0\0\0\0' + b''.join(struct.pack('<I', key) for key, _ in chunk)
+            reply = await reader.query_base(_ubx_packet(6, 0x8b, poll), (6, 0x8b))
+            body = reply[6:-2]
+            if (len(reply) != len(body) + 8 or reply != _ubx_packet(6, 0x8b, body)
+                    or len(body) != 4 + len(chunk) * 5 or body[:4] != b'\x01\0\0\0'):
+                raise ValueError('Invalid CFG-VALGET response')
+            received = [struct.unpack_from('<IB', body, i) for i in range(4, len(body), 5)]
+            values = dict(received)
+            if len(values) != len(chunk) or set(values) != {key for key, _ in chunk}:
+                raise ValueError('Missing or duplicate CFG-VALGET keys')
+        except Exception as error:
+            values = None
+            result['output_error'] = str(error)[:200]
+        for key, wanted in chunk:
+            name = 'protocols' if key >> 28 == 1 else 'rtcm' if key >= 0x209102bd else 'diagnostics'
+            group = groups[name]
+            group['checked' if values is not None else 'unread'] += 1
+            if values is not None and values[key] != wanted:
+                group['mismatched'] += 1
+    result['state'] = ('unread' if any(group['unread'] or not group['checked'] for group in groups.values())
+                       else 'mismatch' if any(group['mismatched'] for group in groups.values()) else 'match')
+    agent.gnss_verification = result
+    agent.gnss_verification_at = time.monotonic()
+    return result
+
+
 def receiver_base_system_info(agent):
     result = copy.deepcopy(getattr(agent, 'receiver_base_readback', {}))
     checked_at = getattr(agent, 'receiver_base_readback_at', None)
     age = max(0, time.monotonic() - checked_at) if checked_at is not None else None
-    system = {}
+    system = dict(gnss_verification_supported=True, gnss_verification_uart1=False,
+                  gnss_verification=None)
+    verification = getattr(agent, 'gnss_verification', None)
+    verified_at = getattr(agent, 'gnss_verification_at', None)
+    if verification and verified_at is not None:
+        verification_age = max(0, time.monotonic() - verified_at)
+        if verification_age < 60:
+            system['gnss_verification'] = {**copy.deepcopy(verification), 'age_seconds': int(verification_age)}
+        else:
+            agent.gnss_verification = None
     if result:
         result['age_seconds'] = int(age) if age is not None else 0xffffffff
         system['receiver_base_readback'] = result
@@ -4314,6 +4507,8 @@ class AgentManager:
         self.gnss_reader = None
         self.receiver_base_readback = {}
         self.receiver_base_readback_at = None
+        self.gnss_verification = None
+        self.gnss_verification_at = None
         self.survey_in_started_at = None
         self.service_stats = {}
         self.ntrip_connection_status = {} 
@@ -5033,6 +5228,7 @@ def _validate_command_payload(command: str, payload: dict, data: dict, agent: Ag
         "SET_RTCM_STREAM_ACTIVE",
         "DELETE_DEVICE",
         "CHECK_BASE_STATUS",
+        "VERIFY_GNSS_CONFIG",
         "REBOOT_DEVICE",
     }
     if command not in known_commands:
@@ -5434,6 +5630,11 @@ async def _process_command(source: str, data: dict, agent: AgentManager, gnss_re
             logging.info("[REBOOT_FOR_RESET] Restarting Agent process...")
             sys.exit(0)
         
+        elif command == "VERIFY_GNSS_CONFIG":
+            if active_auto_base_task and not active_auto_base_task.done():
+                raise RuntimeError('Base workflow is running; wait before verifying configuration')
+            await verify_receiver_configuration(agent, gnss_reader, payload, command_id)
+
         elif command == "CHECK_BASE_STATUS":
             await refresh_receiver_base_status(agent, gnss_reader)
 
