@@ -429,9 +429,64 @@ def _ubx_satellite_payload(payload):
     return dict(source='ubx_nav_sat', payload_b64=base64.b64encode(payload).decode('ascii'))
 
 
+def _ubx_rf_payload(payload, message_id):
+    size = {0x38: 24, 0x31: 272}.get(message_id)
+    if size is None or len(payload) < 4 or payload[0] != 0 or not 1 <= payload[1] <= 4 or len(payload) != 4 + payload[1] * size:
+        raise ValueError('Invalid MON-RF/MON-SPAN payload')
+    if message_id == 0x38:
+        blocks = [payload[i] for i in range(4, len(payload), size)]
+        if len(set(blocks)) != len(blocks) or any(struct.unpack_from('<H', payload, i + 14)[0] > 8191 for i in range(4, len(payload), size)):
+            raise ValueError('Invalid RF block identifiers or AGC')
+    else:
+        for offset in range(4, len(payload), size):
+            span, resolution, center = struct.unpack_from('<III', payload, offset + 256)
+            if not span or not resolution or not center:
+                raise ValueError('Invalid MON-SPAN frequencies')
+    return dict(source='ubx_mon_rf' if message_id == 0x38 else 'ubx_mon_span',
+                payload_b64=base64.b64encode(payload).decode('ascii'))
+
+
+def _unicore_rf_log(packet):
+    if len(packet) > 383 or not re.search(rb'\*[0-9a-fA-F]{8}$', packet.strip()):
+        raise ValueError('Invalid Unicore RF checksum format')
+    text, body = _base_unicore_fields(packet)
+    message = text.split(',', 1)[0]
+    fields = body.split(',')
+    count = {'#AGCA': 10, '#JAMSTATUSA': 5, '#FREQJAMSTATUSA': 9}.get(message)
+    if count is None or len(fields) != count:
+        raise ValueError('Invalid Unicore RF fields')
+    numeric = fields if message == '#AGCA' else fields[1:]
+    if any(not re.fullmatch(r'-?\d+', value.strip()) for value in numeric):
+        raise ValueError('Invalid Unicore RF numbers')
+    values = [int(value) for value in numeric]
+    if message == '#AGCA':
+        if any(not -1 <= value <= 255 for value in values):
+            raise ValueError('Invalid Unicore AGC')
+        return dict(source='unicore_agca', values=values)
+    pairs = 3 if message == '#FREQJAMSTATUSA' else 1
+    ratios, flags = values[:pairs*2:2], values[1:pairs*2:2]
+    if any(not 0 <= value <= 255 for value in values) or any(value not in (0, 1, 2) for value in flags):
+        raise ValueError('Invalid Unicore CW indication')
+    return dict(source='unicore_freqjamstatusa' if pairs == 3 else 'unicore_jamstatusa',
+                ratios=ratios, flags=flags)
+
+
 def receiver_quality_status(now):
     # Explicit null clears stale data; legacy hacc is always millimetres.
-    status = dict(hacc=None, gnss_quality=None, gnss_dop=None, gnss_satellites=None)
+    status = dict(hacc=None, gnss_quality=None, gnss_dop=None, gnss_satellites=None, gnss_rf=None, gnss_spectrum=None)
+    for field, key in [('gnss_rf', 'LAST_UBX_RF'), ('gnss_spectrum', 'LAST_UBX_SPECTRUM')]:
+        reading = globals().get(key)
+        age = now - float(globals().get(key + '_TS') or 0)
+        if reading and 0 <= age <= 45:
+            status[field] = dict(reading, age_seconds=round(age, 1))
+    unicore = dict(source='unicore_rf', agc=None, jamming=None)
+    for field, key in [('agc', 'LAST_UNICORE_AGC'), ('jamming', 'LAST_UNICORE_JAM')]:
+        reading = globals().get(key)
+        age = now - float(globals().get(key + '_TS') or 0)
+        if reading and 0 <= age <= 45:
+            unicore[field] = dict(reading, age_seconds=round(age, 1))
+    if unicore['agc'] or unicore['jamming']:
+        status['gnss_rf'] = unicore
     satellites = globals().get('LAST_UBX_SATELLITES')
     satellite_age = now - float(globals().get('LAST_UBX_SATELLITES_TS') or 0)
     if satellites and 0 <= satellite_age <= 45:
@@ -458,12 +513,31 @@ def receiver_quality_status(now):
 
 
 async def refresh_receiver_quality(agent, reader):
+    if agent.detected_chip.get('type') == 'Unicorecomm':
+        try:
+            packet = await reader.query_base(b'\r\nAGCA\r\n', b'#AGCA')
+            globals()['LAST_UNICORE_AGC'] = _unicore_rf_log(packet)
+            globals()['LAST_UNICORE_AGC_TS'] = time.time()
+        except Exception as error:
+            logging.warning('[GNSS][AGCA] %s', error)
+        for name in (b'FREQJAMSTATUSA', b'JAMSTATUSA'):
+            try:
+                packet = await reader.query_base(b'\r\n' + name + b'\r\n', b'#' + name)
+                globals()['LAST_UNICORE_JAM'] = _unicore_rf_log(packet)
+                globals()['LAST_UNICORE_JAM_TS'] = time.time()
+                break
+            except Exception as error:
+                logging.warning('[GNSS][%s] %s', name.decode('ascii'), error)
+        return
     if agent.detected_chip.get('type') != 'Ublox':
         return
-    packet = await reader.query_base(_ubx_packet(1, 7), (1, 7))
-    quality = _ubx_navigation_quality(_base_ubx_payload(packet, (1, 7)))
-    globals()['LAST_RECEIVER_QUALITY'] = quality
-    globals()['LAST_RECEIVER_QUALITY_TS'] = time.time()
+    try:
+        packet = await reader.query_base(_ubx_packet(1, 7), (1, 7))
+        quality = _ubx_navigation_quality(_base_ubx_payload(packet, (1, 7)))
+        globals()['LAST_RECEIVER_QUALITY'] = quality
+        globals()['LAST_RECEIVER_QUALITY_TS'] = time.time()
+    except Exception as error:
+        logging.warning('[GNSS][PVT] %s', error)
     try:
         packet = await reader.query_base(_ubx_packet(1, 4), (1, 4))
         globals()['LAST_UBX_DOP'] = _ubx_dop(_base_ubx_payload(packet, (1, 4)))
@@ -476,6 +550,14 @@ async def refresh_receiver_quality(agent, reader):
         globals()['LAST_UBX_SATELLITES_TS'] = time.time()
     except Exception as error:
         logging.warning('[GNSS][NAV-SAT] %s', error)
+
+    for message_id, key in [(0x38, 'LAST_UBX_RF'), (0x31, 'LAST_UBX_SPECTRUM')]:
+        try:
+            packet = await reader.query_base(_ubx_packet(0x0a, message_id), (0x0a, message_id))
+            globals()[key] = _ubx_rf_payload(_base_ubx_payload(packet, (0x0a, message_id)), message_id)
+            globals()[key + '_TS'] = time.time()
+        except Exception as error:
+            logging.warning('[GNSS][RF %02X] %s', message_id, error)
 
 
 
@@ -3842,6 +3924,14 @@ class GNSSReader(threading.Thread):
                     except Exception:
                         pass
 
+                if ubx_class == 0x0a and ubx_id in (0x38, 0x31):
+                    try:
+                        key = 'LAST_UBX_RF' if ubx_id == 0x38 else 'LAST_UBX_SPECTRUM'
+                        globals()[key] = _ubx_rf_payload(packet[6:-2], ubx_id)
+                        globals()[key + '_TS'] = time.time()
+                    except ValueError:
+                        self.parse_errors += 1
+
                 if ubx_class == 1 and ubx_id == 0x35:
                     try:
                         globals()['LAST_UBX_SATELLITES'] = _ubx_satellite_payload(packet[6:-2])
@@ -4251,6 +4341,9 @@ def _base_ubx_payload(packet, key):
             or _ubx_packet(*key, packet[6:-2]) != packet):
         raise ValueError("Invalid UBX readback checksum or frame")
     payload = packet[6:-2]
+    if key in ((0x0a, 0x38), (0x0a, 0x31)):
+        _ubx_rf_payload(payload, key[1])
+        return payload
     if key == (1, 0x35):
         _ubx_satellite_payload(payload)
         return payload
