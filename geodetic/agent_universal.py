@@ -387,8 +387,8 @@ LAST_HPPOSLLH_COORD = None
 LAST_HPPOSLLH_TS = 0.0
 LAST_UBX_NUMSV = None
 LAST_UBX_NUMSV_TS = 0.0
-LAST_UBX_HACC_MM = None
-LAST_UBX_HACC_TS = 0.0
+LAST_RECEIVER_QUALITY = None
+LAST_RECEIVER_QUALITY_TS = 0.0
 LAST_NMEA_TYPE_COUNTS = {}
 LAST_GST_HACC_M = None
 LAST_GST_SEMI_MAJOR_M = None
@@ -400,6 +400,45 @@ LAST_GSV_TS = 0.0
 LAST_CONFIGURED_OUTPUT_MODE = None
 nmea_rate_limit_counter = 0
 nmea_rate_limit_reset_ts = time.time()
+
+
+def _ubx_navigation_quality(payload):
+    """NAV-PVT units and validity, UBX-22008968. Time-only is not RTK Fixed."""
+    if len(payload) != 92 or payload[20] > 5:
+        raise ValueError("Invalid NAV-PVT payload")
+    valid = bool(payload[21] & 1) and payload[20] in (2, 3, 4, 5) and not (payload[78] & 1)
+    return dict(source='ubx_nav_pvt', fix_valid=valid, fix_type=payload[20],
+                satellites=payload[23], pdop=struct.unpack_from('<H', payload, 76)[0] * 0.01,
+                hacc_m=struct.unpack_from('<I', payload, 40)[0] * 0.001 if valid else None)
+
+
+def receiver_quality_status(now):
+    # Explicit null clears stale data; legacy hacc is always millimetres.
+    status = dict(hacc=None, gnss_quality=None)
+    quality = globals().get('LAST_RECEIVER_QUALITY')
+    age = now - float(globals().get('LAST_RECEIVER_QUALITY_TS') or 0)
+    if quality and 0 <= age <= 45:
+        status['gnss_quality'] = dict(quality, age_seconds=round(age, 1))
+        if 'satellites' in quality:
+            status['satellite_count'] = quality['satellites']
+        if quality['hacc_m'] is not None:
+            status['hacc'] = round(quality['hacc_m'] * 1000)
+        return status
+    gst = globals().get('LAST_GST_HACC_M')
+    age = now - float(globals().get('LAST_GST_TS') or 0)
+    if gst is not None and math.isfinite(gst) and gst > 0 and 0 <= age <= 15:
+        status['hacc'] = round(gst * 1000)
+        status['gnss_quality'] = dict(hacc_m=float(gst), source='nmea_gst', age_seconds=round(age, 1))
+    return status
+
+
+async def refresh_receiver_quality(agent, reader):
+    if agent.detected_chip.get('type') != 'Ublox':
+        return
+    packet = await reader.query_base(_ubx_packet(1, 7), (1, 7))
+    quality = _ubx_navigation_quality(_base_ubx_payload(packet, (1, 7)))
+    globals()['LAST_RECEIVER_QUALITY'] = quality
+    globals()['LAST_RECEIVER_QUALITY_TS'] = time.time()
 
 
 def _runtime_serial_baud(agent=None, gnss_reader=None) -> int:
@@ -1438,8 +1477,8 @@ def _mark_gnss_data_stale():
     globals()['LAST_HPPOSLLH_TS'] = 0.0
     globals()['LAST_UBX_NUMSV'] = None
     globals()['LAST_UBX_NUMSV_TS'] = 0.0
-    globals()['LAST_UBX_HACC_MM'] = None
-    globals()['LAST_UBX_HACC_TS'] = 0.0
+    globals()['LAST_RECEIVER_QUALITY'] = None
+    globals()['LAST_RECEIVER_QUALITY_TS'] = 0.0
 
 def _crc24q(data: bytes) -> int:
     crc = 0
@@ -3730,20 +3769,28 @@ class GNSSReader(threading.Thread):
                 # Extract UBX packet (we don't dispatch it, just discard or log)
                 packet = bytes(buffer[:packet_len])
                 
+                a = b = 0
+                for value in packet[2:-2]:
+                    a = (a + value) & 255
+                    b = (b + a) & 255
+                if packet[-2:] != bytes((a, b)):
+                    buffer = buffer[packet_len:]
+                    self.parse_errors += 1
+                    continue
                 self._deliver_base_reply((packet[2], packet[3]), packet)
                 ubx_class = buffer[2]
                 ubx_id = buffer[3]
 
                 # UBX-NAV-HPPOSLLH (class=0x01, id=0x14) payload length is typically 36 bytes.
-                if ubx_class == 0x01 and ubx_id == 0x14 and payload_length >= 36:
+                if ubx_class == 0x01 and ubx_id == 0x14 and payload_length == 36 and not (packet[9] & 1):
                     try:
                         payload = packet[6:6 + payload_length]
-                        lon = struct.unpack_from('<i', payload, 4)[0] * 1e-7
-                        lat = struct.unpack_from('<i', payload, 8)[0] * 1e-7
-                        h_mm = struct.unpack_from('<i', payload, 12)[0]
-                        lon_hp = struct.unpack_from('<b', payload, 20)[0] * 1e-9
-                        lat_hp = struct.unpack_from('<b', payload, 21)[0] * 1e-9
-                        h_hp_m = struct.unpack_from('<b', payload, 22)[0] * 1e-4  # 0.1 mm -> m
+                        lon = struct.unpack_from('<i', payload, 8)[0] * 1e-7
+                        lat = struct.unpack_from('<i', payload, 12)[0] * 1e-7
+                        h_mm = struct.unpack_from('<i', payload, 16)[0]
+                        lon_hp = struct.unpack_from('<b', payload, 24)[0] * 1e-9
+                        lat_hp = struct.unpack_from('<b', payload, 25)[0] * 1e-9
+                        h_hp_m = struct.unpack_from('<b', payload, 26)[0] * 1e-4  # 0.1 mm -> m
                         lat_hpp = float(lat + lat_hp)
                         lon_hpp = float(lon + lon_hp)
                         h_ell = float(h_mm * 1e-3 + h_hp_m)
@@ -3754,18 +3801,15 @@ class GNSSReader(threading.Thread):
                         pass
 
                 # UBX-NAV-PVT (class=0x01, id=0x07): numSV at offset 23, hAcc at offset 40.
-                if ubx_class == 0x01 and ubx_id == 0x07 and payload_length >= 24:
+                if ubx_class == 0x01 and ubx_id == 0x07 and payload_length == 92:
                     try:
                         payload = packet[6:6 + payload_length]
+                        globals()['LAST_RECEIVER_QUALITY'] = _ubx_navigation_quality(payload)
+                        globals()['LAST_RECEIVER_QUALITY_TS'] = time.time()
                         num_sv = int(payload[23])
                         if 0 <= num_sv <= 99:
                             globals()['LAST_UBX_NUMSV'] = num_sv
                             globals()['LAST_UBX_NUMSV_TS'] = time.time()
-                        if payload_length >= 44:
-                            hacc_mm = struct.unpack_from('<I', payload, 40)[0]
-                            if 0 <= hacc_mm <= 10000000:
-                                globals()['LAST_UBX_HACC_MM'] = int(hacc_mm)
-                                globals()['LAST_UBX_HACC_TS'] = time.time()
                     except Exception:
                         pass
                 
@@ -4154,8 +4198,9 @@ def _base_ubx_payload(packet, key):
             or _ubx_packet(*key, packet[6:-2]) != packet):
         raise ValueError("Invalid UBX readback checksum or frame")
     payload = packet[6:-2]
-    if len(payload) != 40 or payload[0] != 0:
-        raise ValueError("Unsupported UBX base status payload")
+    if ((key == (1, 7) and len(payload) != 92)
+            or (key != (1, 7) and (len(payload) != 40 or payload[0] != 0))):
+        raise ValueError("Unsupported UBX readback payload")
     return payload
 
 
@@ -4235,6 +4280,7 @@ async def refresh_receiver_base_status(agent, reader):
                 if svin[36] or svin[37]:
                     result['bestpos'] = _base_ubx_position(svin, survey=True, ready=ready)
         else:
+            globals()['LAST_RECEIVER_QUALITY'] = None
             result['query'] = 'MODE / BESTNAVA'
             _, mode = _base_unicore_fields(await reader.query_base(b'\r\nMODE\r\n', b'#MODE'))
             mode = mode.upper()
@@ -4253,6 +4299,17 @@ async def refresh_receiver_base_status(agent, reader):
                 lat, lon, height, undulation = map(float, fields[2:6])
                 if not all(math.isfinite(v) for v in (lat, lon, height, undulation)) or abs(lat) > 90 or abs(lon) > 180:
                     raise ValueError("Invalid Unicore BESTNAV coordinates")
+                # BESTNAV lat/lon standard deviations are metres (N4 manual, table BESTNAV).
+                if len(fields) >= 10:
+                    try:
+                        lat_sigma, lon_sigma = map(float, fields[7:9])
+                        if not all(math.isfinite(v) and 0 <= v <= 10000000 for v in (lat_sigma, lon_sigma)):
+                            raise ValueError('Invalid BESTNAV standard deviations')
+                        globals()['LAST_RECEIVER_QUALITY'] = dict(
+                            source='unicore_bestnav_sigma', hacc_m=math.hypot(lat_sigma, lon_sigma))
+                        globals()['LAST_RECEIVER_QUALITY_TS'] = time.time()
+                    except ValueError:
+                        pass  # Position remains useful when optional statistics are unavailable.
                 result['bestpos'] = dict(state='ok', message='BESTNAV', raw=raw,
                                          solution_status=fields[0], position_type=fields[1],
                                          latitude=lat, longitude=lon, height_msl=height)
@@ -4988,10 +5045,7 @@ class AgentManager:
         if numsv is not None and now - numsv_ts <= 15:
             status["satellite_count"] = int(numsv)
 
-        hacc_mm = globals().get("LAST_UBX_HACC_MM")
-        hacc_ts = float(globals().get("LAST_UBX_HACC_TS") or 0.0)
-        if hacc_mm is not None and now - hacc_ts <= 15:
-            status["hacc"] = int(hacc_mm)
+        status.update(receiver_quality_status(now))
 
         nmea_health = {
             "type_counts": dict(globals().get("LAST_NMEA_TYPE_COUNTS") or {}),
@@ -5010,7 +5064,6 @@ class AgentManager:
             if gst_hacc is not None:
                 nmea_health["hacc"] = float(gst_hacc)
                 nmea_health["hacc_source"] = globals().get("LAST_GST_HACC_SOURCE") or "gst_lat_lon_sigma"
-                status.setdefault("hacc", float(gst_hacc))
         gsv_avg_snr = globals().get("LAST_GSV_AVG_SNR")
         gsv_ts = float(globals().get("LAST_GSV_TS") or 0.0)
         if gsv_avg_snr is not None and now - gsv_ts <= 15:
@@ -5923,6 +5976,10 @@ async def status_publisher_task(agent: AgentManager, mqtt_client: mqtt.Client):
                         await refresh_receiver_base_status(agent, reader)
                     except Exception as error:
                         logging.warning("[GNSS][READBACK] %s", error)
+                    try:
+                        await refresh_receiver_quality(agent, reader)
+                    except Exception as error:
+                        logging.warning("[GNSS][QUALITY] %s", error)
             await send_status(agent, mqtt_client)
     except asyncio.CancelledError:
         logging.info("status_publisher_task cancelled")
