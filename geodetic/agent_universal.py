@@ -497,6 +497,15 @@ async def _refresh_ubx_receiver_info(reader):
     except Exception as error:
         info['error'] = (str(error) or type(error).__name__)[:160]
     if info.get('itfm_supported') is False:
+        try:
+            poll = bytes(4) + struct.pack('<I', 0x10f60051)
+            packet = await reader.query_base(_ubx_packet(6, 0x8b, poll), (6, 0x8b))
+            values = _ubx_cfg_values(_base_ubx_payload(packet, (6, 0x8b)))
+            if values.get(0x10f60051) not in (b'\0', b'\x01'):
+                raise ValueError('Invalid jamming sensitivity response')
+            info['jamming_sensitivity_high'] = values[0x10f60051] == b'\x01'
+        except Exception as error:
+            info['sensitivity_error'] = (str(error) or type(error).__name__)[:160]
         globals()['LAST_UBX_RECEIVER_INFO'] = info
         globals()['LAST_UBX_RECEIVER_INFO_TS'] = time.time()
         return
