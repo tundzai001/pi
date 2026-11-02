@@ -445,6 +445,35 @@ def _ubx_rf_payload(payload, message_id):
                 payload_b64=base64.b64encode(payload).decode('ascii'))
 
 
+def _ubx_security_payload(payload, message_id):
+    # HPG 1.51 interface: SEC-SIG v2 and SEC-SIGLOG v1.
+    if message_id == 9:
+        if len(payload) < 4 or payload[0] != 2 or payload[3] > 16 or len(payload) != 4 + payload[3] * 4:
+            raise ValueError('Invalid SEC-SIG payload')
+        flags = payload[1]
+        jam, spoof = (flags >> 1) & 3, (flags >> 4) & 7
+        if jam > 2 or spoof > 3:
+            raise ValueError('Unknown SEC-SIG state')
+        frequencies = []
+        for offset in range(4, len(payload), 4):
+            value = int.from_bytes(payload[offset:offset+4], 'little')
+            khz = value & 0xffffff
+            if not khz or any(row['khz'] == khz for row in frequencies):
+                raise ValueError('Invalid SEC-SIG frequency')
+            frequencies.append(dict(khz=khz, jammed=bool(value & (1 << 24))))
+        result = dict(source='ubx_sec_sig', jam_enabled=bool(flags & 1), jam_state=jam,
+                      spoof_enabled=bool(flags & 8), spoof_state=spoof, frequencies=frequencies)
+    elif message_id == 0x10:
+        if len(payload) < 8 or payload[0] != 1 or payload[1] > 16 or len(payload) != 8 + payload[1] * 8:
+            raise ValueError('Invalid SEC-SIGLOG payload')
+        result = dict(source='ubx_sec_siglog', events=[dict(
+            elapsed_seconds=int.from_bytes(payload[o:o+4], 'little'), detection=payload[o+4], event=payload[o+5])
+            for o in range(8, len(payload), 8)])
+    else:
+        raise ValueError('Unsupported security message')
+    return dict(result, payload_b64=base64.b64encode(payload).decode('ascii'))
+
+
 def _ubx_version_payload(payload):
     if not 40 <= len(payload) <= 520 or (len(payload) - 40) % 30:
         raise ValueError('Invalid MON-VER payload')
@@ -536,7 +565,7 @@ def _rf_monitor_decode(snapshot, source, limit):
 
 
 class GnssRfMonitor:
-    """Ten minutes of distinct RF samples plus one matching satellite snapshot."""
+    """Distinct samples in successive ten-minute periods, with bounded persistent history."""
     def __init__(self, history_path=None):
         self.samples = deque(maxlen=120)
         self.previous_cno = {}
@@ -565,8 +594,8 @@ class GnssRfMonitor:
                 if source is None:
                     row = connection.execute('SELECT source FROM rf_samples ORDER BY at DESC LIMIT 1').fetchone()
                     source = row[0] if row else None
-                rows = connection.execute('SELECT CAST(at/3600 AS INTEGER)*3600, COUNT(*), SUM(severity>0), SUM(severity=2), COALESCE(SUM(severity>0 AND delta<=-3),0), COUNT(delta), MIN(delta) FROM rf_samples WHERE source=? GROUP BY 1 ORDER BY 1', (source,)).fetchall()
-                bounds = connection.execute('SELECT MIN(at),MAX(at) FROM rf_samples WHERE source=?', (source,)).fetchone()
+                rows = connection.execute('SELECT CAST(at/3600 AS INTEGER)*3600, COUNT(*), SUM(severity>0), SUM(severity=2), COALESCE(SUM(severity>0 AND delta<=-3),0), COUNT(delta), MIN(delta) FROM rf_samples GROUP BY 1 ORDER BY 1').fetchall()
+                bounds = connection.execute('SELECT MIN(at),MAX(at) FROM rf_samples').fetchone()
             self.history = {'source':source, 'hours':[list(row) for row in rows], 'first_sample_at':bounds[0], 'last_sample_at':bounds[1]} if rows else None
             self.history_error = None
         except (sqlite3.Error, OSError) as error:
@@ -580,10 +609,28 @@ class GnssRfMonitor:
         while self.samples and now - self.samples[0]['at'] > 600:
             self.samples.popleft()
         raw = payload.get('gnss_rf')
+        modern = (payload.get('gnss_receiver') or {}).get('itfm_supported') is False
+        if modern or payload.get('gnss_security'):
+            raw = payload.get('gnss_security') or {'source': 'ubx_sec_sig'}
         age, severity = None, None
         blocks = []
         source = raw.get('source') if isinstance(raw, dict) else None
-        if payload.get('status') != 'offline' and source == 'ubx_mon_rf':
+        jam_warning = spoof_warning = False
+        if payload.get('status') != 'offline' and source == 'ubx_sec_sig':
+            data = _rf_monitor_decode(raw, source, 92)
+            if data and not raw.get('error'):
+                try:
+                    security = _ubx_security_payload(data, 9)
+                    age = _rf_monitor_age(raw)
+                    jam_warning = security['jam_enabled'] and security['jam_state'] == 2
+                    spoof_warning = security['spoof_enabled'] and security['spoof_state'] >= 2
+                    if jam_warning or spoof_warning:
+                        severity = 2 if spoof_warning and security['spoof_state'] == 3 else 1
+                    elif security['jam_enabled'] and security['jam_state'] == 1 and security['spoof_enabled'] and security['spoof_state'] == 1:
+                        severity = 0
+                except ValueError:
+                    pass
+        elif payload.get('status') != 'offline' and source == 'ubx_mon_rf':
             data = _rf_monitor_decode(raw, source, 136)
             if data and len(data) >= 4 and data[0] == 0 and 1 <= data[1] <= 4 and len(data) == 4 + 24 * data[1]:
                 blocks = [[data[o], data[o + 1] & 3, int.from_bytes(data[o+12:o+14], 'little'),
@@ -616,10 +663,13 @@ class GnssRfMonitor:
         if severity is not None and (not self.samples or sample_at - self.samples[-1]['at'] >= 5):
             if self.started_at is None:
                 self.started_at = sample_at
+            elif sample_at >= self.started_at + 600:
+                self.started_at += int((sample_at - self.started_at) // 600) * 600
+                self.samples.clear()
             cno = {}
             epoch = None
             satellites = payload.get('gnss_satellites')
-            data = _rf_monitor_decode(satellites, 'ubx_nav_sat', 2060) if source == 'ubx_mon_rf' else None
+            data = _rf_monitor_decode(satellites, 'ubx_nav_sat', 2060) if source in ('ubx_mon_rf', 'ubx_sec_sig') else None
             if (data and len(data) >= 8 and data[4] == 1 and data[5] <= 128
                     and len(data) == 8 + 12 * data[5] and abs(_rf_monitor_age(satellites) - age) <= 10):
                 epoch = int.from_bytes(data[:4], 'little')
@@ -639,6 +689,7 @@ class GnssRfMonitor:
                 changes = [cno[key] - self.previous_cno[key] for key in common]
                 delta = round(statistics.median(changes), 1)
             self.samples.append({'at': sample_at, 'severity': severity, 'cno_delta': delta,
+                                 'jamming': jam_warning, 'spoofing': spoof_warning,
                                  'rf_blocks': blocks, 'matched': len(changes), 'changed': sum(value != 0 for value in changes),
                                  'minimum': min(changes) if changes else None, 'maximum': max(changes) if changes else None})
             if epoch != self.previous_epoch:
@@ -662,6 +713,10 @@ class GnssRfMonitor:
                     *[value for column in (2, 3, 4) for value in (min(row[column] for row in readings), max(row[column] for row in readings))]])
         last = self.samples[-1] if self.samples else {'at':self.history['last_sample_at'], 'cno_delta':None, 'matched':0}
         return {'source': self.source or self.history['source'], 'window_seconds': 600, 'sample_count': len(self.samples),
+                'window_mode': 'fixed', 'window_started_at': self.started_at,
+                'window_ends_at': self.started_at + 600 if self.started_at is not None else None,
+                'jamming_samples': sum(sample.get('jamming', False) for sample in self.samples),
+                'spoofing_samples': sum(sample.get('spoofing', False) for sample in self.samples),
                 'observed_seconds': min(600, max(0, round(last['at'] - self.started_at, 1))) if self.started_at is not None else 0,
                 'samples': [[round(last['at'] - sample['at'], 1), sample['severity'], sample['cno_delta'], sample['matched'], sample['changed'], sample['minimum'], sample['maximum']] for sample in self.samples],
                 'history_24h': self.history, 'history_error': self.history_error, 'block_ranges': block_ranges,
@@ -675,10 +730,12 @@ class GnssRfMonitor:
 
 def receiver_quality_status(now):
     # Explicit null clears stale data; legacy hacc is always millimetres.
-    status = dict(hacc=None, gnss_quality=None, gnss_dop=None, gnss_satellites=None, gnss_rf=None, gnss_spectrum=None, gnss_receiver=None)
+    status = dict(hacc=None, gnss_quality=None, gnss_dop=None, gnss_satellites=None, gnss_rf=None, gnss_spectrum=None, gnss_receiver=None,
+                  gnss_security=None, gnss_security_log=None)
     report = globals().get('AUTOMATIC_RF_REPORT')
     status['gnss_rf_monitor'] = dict(report, age_seconds=max(0, round(now - report['last_sample_at'], 1))) if report else None
-    for field, key in [('gnss_receiver', 'LAST_UBX_RECEIVER_INFO'), ('gnss_rf', 'LAST_UBX_RF'), ('gnss_spectrum', 'LAST_UBX_SPECTRUM')]:
+    for field, key in [('gnss_receiver', 'LAST_UBX_RECEIVER_INFO'), ('gnss_rf', 'LAST_UBX_RF'), ('gnss_spectrum', 'LAST_UBX_SPECTRUM'),
+                       ('gnss_security', 'LAST_UBX_SECURITY'), ('gnss_security_log', 'LAST_UBX_SECURITY_LOG')]:
         reading = globals().get(key)
         age = now - float(globals().get(key + '_TS') or 0)
         if reading and 0 <= age <= 45:
@@ -789,6 +846,17 @@ async def refresh_receiver_quality(agent, reader):
                 globals()['LAST_UBX_RF_ERROR_TS'] = time.time()
             logging.warning('[GNSS][RF %02X] %s', message_id, error)
     await _refresh_ubx_receiver_info(reader)
+    if (globals().get('LAST_UBX_RECEIVER_INFO') or {}).get('itfm_supported') is False:
+        for message_id, key in ((9, 'LAST_UBX_SECURITY'), (0x10, 'LAST_UBX_SECURITY_LOG')):
+            try:
+                packet = await reader.query_base(_ubx_packet(0x27, message_id), (0x27, message_id))
+                globals()[key] = _ubx_security_payload(_base_ubx_payload(packet, (0x27, message_id)), message_id)
+                globals()[key + '_TS'] = time.time()
+            except Exception as error:
+                globals()[key] = dict(source='ubx_sec_sig' if message_id == 9 else 'ubx_sec_siglog',
+                                      error=(str(error) or type(error).__name__)[:160])
+                globals()[key + '_TS'] = time.time()
+                logging.warning('[GNSS][SEC %02X] %s', message_id, error)
     _update_automatic_rf_monitor()
 
 
@@ -4140,6 +4208,14 @@ class GNSSReader(threading.Thread):
                 ubx_class = buffer[2]
                 ubx_id = buffer[3]
 
+                if ubx_class == 0x27 and ubx_id in (9, 0x10):
+                    try:
+                        key = 'LAST_UBX_SECURITY' if ubx_id == 9 else 'LAST_UBX_SECURITY_LOG'
+                        globals()[key] = _ubx_security_payload(packet[6:-2], ubx_id)
+                        globals()[key + '_TS'] = time.time()
+                    except ValueError:
+                        self.parse_errors += 1
+
                 # UBX-NAV-HPPOSLLH (class=0x01, id=0x14) payload length is typically 36 bytes.
                 if ubx_class == 0x01 and ubx_id == 0x14 and payload_length == 36 and not (packet[9] & 1):
                     try:
@@ -4579,6 +4655,9 @@ def _base_ubx_payload(packet, key):
             or _ubx_packet(*key, packet[6:-2]) != packet):
         raise ValueError("Invalid UBX readback checksum or frame")
     payload = packet[6:-2]
+    if key[0] == 0x27 and key[1] in (9, 0x10):
+        _ubx_security_payload(payload, key[1])
+        return payload
     if key == (0x0a, 4):
         _ubx_version_payload(payload)
         return payload
