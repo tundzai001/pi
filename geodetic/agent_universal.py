@@ -451,7 +451,13 @@ def _ubx_version_payload(payload):
     fields = [payload[:30], payload[30:40]] + [payload[i:i+30] for i in range(40, len(payload), 30)]
     if any(any(c < 32 or c > 126 for c in field.split(b'\0', 1)[0]) for field in fields) or not fields[0].split(b'\0', 1)[0]:
         raise ValueError('Invalid MON-VER text')
-    return dict(source='ubx_mon_ver', payload_b64=base64.b64encode(payload).decode('ascii'))
+    extensions = [field.split(b'\0', 1)[0].decode('ascii') for field in fields[2:]]
+    firmware = next((item[6:] for item in extensions if item.startswith('FWVER=')), None)
+    protocol = next((item[8:] for item in extensions if item.startswith('PROTVER=')), None)
+    model = next((item[4:] for item in extensions if item.startswith('MOD=')), None)
+    return dict(source='ubx_mon_ver', payload_b64=base64.b64encode(payload).decode('ascii'),
+                firmware=firmware, protocol=protocol, model=model,
+                itfm_supported=False if firmware in ('HPG 1.50', 'HPG 1.51') else None)
 
 
 async def _refresh_ubx_receiver_info(reader):
@@ -461,6 +467,10 @@ async def _refresh_ubx_receiver_info(reader):
         info.update(_ubx_version_payload(_base_ubx_payload(packet, (0x0a, 4))))
     except Exception as error:
         info['error'] = (str(error) or type(error).__name__)[:160]
+    if info.get('itfm_supported') is False:
+        globals()['LAST_UBX_RECEIVER_INFO'] = info
+        globals()['LAST_UBX_RECEIVER_INFO_TS'] = time.time()
+        return
     try:
         poll = bytes(4) + struct.pack('<I', 0x1041000d)  # VALGET: running RAM layer, exact enable key.
         packet = await reader.query_base(_ubx_packet(6, 0x8b, poll), (6, 0x8b))
@@ -4584,6 +4594,52 @@ def _base_ubx_payload(packet, key):
     return payload
 
 
+def _ubx_cfg_values(body):
+    if len(body) < 4 or body[:4] not in (b'\x01\0\0\0', b'\x01\x01\0\0', b'\x01\x02\0\0'):
+        raise ValueError('Invalid CFG-VALGET header')
+    values, offset = {}, 4
+    while offset < len(body):
+        if offset + 4 > len(body):
+            raise ValueError('Truncated configuration key')
+        key = int.from_bytes(body[offset:offset+4], 'little')
+        size = {1:1,2:1,3:2,4:4,5:8}.get(key >> 28)
+        if size is None or key in values or len(values) >= 64 or offset+4+size > len(body):
+            raise ValueError('Invalid configuration key/value')
+        values[key] = body[offset+4:offset+4+size]
+        offset += 4+size
+    return values
+
+
+def _ubx_tmode_fields():
+    return [(0x20030001,2,1),(0x20030002,3,1),
+            (0x40030003,4,4),(0x40030004,8,4),(0x40030005,12,4),
+            (0x20030006,16,1),(0x20030007,17,1),(0x20030008,18,1),
+            (0x40030009,4,4),(0x4003000a,8,4),(0x4003000b,12,4),
+            (0x2003000c,16,1),(0x2003000d,17,1),(0x2003000e,18,1),
+            (0x4003000f,20,4),(0x40030010,24,4),(0x40030011,28,4)]
+
+
+async def _read_ublox_tmode(reader, modern=False):
+    if not modern:
+        return _base_ubx_payload(await reader.query_base(_ubx_packet(6,0x71),(6,0x71)),(6,0x71))
+    fields = _ubx_tmode_fields()
+    poll = bytes(4)+b''.join(struct.pack('<I',key) for key,_,_ in fields)
+    packet = await reader.query_base(_ubx_packet(6,0x8b,poll),(6,0x8b))
+    if packet != _ubx_packet(6,0x8b,packet[6:-2]) or packet[6:10] != b'\x01\0\0\0':
+        raise ValueError('Invalid TMODE VALGET response')
+    values = _ubx_cfg_values(packet[6:-2])
+    if set(values) != {key for key,_,_ in fields} or values[0x20030001][0] > 2 or values[0x20030002][0] > 1:
+        raise ValueError('Incomplete or invalid TMODE keys')
+    mode = bytearray(40)
+    lla = values[0x20030002] == b'\x01'
+    for key,offset,size in fields:
+        if (key in (0x40030003,0x40030004,0x40030005,0x20030006,0x20030007,0x20030008) and lla
+            or key in (0x40030009,0x4003000a,0x4003000b,0x2003000c,0x2003000d,0x2003000e) and not lla):
+            continue
+        mode[offset:offset+size] = values[key]
+    return bytes(mode)
+
+
 def _base_ecef_position(x, y, z):
     if not 5000000 <= math.sqrt(x*x + y*y + z*z) <= 8000000:
         raise ValueError("Receiver base ECEF coordinates are invalid")
@@ -4637,13 +4693,16 @@ async def refresh_receiver_base_status(agent, reader):
             raise RuntimeError("Base readback requires a supported GNSS reader")
         if chip == 'Ublox':
             result['query'] = 'CFG-TMODE3 / NAV-SVIN'
-            mode = _base_ubx_payload(await reader.query_base(_ubx_packet(6, 0x71), (6, 0x71)), (6, 0x71))
+            modern = (globals().get('LAST_UBX_RECEIVER_INFO') or {}).get('itfm_supported') is False
+            mode = await _read_ublox_tmode(reader, modern)
+            if modern:
+                result['query'] = 'CFG-VALGET / NAV-SVIN'
             flags = int.from_bytes(mode[2:4], 'little')
             kind = flags & 0xff
             if kind not in (0, 1, 2):
                 raise ValueError("Unsupported u-blox receiver mode")
             result.update(state='ok', mode_kind=('rover', 'survey_in', 'base')[kind],
-                          mode_raw=('Rover (CFG-TMODE3)', 'Survey-In (NAV-SVIN)', 'Fixed LLA (CFG-TMODE3)')[kind])
+                          mode_raw=('Rover', 'Survey-In', 'Fixed LLA')[kind] + (' (CFG-VALGET)' if modern else ' (CFG-TMODE3)'))
             if kind == 2:
                 result['bestpos'] = _base_ubx_position(mode, ready=True)
             elif kind == 1:
@@ -4723,7 +4782,7 @@ def _gnss_verification_expected(payload):
     """Accept bounded, exact output keys; these bytes are never sent as setters."""
     mode_b64, output_b64 = payload.get('tmode_b64'), payload.get('output_b64')
     if (not isinstance(mode_b64, str) or len(mode_b64) > 56
-            or not isinstance(output_b64, str) or len(output_b64) > 620):
+            or not isinstance(output_b64, str) or len(output_b64) > 680):
         raise ValueError('Invalid GNSS verification expectation')
     mode = base64.b64decode(mode_b64, validate=True)
     output = base64.b64decode(output_b64, validate=True)
@@ -4898,7 +4957,7 @@ async def verify_receiver_configuration(agent, reader, payload, command_id):
                 for key, _ in chunk:
                     if key in (0x10510003, 0x10520005, 0x10530005, 0x10650001, 0x10640006): desired[key] = 1
     try:
-        actual = _base_ubx_payload(await reader.query_base(_ubx_packet(6, 0x71), (6, 0x71)), (6, 0x71))
+        actual = await _read_ublox_tmode(reader, payload.get('tmode_valget') is True)
         expected_position = [struct.unpack_from('<i', expected, 4 + i * 4)[0] * 100
                              + struct.unpack_from('<b', expected, 16 + i)[0] for i in range(3)]
         actual_position = [struct.unpack_from('<i', actual, 4 + i * 4)[0] * 100
@@ -4953,11 +5012,21 @@ async def verify_receiver_configuration(agent, reader, payload, command_id):
             if port_name in ('UART1', 'UART2'):
                 try:
                     port_id = int(port_name[-1])
-                    reply = await reader.query_base(_ubx_packet(6, 0, bytes([port_id])), (6, 0))
-                    body = reply[6:-2]
-                    if len(body) != 20 or reply != _ubx_packet(6, 0, body) or body[0] != port_id:
-                        raise ValueError('Invalid CFG-PRT response')
-                    port['baud'] = struct.unpack_from('<I', body, 8)[0]
+                    if payload.get('tmode_valget') is True:
+                        key = 0x40520001 if port_id == 1 else 0x40530001
+                        reply = await reader.query_base(_ubx_packet(6,0x8b,bytes(4)+struct.pack('<I',key)),(6,0x8b))
+                        if reply != _ubx_packet(6,0x8b,reply[6:-2]):
+                            raise ValueError('Invalid baud VALGET response')
+                        baud_values = _ubx_cfg_values(reply[6:-2])
+                        if set(baud_values) != {key}:
+                            raise ValueError('Invalid baud key')
+                        port['baud'] = int.from_bytes(baud_values[key],'little')
+                    else:
+                        reply = await reader.query_base(_ubx_packet(6, 0, bytes([port_id])), (6, 0))
+                        body = reply[6:-2]
+                        if len(body) != 20 or reply != _ubx_packet(6, 0, body) or body[0] != port_id:
+                            raise ValueError('Invalid CFG-PRT response')
+                        port['baud'] = struct.unpack_from('<I', body, 8)[0]
                 except Exception:
                     port['baud'] = None
             details['ports'].append(port)
@@ -4981,7 +5050,7 @@ def receiver_base_system_info(agent):
     result = copy.deepcopy(getattr(agent, 'receiver_base_readback', {}))
     checked_at = getattr(agent, 'receiver_base_readback_at', None)
     age = max(0, time.monotonic() - checked_at) if checked_at is not None else None
-    system = dict(gnss_verification_supported=True, gnss_verification_details_supported=True, gnss_verification_uart1=False,
+    system = dict(gnss_valset_supported=True, gnss_verification_supported=True, gnss_verification_details_supported=True, gnss_verification_uart1=False,
                   gnss_verification=None)
     verification = getattr(agent, 'gnss_verification', None)
     verified_at = getattr(agent, 'gnss_verification_at', None)
@@ -6004,6 +6073,13 @@ async def _process_command(source: str, data: dict, agent: AgentManager, gnss_re
                     logging.info(f"Opening GNSS command port {port} @ {baud} baud")
                     with serial_port_lock, serial.Serial(port, baud, timeout=2) as ser:
                         expected_tmode = None
+                        expected_values = {}
+                        profile = payload.get('receiver_profile') or {}
+                        if profile.get('modern'):
+                            logging.info('[GNSS][CONFIG] firmware=%s interface=VALSET layers=RAM/BBR/Flash', profile.get('firmware'))
+                            actual_info = _ubx_version_payload(_query_ubx_serial(ser, 0x0a, 4))
+                            if actual_info.get('firmware') != profile.get('firmware') or actual_info.get('model') != 'ZED-F9P':
+                                raise RuntimeError('GNSS firmware changed; refresh receiver information before applying')
                         for cmd_b64 in commands_b64:
                             decoded_cmd = base64.b64decode(cmd_b64)
                             
@@ -6016,12 +6092,17 @@ async def _process_command(source: str, data: dict, agent: AgentManager, gnss_re
                             if decoded_cmd[:4] == b"\xb5\x62\x06\x71" and len(decoded_cmd) == 48:
                                 expected_tmode = decoded_cmd
 
+                            if profile.get('modern'):
+                                expected_values.update(_ubx_valset_values(decoded_cmd))
+
                             # Send command
                             logging.info(f"  -> Sending: {decoded_cmd.decode('ascii', errors='ignore').strip()}")
                             ser.write(decoded_cmd)
                             ser.flush()
                             await asyncio.sleep(0.5)
                             
+                        if profile.get('modern'):
+                            _verify_ublox_values(ser, expected_values)
                         if expected_tmode is not None:
                             _verify_ublox_tmode(ser, expected_tmode)
 
@@ -6434,6 +6515,69 @@ def _ubx_packet(msg_class, msg_id, payload=b''):
     return b'\xb5\x62' + body + bytes([ck_a, ck_b])
 
 
+def _query_ubx_serial(ser, msg_class, msg_id, payload=b'', timeout=4.0):
+    previous_timeout = ser.timeout
+    ser.timeout = 0.2
+    buffer = bytearray()
+    try:
+        ser.reset_input_buffer()
+        ser.write(_ubx_packet(msg_class,msg_id,payload))
+        ser.flush()
+        deadline = time.monotonic()+timeout
+        while time.monotonic() < deadline:
+            buffer.extend(ser.read(min(ser.in_waiting or 1,4096)))
+            while len(buffer) >= 8:
+                start = buffer.find(b'\xb5\x62')
+                if start < 0:
+                    del buffer[:-1]
+                    break
+                del buffer[:start]
+                if len(buffer) < 8:
+                    break
+                length = int.from_bytes(buffer[4:6],'little')
+                if length > 8192:
+                    del buffer[0]
+                    continue
+                if len(buffer) < length+8:
+                    break
+                packet = bytes(buffer[:length+8])
+                del buffer[:length+8]
+                if packet != _ubx_packet(packet[2],packet[3],packet[6:-2]):
+                    continue
+                if packet[2:4] == b'\x05\0' and packet[6:-2] == bytes([msg_class,msg_id]):
+                    raise RuntimeError('Receiver rejected UBX readback')
+                if packet[2:4] == bytes([msg_class,msg_id]):
+                    return packet[6:-2]
+        raise TimeoutError('Receiver configuration readback timeout')
+    finally:
+        ser.timeout = previous_timeout
+
+
+def _ubx_valset_values(blob):
+    values, offset = {}, 0
+    while offset < len(blob):
+        length = int.from_bytes(blob[offset+4:offset+6],'little')
+        packet = blob[offset:offset+length+8]
+        if (len(packet) < 12 or packet != _ubx_packet(6,0x8a,packet[6:-2]) or packet[6:10] != b'\0\x07\0\0'):
+            raise ValueError('Expected VALSET RAM/BBR/Flash commands only')
+        values.update(_ubx_cfg_values(b'\x01\0\0\0'+packet[10:-2]))
+        offset += length+8
+    if not values:
+        raise ValueError('Empty VALSET configuration')
+    return values
+
+
+def _verify_ublox_values(ser, values):
+    items = list(values.items())
+    for layer in (0,1,2):  # RAM, BBR and Flash have different VALGET layer IDs.
+        for offset in range(0,len(items),64):
+            chunk = dict(items[offset:offset+64])
+            poll = bytes([0,layer,0,0])+b''.join(struct.pack('<I',key) for key in chunk)
+            body = _query_ubx_serial(ser,6,0x8b,poll)
+            if body[:4] != bytes([1,layer,0,0]) or _ubx_cfg_values(body) != chunk:
+                raise RuntimeError(f'Receiver configuration differs in layer {layer}; configuration is unconfirmed')
+
+
 def _verify_ublox_tmode(ser, expected_packet, timeout=4.0):
     """Poll TMODE3; a successful serial write is not proof of receiver mode."""
     expected_flags = int.from_bytes(expected_packet[8:10], 'little') & 0x1ff
@@ -6584,12 +6728,14 @@ async def _apply_base_mode_to_chip(chip_type: str, port: str, lat: float, lon: f
                 msg[9] = 1
 
                 multiplier = 10000000
-                ecef_x_or_lat = int(lat * multiplier).to_bytes(4, byteorder='little', signed=True)
-                ecef_x_or_lat_hp = int(round((lat * multiplier - int(lat * multiplier)) * 100)).to_bytes(1, byteorder='little', signed=True)
-                ecef_y_or_lon = int(lon * multiplier).to_bytes(4, byteorder='little', signed=True)
-                ecef_y_or_lon_hp = int(round((lon * multiplier - int(lon * multiplier)) * 100)).to_bytes(1, byteorder='little', signed=True)
-                ecef_z_or_alt = int(alt * 100).to_bytes(4, byteorder='little', signed=True)
-                ecef_z_or_alt_hp = int(round((alt * 100 - int(alt * 100)) * 100)).to_bytes(1, byteorder='little', signed=True)
+                # Match the BASE builder's truncation; rounding the residual can produce invalid HP +/-100.
+                fixed_lat, fixed_lon, fixed_alt = (Decimal(str(value)) for value in (lat, lon, alt))
+                ecef_x_or_lat = int(fixed_lat * multiplier).to_bytes(4, byteorder='little', signed=True)
+                ecef_x_or_lat_hp = (int(fixed_lat * multiplier * 100) - int(fixed_lat * multiplier) * 100).to_bytes(1, byteorder='little', signed=True)
+                ecef_y_or_lon = int(fixed_lon * multiplier).to_bytes(4, byteorder='little', signed=True)
+                ecef_y_or_lon_hp = (int(fixed_lon * multiplier * 100) - int(fixed_lon * multiplier) * 100).to_bytes(1, byteorder='little', signed=True)
+                ecef_z_or_alt = int(fixed_alt * 100).to_bytes(4, byteorder='little', signed=True)
+                ecef_z_or_alt_hp = (int(fixed_alt * 10000) - int(fixed_alt * 100) * 100).to_bytes(1, byteorder='little', signed=True)
                 fixed_pos_acc = int(accuracy * 10000).to_bytes(4, byteorder='little', signed=False)
 
                 for i in range(4):
@@ -6609,11 +6755,14 @@ async def _apply_base_mode_to_chip(chip_type: str, port: str, lat: float, lon: f
                 msg[46] = ck_a
                 msg[47] = ck_b
 
-                ser.write(msg)
-                ser.write(_ubx_packet(0x06, 0x01, b'\xf5\x05\x00\x01\x00\x01\x00\x00'))
-                ser.write(b'\xb5\x62\x06\x09\x0d\x00\x00\x00\x00\x00\xff\xff\x00\x00\x00\x00\x00\x00\x03\x1d\xab')
+                mode = bytes(msg[6:-2])
+                keys = {key: mode[offset:offset+size] for key,offset,size in _ubx_tmode_fields()
+                        if key not in (0x40030003,0x40030004,0x40030005,0x20030006,0x20030007,0x20030008)}
+                for key in (0x209102BE,0x209102C0):
+                    keys[key] = b'\x01'
+                ser.write(_ubx_packet(6,0x8a,b'\0\x07\0\0'+b''.join(struct.pack('<I',key)+value for key,value in keys.items())))
                 ser.flush()
-                _verify_ublox_tmode(ser, msg)
+                _verify_ublox_values(ser,keys)
             elif chip_type in ("Unicorecomm", "RTCM3_Source"):
                 # Use higher precision for command string to avoid rounding
                 base_cmd = f"MODE BASE {Decimal(repr(lat)):f} {Decimal(repr(lon)):f} {Decimal(repr(alt)):f}\r\n".encode("ascii")
@@ -6643,6 +6792,7 @@ async def _apply_rover_mode_to_chip(chip_type: str, port: str, gnss_reader: GNSS
         baud = _runtime_serial_baud(gnss_reader=gnss_reader)
         with serial_port_lock, serial.Serial(port, baud, timeout=2) as ser:
             if chip_type == "Ublox":
+                expected_values = {}
                 # Helper for UBX-CFG-VALSET (Generation 9 - F9P / F9H)
                 def send_valset_u1(key_id, val):
                     v_msg = bytearray(b'\xb5\x62\x06\x8a\x09\x00\x00\x07\x00\x00')
@@ -6655,6 +6805,7 @@ async def _apply_rover_mode_to_chip(chip_type: str, port: str, gnss_reader: GNSS
                         v_b = (v_b + v_a) & 0xFF
                     v_msg[15], v_msg[16] = v_a, v_b
                     ser.write(v_msg)
+                    expected_values[key_id] = bytes([val & 0xff])
 
                 # Input protocol gates are independent from message output rates.
                 for input_prefix, output_prefix in ((0x10730000, 0x10740000), (0x10750000, 0x10760000), (0x10770000, 0x10780000)):
@@ -6669,45 +6820,15 @@ async def _apply_rover_mode_to_chip(chip_type: str, port: str, gnss_reader: GNSS
                 send_valset_u1(0x209100bd, 1) # CFG-MSGOUT-NMEA_ID_GGA_USB
                 send_valset_u1(0x209100bb, 1) # CFG-MSGOUT-NMEA_ID_GGA_UART1
                 send_valset_u1(0x20910036, 1) # CFG-MSGOUT-UBX_NAV_HPPOSLLH_USB
-                send_valset_u1(0x20910035, 1) # CFG-MSGOUT-UBX_NAV_HPPOSLLH_UART1
+                send_valset_u1(0x20910034, 1) # CFG-MSGOUT-UBX_NAV_HPPOSLLH_UART1
                 send_valset_u1(0x20910009, 1) # CFG-MSGOUT-UBX_NAV_PVT_USB
                 # Disable RTCM 1005 output
                 send_valset_u1(0x209102c0, 0) # CFG-MSGOUT-RTCM3X_1005_USB
                 send_valset_u1(0x209102be, 0) # CFG-MSGOUT-RTCM3X_1005_UART1
 
-                # Legacy UBX-CFG-TMODE3 (turn off base mode)
-                msg = bytearray(b'\xb5\x62\x06\x71\x28\x00' + b'\x00' * 42)
-                ck_a = ck_b = 0
-                for index in range(2, 46):
-                    ck_a = (ck_a + msg[index]) & 0xFF
-                    ck_b = (ck_b + ck_a) & 0xFF
-                msg[46], msg[47] = ck_a, ck_b
-                ser.write(msg)
-                
-                # Legacy UBX-CFG-MSG Enable NMEA-GGA (0xF0 0x00) rate 1 on all ports
-                gga_msg = bytearray(b'\xb5\x62\x06\x01\x08\x00\xf0\x00\x01\x01\x01\x01\x01\x00\x00\x00')
-                ck_a = ck_b = 0
-                for index in range(2, 14):
-                    ck_a = (ck_a + gga_msg[index]) & 0xFF
-                    ck_b = (ck_b + ck_a) & 0xFF
-                gga_msg[14], gga_msg[15] = ck_a, ck_b
-                ser.write(gga_msg)
-                
-                # Disable RTCM 1005 output
-                rtcm_off = bytearray(b'\xb5\x62\x06\x01\x08\x00\xf5\x05\x00\x00\x00\x00\x00\x00\x00\x00')
-                ck_a = ck_b = 0
-                for index in range(2, 14):
-                    ck_a = (ck_a + rtcm_off[index]) & 0xFF
-                    ck_b = (ck_b + ck_a) & 0xFF
-                rtcm_off[14], rtcm_off[15] = ck_a, ck_b
-                ser.write(rtcm_off)
-                
-                # Save configuration
-                ser.write(b'\xb5\x62\x06\x09\x0d\x00\x00\x00\x00\x00\xff\xff\x00\x00\x00\x00\x00\x00\x03\x1d\xab')
                 ser.flush()
-                
-                _verify_ublox_tmode(ser, msg)
-                logging.info("AutoBase: _apply_rover_mode_to_chip Ublox ROVER mode set (VALSET + TMODE3 + NMEA GGA enabled)")
+                _verify_ublox_values(ser, expected_values)
+                logging.info("AutoBase: Ublox ROVER mode applied and verified with VALSET/VALGET")
             elif chip_type in ("Unicorecomm", "RTCM3_Source"):
                 ser.write(b'UNLOGALL\r\n')
                 ser.flush()
