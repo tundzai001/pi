@@ -2252,39 +2252,6 @@ def _vn2000_blh_to_local_wgs84_llh(lat_blh: float, lon_blh: float, h_blh: float,
     lat_local, lon_local, h_local = _ecef_to_llh_rad(xv, yv, zv, a, b)
     return lat_local, lon_local, h_local
 
-def _transform_itrf_to_vn2000_llh(lat_deg: float, lon_deg: float, h: float, datum: RTCMDatum):
-    phi = math.radians(lat_deg)
-    lam = math.radians(lon_deg)
-    a = datum.elip.a
-    b = datum.elip.b
-    x, y, z = _llh_rad_to_ecef(phi, lam, h, a, b)
-
-    ro = math.pi / (180.0 * 3600.0)
-    omega = datum.rX * ro
-    phi0 = datum.rY * ro
-    eps = datum.rZ * ro
-    k = datum.kT
-
-    xv = datum.dX + k * (x + eps * y - phi0 * z)
-    yv = datum.dY + k * (-eps * x + y + omega * z)
-    zv = datum.dZ + k * (phi0 * x - omega * y + z)
-    lat_vn, lon_vn, h_vn = _ecef_to_llh_rad(xv, yv, zv, a, b)
-
-    if datum.res_update:
-        lat_vn += datum.resB
-        lon_vn += datum.resL
-        h_vn += datum.resH
-
-    north, east, h_ne = _blh_to_xyh(datum.l0, datum.k0, lat_vn, lon_vn, h_vn, datum)
-    if datum.shift_cors:
-        north += datum.resN
-        east += datum.resE
-        h_ne += datum.resHS
-
-    lat_blh, lon_blh, h_blh = _xy_to_blh(datum.l0, datum.k0, north, east, h_ne, datum)
-    lat_local, lon_local, h_local = _vn2000_blh_to_local_wgs84_llh(lat_blh, lon_blh, h_blh, datum)
-    return math.degrees(lat_local), math.degrees(lon_local), h_local
-
 def _transform_itrf_to_vn2000_neh_and_llh(lat_deg: float, lon_deg: float, h: float, datum: RTCMDatum):
     phi = math.radians(lat_deg)
     lam = math.radians(lon_deg)
@@ -6063,9 +6030,10 @@ async def _process_command(source: str, data: dict, agent: AgentManager, gnss_re
                 "samples": auto_setup_metadata.get("samples", 60),
                 "sensor_type": auto_setup_metadata.get("sensor_type"),
                 "review_only": True,
-                "enable_itrf_vn2000_transform": str(auto_setup_metadata.get("ip") or "").strip() == "14.238.1.125",
+                "enable_itrf_vn2000_transform": auto_setup_metadata.get("enable_itrf_vn2000_transform", True),
                 "l0_deg": auto_setup_metadata.get("l0_deg"),
-                "k0": auto_setup_metadata.get("k0")
+                "k0": auto_setup_metadata.get("k0"),
+                **{key: auto_setup_metadata.get(key, 0.0) for key in ("resN", "resE", "resHS")}
             }
             agent.save_config()
             _set_auto_base_progress("queued", step=0, total_steps=4)
@@ -7096,7 +7064,7 @@ async def _run_auto_base_setup(agent: AgentManager, gnss_reader: GNSSReader, mqt
     global current_state, LAST_GGA_COORD
     
     cfg = agent.config.get("auto_base_setup", {})
-    enable_transform = str(cfg.get("ip") or "").strip() == "14.238.1.125"
+    enable_transform = cfg.get("enable_itrf_vn2000_transform", True) is not False
     if not cfg:
         # Default disabled if not in config
         return
@@ -7332,36 +7300,35 @@ async def _run_auto_base_setup(agent: AgentManager, gnss_reader: GNSSReader, mqt
     province_code = None
     province_name = None
     province_hint = None
-    if cfg.get("l0_deg") is not None:
-        datum_snapshot.l0 = math.radians(float(cfg.get("l0_deg")))
-        projection_source = "manual"
-    if cfg.get("k0") is not None:
-        datum_snapshot.k0 = float(cfg.get("k0"))
-        if projection_source != "manual":
-            projection_source = "manual_k0"
-    _set_auto_base_progress('resolving_location', raw_coord=raw_coord, step=4, total_steps=4)
-    await send_status(agent, mqtt_client)
-    try:
-        location = await asyncio.to_thread(_resolve_auto_base_location, avg_lat, avg_lon, avg_alt)
-    except Exception as exc:
-        location = {'state': 'lookup_failed', 'reason': str(exc)}
-    province_code = location.get('province_code')
-    province_name = location.get('province_name')
+    location = {}
     if enable_transform:
         if not datum_snapshot.rtcm1021_update:
             raise ValueError('Chưa nhận RTCM 1021 của phiên CORS này; không dùng 7 tham số mặc định.')
-        if cfg.get('l0_deg') is None:
-            if datum_snapshot.rtcm1025_update:
-                projection_source = 'rtcm1025'
-            elif location.get('l0_deg') is not None:
-                datum_snapshot.l0 = math.radians(float(location['l0_deg']))
-                datum_snapshot.k0 = float(location['k0'])
-                projection_source = 'server_catalog'
-            else:
-                raise ValueError('Chưa xác định được vùng kinh tuyến trục. Cần RTCM 1025 hoặc chọn vùng rõ ràng.')
-
-    if enable_transform and abs(datum_snapshot.k0 - 0.9996) > 1e-9:
-        raise ValueError('Yêu cầu múi 6 độ (k0=0.9996). Nguồn đang gửi múi khác; chọn mountpoint M6, không dùng M3.')
+        if datum_snapshot.rtcm1025_update:
+            projection_source = 'rtcm1025'
+        elif cfg.get('l0_deg') is not None and cfg.get('k0') is not None:
+            datum_snapshot.l0 = math.radians(float(cfg['l0_deg']))
+            datum_snapshot.k0 = float(cfg['k0'])
+            projection_source = 'manual'
+        else:
+            _set_auto_base_progress('resolving_location', raw_coord=raw_coord, step=4, total_steps=4)
+            await send_status(agent, mqtt_client)
+            try:
+                location = await asyncio.to_thread(_resolve_auto_base_location, avg_lat, avg_lon, avg_alt)
+            except Exception as exc:
+                location = {'state': 'lookup_failed', 'reason': str(exc)}
+            province_code = location.get('province_code')
+            province_name = location.get('province_name')
+            if location.get('l0_deg') is None or location.get('k0') is None:
+                raise ValueError('Chưa xác định được kinh tuyến trục. Cần RTCM 1025 hoặc nhập L0/k0 theo tỉnh.')
+            datum_snapshot.l0 = math.radians(float(location['l0_deg']))
+            datum_snapshot.k0 = float(location['k0'])
+            projection_source = 'server_catalog'
+        for key in ('resN', 'resE', 'resHS'):
+            value = float(cfg.get(key, 0.0))
+            if not math.isfinite(value):
+                raise ValueError(f'Invalid CORS shift: {key}')
+            setattr(datum_snapshot, key, value)
 
     if bool(enable_transform):
         try:
@@ -7432,12 +7399,13 @@ async def _run_auto_base_setup(agent: AgentManager, gnss_reader: GNSSReader, mqt
         "rtcm1025_used": projection_source == "rtcm1025",
         "location": location,
         "projection_source": projection_source,
-        "zone_width_deg": 6 if transform_applied else None,
+        "zone_width_deg": (3 if abs(datum_snapshot.k0 - 0.9999) < 1e-9 else
+                           6 if abs(datum_snapshot.k0 - 0.9996) < 1e-9 else None) if transform_applied else None,
         "province_code": province_code, "province_name": province_name, "province_hint": province_hint,
         "central_meridian_deg": math.degrees(datum_snapshot.l0), "k0": datum_snapshot.k0,
         "projected_coord": vn2000_neh,
         "parameters": {key: getattr(datum_snapshot, key) for key in
-                       ("dX", "dY", "dZ", "rX", "rY", "rZ", "kT", "resB", "resL", "resH")},
+                       ("dX", "dY", "dZ", "rX", "rY", "rZ", "kT", "resB", "resL", "resH", "resN", "resE", "resHS")},
         "sample_count": len(coords),
     }
 
