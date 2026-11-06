@@ -303,7 +303,7 @@ else:
 
 # --- CONNECTION CONFIGURATION ---
 DEFAULT_BACKEND_HOST = "aitogy.click"
-DEFAULT_MQTT_BROKER = "45.117.179.134"
+DEFAULT_MQTT_BROKER = "aitogy.click"
 DEFAULT_MQTT_PORT = 1883
 DEFAULT_MQTT_USERNAME = "mqttUser"
 DEFAULT_MQTT_PASSWORD = "MqttPassword123$%^"
@@ -1055,6 +1055,7 @@ class EllipPara:
 @dataclass
 class RTCMDatum:
     rtcm1025_update: bool = False
+    projection_1025: dict = field(default_factory=dict)
     k0: float = 0.9999
     to_zone: int = 3
     l0: float = 105.0 * 0.017453292519943295
@@ -2055,7 +2056,7 @@ def _decode_type1025(buff: bytes, datum: RTCMDatum):
     if i + 184 > len(buff) * 8 + 24:
         return
     i += 8  # station id
-    i += 6  # projection type
+    projection_type = _rtcm_getbitu(buff, i, 6); i += 6
     _ = _rtcm_getbits(buff, i, 34); i += 34  # latitude of natural origin
     lon_no = _rtcm_getbits(buff, i, 35); i += 35  # longitude of natural origin
     sno = _rtcm_getbitu(buff, i, 30); i += 30
@@ -2082,10 +2083,18 @@ def _decode_type1025(buff: bytes, datum: RTCMDatum):
     datum.false_easting = float(fe) * 0.001
     datum.false_northing = float(fn) * 0.001
     datum.rtcm1025_update = True
+    datum.projection_1025 = {
+        'raw_l0': str(lon_no), 'raw_k0': sno, 'projection_type': projection_type,
+        'l0_deg': repr(l0_deg_raw), 'k0': repr(k0),
+        'false_easting': repr(datum.false_easting), 'false_northing': repr(datum.false_northing),
+        'frame_hex': buff[:32].hex(), 'frame_bytes': len(buff), 'frame_truncated': len(buff) > 32,
+    }
     logging.info(
-        "RTCM1025 datum updated: "
+        "RTCM1025 datum updated: processor=python_agent; "
+        f"LoNO={lon_no}, SNO={sno}, PT={projection_type}, "
         f"L0_deg={math.degrees(datum.l0)!r}, k0={datum.k0!r}, "
-        f"FE={datum.false_easting!r}, FN={datum.false_northing!r}"
+        f"FE={datum.false_easting!r}, FN={datum.false_northing!r}, "
+        f"frame_bytes={len(buff)}, hex={datum.projection_1025['frame_hex']}"
     )
 
 def _update_datum_from_rtcm_packet(packet: bytes, datum=None):
@@ -5883,6 +5892,12 @@ async def process_command(source: str, data: dict, agent: AgentManager, gnss_rea
     async with command_execution_lock:
         await _process_command(source, data, agent, gnss_reader, mqtt_client)
 
+def _write_license_key(license_key: str) -> None:
+    fd = os.open(LICENSE_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as license_file:
+        license_file.write(license_key)
+
+
 async def _process_command(source: str, data: dict, agent: AgentManager, gnss_reader: GNSSReader, mqtt_client: mqtt.Client):
     global current_state, rtcm_stream_active_flag, active_auto_base_task, active_auto_base_client
     if not isinstance(data, dict):
@@ -6003,15 +6018,13 @@ async def _process_command(source: str, data: dict, agent: AgentManager, gnss_re
                 license_key = str(payload["license_key"]).strip()
                 if not is_valid_license_key(license_key, MACHINE_SERIAL):
                     raise ValueError("Invalid device token format")
-                fd = os.open(LICENSE_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                with os.fdopen(fd, "w") as f:
-                    f.write(license_key)
+                await asyncio.to_thread(_write_license_key, license_key)
                 current_state = "REBOOTING"
                 _record_command_result(command, source, "success", "license deployed; rebooting", command_id)
                 await send_status(agent, mqtt_client)
                 await asyncio.sleep(2)
                 remove_lock_file()
-                os.execv(sys.executable, [sys.executable] + sys.argv)
+                os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
         
         elif command == "TRIGGER_AUTO_BASE":
             logging.info("Received TRIGGER_AUTO_BASE command. Configuring and starting state machine...")
@@ -6406,8 +6419,7 @@ async def websocket_task(agent: AgentManager, gnss_reader: GNSSReader, mqtt_clie
     auth_token = ""
     if os.path.exists(LICENSE_PATH):
         try:
-            with open(LICENSE_PATH, "r") as f:
-                auth_token = f.read().strip()
+            auth_token = (await asyncio.to_thread(Path(LICENSE_PATH).read_text, encoding="utf-8")).strip()
         except Exception as e:
             logging.error(f"Error reading license key: {e}")
             
@@ -6445,7 +6457,7 @@ async def websocket_task(agent: AgentManager, gnss_reader: GNSSReader, mqtt_clie
 
         except asyncio.CancelledError:
             logging.info("websocket_task cancelled")
-            break
+            raise
         except asyncio.TimeoutError:
             _telemetry_inc("reconnect", "websocket")
             logging.warning("WebSocket connection timeout. Retrying in 10s...")
@@ -6820,8 +6832,8 @@ async def _apply_base_mode_to_chip(chip_type: str, port: str, lat: float, lon: f
                 ser.flush()
                 _verify_ublox_values(ser,keys)
             elif chip_type in ("Unicorecomm", "RTCM3_Source"):
-                # Use higher precision for command string to avoid rounding
-                base_cmd = f"MODE BASE {Decimal(repr(lat)):f} {Decimal(repr(lon)):f} {Decimal(repr(alt)):f}\r\n".encode("ascii")
+                # Truncate latitude/longitude at the receiver boundary, preserving calculation precision.
+                base_cmd = f"MODE BASE {Decimal(repr(lat)).quantize(Decimal('0.0000000001'), rounding=ROUND_DOWN):.10f} {Decimal(repr(lon)).quantize(Decimal('0.0000000001'), rounding=ROUND_DOWN):.10f} {Decimal(repr(alt)):f}\r\n".encode("ascii")
                 # Auto Base supplies ellipsoidal h; Unicore's default is geoid-based altitude.
                 ser.write(b"CONFIG UNDULATION 0.0\r\n")
                 ser.flush()
@@ -7374,9 +7386,10 @@ async def _run_auto_base_setup(agent: AgentManager, gnss_reader: GNSSReader, mqt
 
     calculated_coord = {"lat": repr(avg_lat), "lon": repr(avg_lon), "alt": repr(avg_alt)}
     final_coord = dict(calculated_coord)
-    if chip_type == 'Ublox':
+    if chip_type in ('Ublox', 'Unicorecomm'):
         # Quantize only the receiver command, never the transformation inputs/report.
-        for key, digits in (('lat', 9), ('lon', 9), ('alt', 4)):
+        fields = (('lat', 9), ('lon', 9), ('alt', 4)) if chip_type == 'Ublox' else (('lat', 10), ('lon', 10))
+        for key, digits in fields:
             final_coord[key] = format(Decimal(calculated_coord[key]).quantize(
                 Decimal(1).scaleb(-digits), rounding=ROUND_DOWN), f'.{digits}f')
 
@@ -7397,6 +7410,9 @@ async def _run_auto_base_setup(agent: AgentManager, gnss_reader: GNSSReader, mqt
         "parameter_source": "rtcm1021" if datum_snapshot.rtcm1021_update else "not_used",
         "residual_source": "rtcm1023" if datum_snapshot.rtcm1023_update else "none",
         "rtcm1025_used": projection_source == "rtcm1025",
+        "processor": "python_agent",
+        "zone_width_source": "inferred_from_k0",
+        "rtcm1025": dict(datum_snapshot.projection_1025),
         "location": location,
         "projection_source": projection_source,
         "zone_width_deg": (3 if abs(datum_snapshot.k0 - 0.9999) < 1e-9 else
@@ -7431,7 +7447,8 @@ async def main():
     # ========== Lock File Check ==========
     if not cleanup_lock_file():
         logging.error("Lock file issue. Another agent instance may be running. Exiting.")
-        if IS_WINDOWS: input("Press Enter to exit.")
+        if IS_WINDOWS:
+            await asyncio.to_thread(input, "Press Enter to exit.")
         sys.exit(1)
     
     if not create_lock_file():
@@ -7552,6 +7569,8 @@ async def main():
         try:
             await task
         except asyncio.CancelledError:
+            if asyncio.current_task().cancelling():
+                raise
             logging.info("Startup Auto Base task cancelled")
 
     active_auto_base_task = asyncio.create_task(auto_base_state_machine(agent, gnss_reader, mqtt_client))
@@ -7567,6 +7586,7 @@ async def main():
         )
     except asyncio.CancelledError:
         logging.info("Tasks cancelled - shutting down gracefully")
+        raise
     finally:
         logging.info("="*60)
         logging.info("Main loop interrupted. Starting cleanup...")
@@ -7607,7 +7627,7 @@ async def main():
                     "cleanup": True
                 })
                 mqtt_client.publish(f"pi/devices/{MACHINE_SERIAL}/status", offline_msg, qos=1, retain=True)
-                time.sleep(0.5) # Give it a moment to send
+                await asyncio.sleep(0.5)  # Give MQTT time to send
             except Exception as e:
                 logging.error(f"Failed to send final offline status: {e}")
 
